@@ -42,6 +42,8 @@ the **builder package**: the same source plus the free tools the build needs, so
   [BUILDING.md](BUILDING.md#what-you-extract-from-your-own-console)). The build checks that it is exactly that version
   and explains a mismatch. Encrypted packages (`.nsp`, `.xci`, `.nca`, ...) are refused: this project decrypts nothing
   and reads no keys.
+- Optional: your console's system font in `<dump>\sysdata\fonts\` ([BUILDING.md](BUILDING.md#system-fonts)); without it
+  a font of your PC stands in.
 - Windows 10/11 x64 and a GPU with a Vulkan 1.3 driver.
 - With the builder package: nothing else. From the source alone: Python 3.10+ and the free tools listed in
   [BUILDING.md](BUILDING.md#what-you-need-on-your-pc).

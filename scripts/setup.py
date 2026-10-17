@@ -10,7 +10,7 @@ Bayonetta 2 with your own tools (this project decrypts nothing and reads no keys
 
     <folder>/exefs/     main  sdk  subsdk0  rtld  main.npdm          (version 1.2 = update v131072; plain NSO files)
     <folder>/romfs/     data000.cpk ... data006.cpk  movie/  sound/   (version 1.2 = update v131072)
-    optional: <folder>/sysdata/fonts        the system shared fonts as files
+    optional: <folder>/sysdata/fonts        the console's shared fonts, .ttf or .bfttf (without them a PC font stands in)
     optional: <folder>/control/icon_AmericanEnglish.dat   the HOME-menu icon (for the window / launcher icon)
 
 Nothing of the game is in the repository. Every step derives its files from the dump into targets/ and build/ (both
@@ -358,7 +358,7 @@ def step_convert(cx):
     if os.path.isdir(fonts):
         say('  targets\\sysdata\\fonts: %s' % link_folder(os.path.join(cx.targets, 'sysdata', 'fonts'), fonts))
     else:
-        say('  no sysdata\\fonts in the dump: the game uses its built-in stand-in for the system fonts')
+        say('  no sysdata\\fonts in the dump: a font of this PC will stand in for the console\'s system fonts (BUILDING.md)')
 
 
 def step_tables(cx):

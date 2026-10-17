@@ -82,12 +82,25 @@ decrypted** files:
 ```
 <dump>/exefs/      the whole ExeFS: main, sdk, subsdk0, rtld, main.npdm        (update v131072 applied; plain NSO files)
 <dump>/romfs/      the RomFS with update v131072 applied: data000.cpk ... data006.cpk, movie/, sound/
-<dump>/sysdata/fonts/                     optional: the system shared fonts as files (software keyboard, system text)
+<dump>/sysdata/fonts/                     optional: your console's shared system fonts (see "System fonts" below)
 <dump>/control/icon_AmericanEnglish.dat   optional: your copy's HOME-menu icon, for the window and launcher icon
 ```
 
-`main`, `sdk` and `main.npdm` are required; `subsdk0` and `rtld` are checked when present. Without `sysdata/fonts` the
-game uses a built-in stand-in for the system fonts; without the icon the programs get the default Windows icon.
+`main`, `sdk` and `main.npdm` are required; `subsdk0` and `rtld` are checked when present. Without the icon the
+programs get the default Windows icon.
+
+### System fonts
+
+The game loads the console's shared font `nintendo_udsg-r_std_003` at start. Put it in `<dump>/sysdata/fonts/` as a
+plain TrueType file (`nintendo_udsg-r_std_003.ttf`) or in the form the console stores it (`nintendo_udsg-r_std_003.bfttf`,
+decoded when the game starts). The other shared fonts (`nintendo_udsg-r_org_zh-cn_003`, `nintendo_udsg-r_ext_zh-cn_003`,
+`nintendo_udjxh-db_zh-tw_003`, `nintendo_udsg-r_ko_003`, `nintendo_ext_003`, `nintendo_ext2_003`) are read the same way
+if the game asks for them. Fonts added after the build go straight into `targets\sysdata\fonts\`, with no rebuild.
+
+Without them, a font of your PC stands in, from `C:\Windows\Fonts`: Yu Gothic for the standard font (else Meiryo, Segoe UI
+or Arial), Microsoft YaHei / JhengHei for Chinese and Malgun Gothic for Korean. The game runs; text drawn with that font
+looks different from the console's, and symbols that only the console's fonts have are missing. The log says which font
+was used (the `nn::pl:` lines in `build\play\stdout.txt`).
 
 This project decrypts nothing and reads no keys. Encrypted packages (`.nsp`, `.xci`, `.nca`, `.nsz`, `.xcz`) anywhere
 in the dump folder are refused. It contains no keys and no link to any, and it does not explain how to obtain them.
