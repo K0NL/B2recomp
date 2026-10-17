@@ -169,3 +169,9 @@ Both are marked `[Recomps#1]` in the code; the values the game sees are unchange
   keeps only what the sdk answers from its live device object (0x38 = 32 deko3d, 0x3b = 1 OPEN, 0x18 = 0 this runtime)
   and the publicly sourced values as documented fallback. Every pname the game asked for in any run gets the same answer
   as before (trace lines compared); 0x30 is now the sdk's 14 (upstream's table had 15; on a path no run reaches).
+- 2026-10-17, `nvn_vk_draw.c`: the Vulkan disk cache (`..\cachek`: SPIR-V, stage records, `pipes.bin`, the driver's pipeline
+  cache) was never written here: the code made `../cache/vk` but not its parent `../cache` (upstream's layout has it
+  already), and CreateDirectory makes one level. The four places now make the parent first. Tested: a cold run wrote
+  117 MB (1,773 SPIR-V files, 118 pipelines, 25 MB pipeline cache); warm runs read it back and made 0 pipelines at
+  draw time; standard test run PASS. `shader_prepare` (Smash's preparation from data.arc) has no effect for Bayonetta 2:
+  said so in `gfx_options.c`'s default text, and the launcher greys the option out.

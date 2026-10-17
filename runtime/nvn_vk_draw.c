@@ -1126,7 +1126,7 @@ static VkShaderModule module_from_glsl(int stage, const char *glsl, const char *
         }
         if (!g_glsl_to_spirv(stage, glsl, &words, &count, log, sizeof log)) { printf("nvn_vk: %s: glslang rejected the translated text: %s\n", what, log); fflush(stdout); return NULL; }
         from_dll = 1;
-        CreateDirectoryA("../cache/vk", NULL); CreateDirectoryA("../cache/vk/spv", NULL);
+        CreateDirectoryA("../cache", NULL); CreateDirectoryA("../cache/vk", NULL); CreateDirectoryA("../cache/vk/spv", NULL);   /* [Recomps#1] the parent first: CreateDirectory makes one level (no cache was ever written) */
         fp = fopen(path, "wb");
         if (fp) { fwrite(words, 4, count, fp); fclose(fp); }
     }
@@ -1194,7 +1194,7 @@ static VStage *vstage_get(Prog *p, int s, const uint32_t *key, uint32_t fo) {
         r.magic = 0x52545356 + MX_VK_VERSION; r.stage = s; r.code_len = v->code_len; memcpy(r.key, v->key, 16); r.fo = v->fo; r.spv = spv_hash;
         r.cbufs = v->cbufs; r.ssbos = v->ssbos; r.ssbo_w = v->ssbo_w; r.images = v->images; r.dep = v->dep; r.tex_units = v->tex_units; r.in_attr = v->in_attr; r.out_attr = v->out_attr;
         r.uses_alpha = v->uses_alpha; r.nsmp = v->nsmp; memcpy(r.smp, v->smp, sizeof r.smp);
-        CreateDirectoryA("../cache/vk", NULL); CreateDirectoryA("../cache/vk/stage", NULL);
+        CreateDirectoryA("../cache", NULL); CreateDirectoryA("../cache/vk", NULL); CreateDirectoryA("../cache/vk/stage", NULL);   /* [Recomps#1] the parent first: CreateDirectory makes one level (no cache was ever written) */
         stage_rec_path(path, sizeof path, s, v->h);
         FILE *fp = fopen(path, "wb");
         if (fp) { fwrite(&r, 1, sizeof r, fp); fclose(fp); }
@@ -1305,7 +1305,7 @@ static void piperec_append(const PKey *k, VStage *vs, VStage *fs, int compute) {
     memset(&r, 0, sizeof r);
     r.magic = PIPEREC_MAGIC; r.compute = (uint32_t)compute; r.vs_h = vs->h; r.fs_h = fs ? fs->h : 0;
     if (k) { r.k = *k; r.k.vs = r.k.fs = 0; }
-    CreateDirectoryA("../cache/vk", NULL);
+    CreateDirectoryA("../cache", NULL); CreateDirectoryA("../cache/vk", NULL);   /* [Recomps#1] the parent first: CreateDirectory makes one level (no cache was ever written) */
     FILE *fp = fopen("../cache/vk/pipes.bin", "ab");
     if (fp) { fwrite(&r, 1, sizeof r, fp); fclose(fp); }
 }
@@ -3842,7 +3842,7 @@ static void vkd_init(void) {
         VKC(vkCreateSampler(V.device, &ci, NULL, &g_smp_default));
     }
     cmd_wait_all();
-    CreateDirectoryA("../cache/vk", NULL);
+    CreateDirectoryA("../cache", NULL); CreateDirectoryA("../cache/vk", NULL);   /* [Recomps#1] the parent first: CreateDirectory makes one level (no cache was ever written) */
     prewarm_start();
     wd_start();
     printf("nvn_vk: drawing part ready: %d command buffers in flight, stream ring %llu MB, %u memory types; debug checks %s\n", NSLOT, (unsigned long long)(R.ring_size >> 20), (unsigned)D.mp.memoryTypeCount, D.debug ? "on" : "off (SSBU_VK_DEBUG=1)");

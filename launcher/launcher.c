@@ -213,7 +213,8 @@ static Setting g_s[S_COUNT] = {
     [S_ANISO]    = { F_GFX, "anisotropic_filtering", K_COMBO, OPTS(o_aniso), 0, .def = "game", .label = L"Anisotropic filtering",
                      .tip = L"Sharper textures at flat angles; costs little on any GPU." },
     [S_PREPARE]  = { F_GFX, "shader_prepare", K_COMBO, OPTS(o_prepare), 0, .def = "first_run", .label = L"Shader preparation",
-                     .tip = L"Before the first start: builds every shader once (several minutes) so the game never waits for one later." },
+                     .tip = L"No effect in B2recomp: preparing shaders ahead reads a data file only Smash has. Shaders are made the "
+                             L"first time the game needs them and kept in the cache folder, so later starts reuse them." },
     [S_OVERLAY]  = { F_GFX, "frame_time_overlay", K_CHECK, .def = "off", .label = L"Show frame time in the window title" },
     [S_LAYOUT]   = { F_PAD, "layout", K_COMBO, OPTS(o_layout), 1, .def = "auto", .label = L"Face buttons",
                      .tip = L"By position: the right button is A, bottom B, top X, left Y (as on a Switch). By printed letter: an Xbox pad's A is A. Auto: by letter on GameCube pads, by position on all others." },
@@ -289,7 +290,8 @@ static void update_ui(void) {
     EnableWindow(g_s[S_VSYNC].hw, vk && custom);
     EnableWindow(g_s[S_SCALE].hw, vk && custom);
     EnableWindow(g_s[S_ANISO].hw, vk && custom);
-    EnableWindow(g_s[S_LATENCY].hw, vk); EnableWindow(g_s[S_PREPARE].hw, vk);
+    EnableWindow(g_s[S_LATENCY].hw, vk);
+    EnableWindow(g_s[S_PREPARE].hw, FALSE);                /* [Recomps#1] no effect for Bayonetta 2 (tip below) */
     int rumble = SendMessageW(g_s[S_RUMBLE].hw, BM_GETCHECK, 0, 0) == BST_CHECKED;
     EnableWindow(g_s[S_STRENGTH].hw, rumble);
     SetWindowTextW(g_s[S_RUMBLE].hval, rumble ? L"On" : L"Off");

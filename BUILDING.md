@@ -144,8 +144,8 @@ reported with the tail of its log (`build/logs/<step>.log`); fix the cause and r
 | **Total** | **4 min 53 s** without `check` (5 min 9 s with it) |
 
 Disk: `build/` is about 0.8 GB; `build/gen_eh` and `build/obj` (about 0.6 GB) can be deleted after a successful build
-(keep `game.dll`); a later `compile` then needs `--from lift`. Shader and pipeline caches grow as you play (see
-"First start"). A 4-core / 8-thread PC should take roughly two to three times as long (estimate, not measured). Verified end
+(keep `game.dll`); a later `compile` then needs `--from lift`. Shader and pipeline caches grow in `cache\vk\` as you play (see
+"Shader cache"). A 4-core / 8-thread PC should take roughly two to three times as long (estimate, not measured). Verified end
 to end: the build above ran the title and attract sequence for 60 s (exit code 0, every system call handled) and passed
 the standard test run below.
 
@@ -161,11 +161,11 @@ the game (Play), the controller test (`--pad-test`) or the controller mapping (`
 (`-NewSave` starts from an empty one). Controllers are read through SDL3 (DualSense, Xbox, Switch Pro and others) while
 the game window has focus.
 
-**First start.** With `shader_prepare = first_run` (the default) the first start on a PC, and the first after a new
-graphics driver, shows `PREPARING SHADERS NN %` and translates every shader of the game before the title: several
-minutes, once. Closing the window stops it cleanly and the next start goes on from there. `background` starts the game
-at once and does the same work behind it; `off` builds shaders when they are first needed (late frames the first time
-something is shown).
+**Shader cache.** The game's shaders are translated and compiled the first time each one is needed, so a scene seen for
+the first time can stutter briefly. Everything made is kept in `cache\vk\` (beside `build\`): later starts reuse it and
+load faster. It is made from your copy of the game, like `build\`: never share it. Delete the folder to start over (for
+example after a new graphics driver). The `shader_prepare` option and the launcher's "Shader preparation" have no effect
+for this game (they belong to the Smash port the runtime comes from).
 
 Options for testing are environment variables (a list is in the comments at the top of the runtime sources), for
 example `SSBU_SHOW=1` (show the window of a test exe), `SSBU_TRACE=<file>`, `SSBU_SHOT=<frame>` (save a frame).

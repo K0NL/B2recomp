@@ -114,6 +114,7 @@
 *.lnk
 *.json
 /build/
+/cache/
 /targets/
 /deps/
 /evidence/
