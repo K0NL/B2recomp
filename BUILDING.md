@@ -221,6 +221,8 @@ game or a compiler is running (`--wait` waits instead); measure on a quiet machi
 - The link step fails with a file in use: a running `game_native.exe` or `launcher.exe` holds `game.dll` open; close
   the game first and run the same command again.
 - The game window stays black or the game stops at start with a Vulkan error: update the graphics driver (Vulkan 1.3
-  is needed); `renderer = opengl` in `config/graphics.ini` is the older fallback renderer (NVIDIA only).
+  is needed); `renderer = opengl` in `config/graphics.ini` is the older fallback renderer (NVIDIA only). A driver
+  without `VK_EXT_vertex_input_dynamic_state` (AMD RX 400/500 on Windows) takes a slower start-up path: the log says
+  `NO VK_EXT_vertex_input_dynamic_state`, and its first runs build more pipelines while playing.
 - A compiler job that fails while the PC is under heavy load or after a power loss: run the same command again.
 - Output with non-ASCII characters from Windows tools is shown with `?`; the logs in `build/logs` are the originals.

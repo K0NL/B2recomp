@@ -23,6 +23,7 @@ typedef struct VStage {
     VSmp smp[64];
     VkShaderModule mod; struct VStage *next, *next_h;
     VkPipeline lib, lib2; volatile LONG lib_state, lib2_state;      /* session 9 (SSBU_VK_GPL=2): the stage's pipeline library; lib2: a vertex stage with the empty fragment shader state */
+    uint32_t vlay;                                 /* finding 116, a GPU without dynamic vertex input: the vertex layout this vertex stage was last drawn with (predictions take it) */
 } VStage;
 #define MX_VK_VERSION 5u                         /* part of every hash: change it when mx_translate's Vulkan text or these records change */
 typedef struct { uint32_t magic; int32_t stage, code_len; uint32_t key[4], fo; uint64_t spv, hb; uint32_t cbufs, ssbos, ssbo_w, images, dep, tex_units, in_attr, out_attr; int32_t uses_alpha, nsmp; VSmp smp[64]; } StageRec;
@@ -334,6 +335,102 @@ typedef struct Pipe { PKey k; VkPipeline p, p_fast; /* p_fast: the pipeline link
 static Pipe *g_pipes[1024];
 static void pkey_targets(PKey *k);
 static int pkey_targets_of(PKey *k, int ncol, const TargetRef *col, const TargetRef *depth);
+/* ---- [Recomps#1] finding 116: GPUs WITHOUT VK_EXT_vertex_input_dynamic_state (AMD Polaris RX 400/500 on Windows: no
+ * driver of AMD has it there). The vertex layout of a draw is then part of its pipeline: its number in the table of the
+ * layouts met (1, 2, ...; 0 = no vertex input, the internal stencil clear) is kept in the three pad bytes of the key. With
+ * the extension those bytes stay 0, so keys, pipes.bin and everything else are what they were. The table is
+ * ..\cache\vk\vlayouts.bin (a layout's number = its place in the file), so the keys pipes.bin holds mean the same in the
+ * next run. Strides and divisors are part of a layout (static, as the draw had them). */
+typedef struct { uint32_t nb, na; struct { uint32_t stride, divisor; } b[17]; struct { uint32_t location, binding, format, offset; } a[16]; } VLay;      /* divisor 0: per vertex */
+#define VLAY_MAX 16384
+#define VLAY_MAGIC 0x59414c56u
+static VLay *g_vlay[VLAY_MAX];
+static volatile LONG g_nvlay;                      /* published entries (written whole before the count moves) */
+static uint32_t g_vlay_slot[2 * VLAY_MAX];         /* open addressing by hash: layout number, 0 = empty */
+static CRITICAL_SECTION g_vlay_lock;
+static LONG64 g_vlay_loaded, g_vlay_new, g_vlay_lookups;
+static uint32_t pkey_vlay(const PKey *k) { return k->pad[0] | (uint32_t)k->pad[1] << 8 | (uint32_t)k->pad[2] << 16; }
+static void pkey_vlay_set(PKey *k, uint32_t n) { k->pad[0] = (uint8_t)n; k->pad[1] = (uint8_t)(n >> 8); k->pad[2] = (uint8_t)(n >> 16); }
+static const VLay *vlay_of(uint32_t n) { return n && n <= (uint32_t)g_nvlay ? g_vlay[n - 1] : NULL; }
+static uint32_t vlay_add(const VLay *l, uint64_t h, int save) {      /* g_vlay_lock held: the number of l, entered when new */
+    unsigned s = (unsigned)h & (2 * VLAY_MAX - 1);
+    for (; g_vlay_slot[s]; s = (s + 1) & (2 * VLAY_MAX - 1)) if (!memcmp(g_vlay[g_vlay_slot[s] - 1], l, sizeof *l)) return g_vlay_slot[s];
+    if (g_nvlay == VLAY_MAX) { nvn_vk_missing("more than 16384 vertex layouts (GPU without dynamic vertex input)"); return 0; }
+    VLay *e = malloc(sizeof *e);
+    *e = *l;
+    g_vlay[g_nvlay] = e;
+    MemoryBarrier();
+    uint32_t n = (uint32_t)InterlockedIncrement(&g_nvlay);
+    g_vlay_slot[s] = n;
+    if (save) {
+        uint32_t magic = VLAY_MAGIC;
+        FILE *fp = fopen(vkc_file("vlayouts.bin"), "ab");
+        if (fp) { fwrite(&magic, 4, 1, fp); fwrite(l, sizeof *l, 1, fp); fclose(fp); }
+        g_vlay_new++;
+    }
+    return n;
+}
+static void vlay_load(void) {                      /* start-up, before pipes.bin is read; a damaged tail is cut so the numbers stay the places in the file */
+    FILE *fp = fopen(vkc_file("vlayouts.bin"), "rb");
+    struct { uint32_t magic; VLay l; } r;
+    int bad = 0;
+    long good = 0;                                 /* the end of the last record taken */
+    if (!fp) return;
+    while (fread(&r, sizeof r, 1, fp) == 1) {
+        if (r.magic != VLAY_MAGIC || r.l.nb > 17 || r.l.na > 16) { bad = 1; break; }
+        LONG before = g_nvlay;
+        vlay_add(&r.l, fnv(0xcbf29ce484222325ULL, &r.l, sizeof r.l), 0);
+        if (g_nvlay != before + 1) { bad = 1; break; }      /* a layout twice (not written by us): the numbers after it would move */
+        good = ftell(fp);
+    }
+    fseek(fp, 0, SEEK_END);
+    if (ftell(fp) != good) bad = 1;                /* a bad record or a part of one at the end */
+    fclose(fp);
+    g_vlay_loaded = g_nvlay;
+    if (bad) {                                     /* rewritten with the layouts that were read */
+        printf("nvn_vk: ../cache/vk/vlayouts.bin is damaged after layout %ld: cut there\n", (long)g_nvlay);
+        fp = fopen(vkc_file("vlayouts.bin"), "wb");
+        if (fp) { for (LONG i = 0; i < g_nvlay; i++) { uint32_t magic = VLAY_MAGIC; fwrite(&magic, 4, 1, fp); fwrite(g_vlay[i], sizeof(VLay), 1, fp); } fclose(fp); }
+    }
+}
+/* The number of a draw's vertex layout (render thread and the look-ahead). The draw before is compared first: most draws
+ * repeat its layout. */
+static uint32_t vlay_number(const VkVertexInputBindingDescription2EXT *bd, uint32_t nb, const VkVertexInputAttributeDescription2EXT *ad, uint32_t na) {
+    VLay l;
+    memset(&l, 0, sizeof l);
+    l.nb = nb; l.na = na;
+    for (uint32_t i = 0; i < nb; i++) { l.b[i].stride = bd[i].stride; l.b[i].divisor = bd[i].inputRate == VK_VERTEX_INPUT_RATE_INSTANCE ? bd[i].divisor : 0; }
+    for (uint32_t i = 0; i < na; i++) { l.a[i].location = ad[i].location; l.a[i].binding = ad[i].binding; l.a[i].format = (uint32_t)ad[i].format; l.a[i].offset = ad[i].offset; }
+    static _Thread_local VLay last;
+    static _Thread_local uint32_t last_n;
+    if (last_n && !memcmp(&last, &l, sizeof l)) return last_n;
+    EnterCriticalSection(&g_vlay_lock);
+    uint32_t n = vlay_add(&l, fnv(0xcbf29ce484222325ULL, &l, sizeof l), 1);
+    g_vlay_lookups++;
+    LeaveCriticalSection(&g_vlay_lock);
+    last = l; last_n = n;
+    return n;
+}
+/* The vertex input state of a pipeline of layout n (pipe_build, without the extension). */
+static void vlay_state(uint32_t n, VkPipelineVertexInputStateCreateInfo *vi, VkVertexInputBindingDescription *b, VkVertexInputAttributeDescription *a,
+                       VkPipelineVertexInputDivisorStateCreateInfoEXT *dv, VkVertexInputBindingDivisorDescriptionEXT *d) {
+    const VLay *l = vlay_of(n);
+    memset(vi, 0, sizeof *vi); memset(dv, 0, sizeof *dv);
+    vi->sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+    dv->sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_DIVISOR_STATE_CREATE_INFO_EXT;
+    if (!l) return;                                /* 0: no vertex input */
+    for (uint32_t i = 0; i < l->nb; i++) {
+        b[i].binding = i; b[i].stride = l->b[i].stride; b[i].inputRate = l->b[i].divisor ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX;
+        if (l->b[i].divisor > 1) {
+            if (D.has_vad && D.vad.vertexAttributeInstanceRateDivisor) { d[dv->vertexBindingDivisorCount].binding = i; d[dv->vertexBindingDivisorCount++].divisor = l->b[i].divisor; }
+            else nvn_vk_missing("an instance divisor above 1 on a GPU without dynamic vertex input or VK_EXT_vertex_attribute_divisor");
+        }
+    }
+    for (uint32_t i = 0; i < l->na; i++) { a[i].location = l->a[i].location; a[i].binding = l->a[i].binding; a[i].format = (VkFormat)l->a[i].format; a[i].offset = l->a[i].offset; }
+    vi->vertexBindingDescriptionCount = l->nb; vi->pVertexBindingDescriptions = b;
+    vi->vertexAttributeDescriptionCount = l->na; vi->pVertexAttributeDescriptions = a;
+    if (dv->vertexBindingDivisorCount) { dv->pVertexBindingDivisors = d; vi->pNext = dv; }
+}
 static VkBlendFactor blend_factor(unsigned f) {
     static const uint8_t m[9] = {VK_BLEND_FACTOR_SRC_COLOR, VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR, VK_BLEND_FACTOR_SRC_ALPHA, VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, VK_BLEND_FACTOR_DST_ALPHA, VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA,
                                  VK_BLEND_FACTOR_DST_COLOR, VK_BLEND_FACTOR_ONE_MINUS_DST_COLOR, VK_BLEND_FACTOR_SRC_ALPHA_SATURATE};
@@ -781,7 +878,7 @@ static double pipe_build(Pipe *p) {
         VK_DYNAMIC_STATE_STENCIL_WRITE_MASK, VK_DYNAMIC_STATE_STENCIL_REFERENCE, VK_DYNAMIC_STATE_CULL_MODE, VK_DYNAMIC_STATE_FRONT_FACE, VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY, VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE,
         VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE, VK_DYNAMIC_STATE_DEPTH_COMPARE_OP, VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE, VK_DYNAMIC_STATE_STENCIL_OP, VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE, VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE,
         VK_DYNAMIC_STATE_RASTERIZER_DISCARD_ENABLE, VK_DYNAMIC_STATE_VERTEX_INPUT_EXT};
-    uint32_t ndyn = 20;
+    uint32_t ndyn = D.has_vids ? 20 : 19;          /* finding 116: without the extension the vertex input is in the pipeline (the last entry is left out) */
     if (D.has_eds3) {
         dyn[ndyn++] = VK_DYNAMIC_STATE_COLOR_BLEND_ENABLE_EXT; dyn[ndyn++] = VK_DYNAMIC_STATE_COLOR_BLEND_EQUATION_EXT; dyn[ndyn++] = VK_DYNAMIC_STATE_COLOR_WRITE_MASK_EXT; dyn[ndyn++] = VK_DYNAMIC_STATE_POLYGON_MODE_EXT;
         dyn[ndyn++] = VK_DYNAMIC_STATE_ALPHA_TO_COVERAGE_ENABLE_EXT; dyn[ndyn++] = VK_DYNAMIC_STATE_SAMPLE_MASK_EXT;
@@ -789,6 +886,12 @@ static double pipe_build(Pipe *p) {
     }
     VkPipelineDynamicStateCreateInfo dy = {VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
     dy.dynamicStateCount = ndyn; dy.pDynamicStates = dyn;
+    VkPipelineVertexInputStateCreateInfo vi;
+    VkVertexInputBindingDescription vib[17];
+    VkVertexInputAttributeDescription via[16];
+    VkPipelineVertexInputDivisorStateCreateInfoEXT vdv;
+    VkVertexInputBindingDivisorDescriptionEXT vdd[17];
+    if (!D.has_vids) vlay_state(pkey_vlay(k), &vi, vib, via, &vdv, vdd);
     VkPipelineRenderingCreateInfo ri = {VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
     VkFormat cf[8];
     for (int i = 0; i < 8; i++) cf[i] = (VkFormat)k->cfmt[i];
@@ -798,6 +901,7 @@ static double pipe_build(Pipe *p) {
     VkGraphicsPipelineCreateInfo gi = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
     gi.pNext = &ri; gi.stageCount = fs ? 2 : 1; gi.pStages = st; gi.pInputAssemblyState = &ia; gi.pViewportState = &vp; gi.pRasterizationState = &rs; gi.pMultisampleState = &ms;
     gi.pDepthStencilState = &ds; gi.pColorBlendState = &cb; gi.pDynamicState = &dy; gi.layout = p->layout;
+    if (!D.has_vids) gi.pVertexInputState = &vi;
     VkResult r = vkCreateGraphicsPipelines(V.device, g_pcache, 1, &gi, NULL, &p->p);
     if (r != VK_SUCCESS) vkd_fail("vkCreateGraphicsPipelines (vertex stage %u, fragment stage %u, %d colour targets, depth format %d): %s", k->vs, k->fs, k->ncolor, k->dfmt, vk_result_name(r));
     InterlockedIncrement64(&R.pipelines);
@@ -837,6 +941,7 @@ static PairRec *pair_get(VStage *vs, VStage *fs) {                 /* g_sh_lock 
 static int sig_note(const PKey *k, int *idx) {     /* g_sh_lock held: the index of the signature when it is NEW, else -1; *idx: its index either way (-1: table full) */
     PKey s = *k;
     s.vs = s.fs = 0; s.topo_class = 2; s.sshade = 0;
+    pkey_vlay_set(&s, 0);                          /* finding 116: a prediction takes the layout of its own vertex stage */
     for (int i = 0; i < g_nsig; i++) if (!memcmp(&g_sig[i].k, &s, sizeof s)) { g_sig[i].uses++; *idx = i; return -1; }
     *idx = -1;
     if (g_nsig == 64) return -1;
@@ -924,8 +1029,10 @@ static void job_copy_src(Job *j, uint8_t **d, int i, const SSrc *s) {
  * predictions, or the pipeline exists. */
 static void predict_pair(PairRec *pr, int i) {
     if (pr->drawn || pr->npred >= 3 || (pr->sigs >> i & 1)) return;
+    if (!D.has_vids && !pr->vs->vlay) return;      /* finding 116: the vertex stage was never drawn: its layout is not known yet */
     PKey k = g_sig[i].k;
     k.vs = pr->vs->id; k.fs = pr->fs ? pr->fs->id : 0; k.sshade = pr->fs ? pr->sshade : 0;
+    if (!D.has_vids) pkey_vlay_set(&k, pr->vs->vlay);
     uint64_t h = fnv(0xcbf29ce484222325ULL, &k, sizeof k);
     pr->sigs |= 1ull << i;
     if (pipe_find(&k, h)) return;
@@ -1539,7 +1646,7 @@ void nvn_vk_program_set(void *prog) {
 }
 static int piperec_cmp(const void *a, const void *b) { return memcmp(a, b, sizeof(PipeRec)); }
 static void prewarm_start(void) {
-    InitializeCriticalSection(&g_sh_lock); InitializeCriticalSection(&g_gpl_lock);
+    InitializeCriticalSection(&g_sh_lock); InitializeCriticalSection(&g_gpl_lock); InitializeCriticalSection(&g_vlay_lock);
     InitializeConditionVariable(&g_sh_cv); InitializeConditionVariable(&g_jq_cv);
     CreateDirectoryA(vkc_dir(), NULL); CreateDirectoryA(vkc_file("spv"), NULL); CreateDirectoryA(vkc_file("stage"), NULL);
     if (getenv("SSBU_VK_CACHE")) printf("nvn_vk: cache folder %s (SSBU_VK_CACHE)\n", vkc_dir());
@@ -1571,6 +1678,7 @@ static void prewarm_start(void) {
     g_cscan_log = getenv("SSBU_VK_CSCAN_LOG") && atoi(getenv("SSBU_VK_CSCAN_LOG"));
     if (getenv("SSBU_VK_CSCAN_STEP") && atoi(getenv("SSBU_VK_CSCAN_STEP")) >= 8) g_cscan_step = (uint64_t)atoi(getenv("SSBU_VK_CSCAN_STEP")) & ~7ull;
     if (getenv("SSBU_VK_CSCAN_REACH") && atoi(getenv("SSBU_VK_CSCAN_REACH")) > 0) g_cscan_reach = (uint64_t)atoi(getenv("SSBU_VK_CSCAN_REACH"));
+    if (!D.has_vids) vlay_load();                  /* finding 116: the layout numbers pipes.bin's keys hold */
     int ahead = !(getenv("SSBU_VK_PREWARM") && !atoi(getenv("SSBU_VK_PREWARM")));
     FILE *fp = ahead ? fopen(vkc_file("pipes.bin"), "rb") : NULL;
     if (fp) {
@@ -1580,7 +1688,9 @@ static void prewarm_start(void) {
         fclose(fp);
         int kept = 0;
         qsort(g_pw_rec, (size_t)g_pw_n, sizeof(PipeRec), piperec_cmp);
-        for (int i = 0; i < g_pw_n; i++) if (g_pw_rec[i].magic == PIPEREC_MAGIC && (!kept || memcmp(&g_pw_rec[kept - 1], &g_pw_rec[i], sizeof(PipeRec)))) g_pw_rec[kept++] = g_pw_rec[i];
+        /* finding 116: a key with a vertex layout only on a GPU without dynamic vertex input (and one it knows), a key without one only with it */
+        for (int i = 0; i < g_pw_n; i++) if (g_pw_rec[i].magic == PIPEREC_MAGIC && (!kept || memcmp(&g_pw_rec[kept - 1], &g_pw_rec[i], sizeof(PipeRec)))
+                                            && (g_pw_rec[i].compute || (D.has_vids ? !pkey_vlay(&g_pw_rec[i].k) : vlay_of(pkey_vlay(&g_pw_rec[i].k)) != NULL))) g_pw_rec[kept++] = g_pw_rec[i];
         g_pw_n = kept;
     } else printf(ahead ? "nvn_vk: no ../cache/vk/pipes.bin: a first run on this PC; stages and pipelines are made when the game hands its programs over\n" : "nvn_vk: SSBU_VK_PREWARM=0: the pipeline list of earlier runs is not read\n");
     SYSTEM_INFO si;
@@ -1604,7 +1714,7 @@ static void prewarm_start(void) {
  * follows then finds them made, waits for the one being made, or makes a queued one itself: the work of a frame that needs
  * many new pipelines at once (the first frame of a fight) is spread over all cores instead of done one by one at the draws.
  * Not followed: integer texture formats (taken as bound now) and, without extended dynamic state 3, anything. */
-typedef struct { Prog *prog[2]; int ncol, nattr, sig_ok, attr_new; TargetRef col[8], depth; uint32_t vattr[32], ints, sints, sig_tag; uint8_t logic; PKey sig; } Scan;
+typedef struct { Prog *prog[2]; int ncol, nattr, sig_ok, attr_new; TargetRef col[8], depth; uint32_t vattr[32], ints, sints, sig_tag; uint8_t logic; PKey sig; uint32_t vstream[64], vbuf_on; } Scan;      /* vstream, vbuf_on (finding 116): {stride, divisor} per stream, streams with a buffer */
 static uint64_t g_scan_seen[8192];
 static void scan_sig(Scan *s) {
     memset(&s->sig, 0, sizeof s->sig);
@@ -1614,6 +1724,8 @@ static void scan_sig(Scan *s) {
 static void scan_begin(Scan *s) {
     s->prog[0] = R.prog[0]; s->prog[1] = R.prog[1]; s->ncol = R.ncol; memcpy(s->col, R.col, sizeof s->col); s->depth = R.depth;
     s->nattr = R.nattr; memcpy(s->vattr, R.vattr, sizeof s->vattr); s->attr_new = 1; s->logic = R.logic;
+    memcpy(s->vstream, R.vstream, sizeof s->vstream); s->vbuf_on = 0;
+    for (int i = 0; i < 32; i++) if (R.vbuf[i].addr && R.vbuf[i].size) s->vbuf_on |= 1u << i;
     scan_sig(s);
 }
 static void scan_draw(Scan *s, unsigned prim) {
@@ -1632,6 +1744,17 @@ static void scan_draw(Scan *s, unsigned prim) {
     uint64_t w[6] = {(uint64_t)(uintptr_t)p0->st[0].code ^ ((uint64_t)p0->serial << 44), p1 ? (uint64_t)(uintptr_t)p1->st[1].code ^ ((uint64_t)p1->serial << 44) : 0, s->sig_tag, tclass[prim] | (uint64_t)s->logic << 8 | (uint64_t)(p1 ? p1->sample_shading & 1 : 0) << 16,
                      (uint64_t)s->ints << 32 | s->sints, (uint64_t)R.tex_int[0] << 32 | R.tex_int[1]};
     uint64_t tag = fnv(0xcbf29ce484222325ULL, w, sizeof w) | 1;
+    uint32_t vl = 0;
+    if (!D.has_vids) {                             /* finding 116: the vertex layout the draw will have is part of its key */
+        VkVertexInputBindingDescription2EXT bd[17];
+        VkVertexInputAttributeDescription2EXT ad[16];
+        uint32_t nb, na;
+        int bs[17], bad;
+        vin_describe(s->nattr, s->vattr, s->vstream, s->vbuf_on & 0xffff, s->ints, s->sints, bd, &nb, ad, &na, bs, &bad);
+        if (bad) return;                           /* the draw reports it */
+        vl = vlay_number(bd, nb, ad, na);
+        tag = (tag ^ (uint64_t)vl * 0x9E3779B97F4A7C15ull) | 1;
+    }
     unsigned slot = (unsigned)(tag >> 20) & 8191;
     if (g_scan_seen[slot] == tag) return;
     g_scan_seen[slot] = tag;
@@ -1641,6 +1764,7 @@ static void scan_draw(Scan *s, unsigned prim) {
     int vs_made = fs_made && vs && vs->state == 2 && key_fits(0, key0, vs->key, vs->dep, vs->tex_units) && vs->fo == (fs && fs->ok ? fs->in_attr & ~(vs->out_attr & ~vs->fo) : 0);
     PKey k = s->sig;
     k.topo_class = tclass[prim]; k.logic = s->logic; k.sshade = p1 ? (uint8_t)p1->sample_shading : 0;
+    if (vl) pkey_vlay_set(&k, vl);
     if (vs_made && fs_made) {
         if (!vs->ok || (fs && !fs->ok)) return;
         k.vs = vs->id; k.fs = fs ? fs->id : 0;
@@ -1689,6 +1813,8 @@ static void scan_list(uint64_t handle, int depth, Scan *s) {
             break;
         }
         case OP_VATTR: s->nattr = (int)a[0] < 32 ? (int)a[0] : 32; memcpy(s->vattr, BLOB(m), (size_t)s->nattr * 4); s->attr_new = 1; break;
+        case OP_VBUF: for (int i = 0; i < (int)a[1] && (int)a[0] + i < 32; i++) { uint64_t r2[2]; memcpy(r2, BLOB(m) + i * 16, 16); if (r2[0] && r2[1]) s->vbuf_on |= 1u << (a[0] + i); else s->vbuf_on &= ~(1u << (a[0] + i)); } break;
+        case OP_VSTREAM: for (int i = 0; i < (int)a[0] && i < 32; i++) memcpy(&s->vstream[i * 2], BLOB(m) + i * 8, 8); break;
         case OP_COLOR: s->logic = ((const uint8_t *)&a[0])[1]; break;
         case OP_DRAW_ARRAYS: case OP_DRAW_ELEMENTS: scan_draw(s, (unsigned)a[0]); break;
         case OP_CALL: for (int i = 0; i < (int)a[0]; i++) { uint64_t h; memcpy(&h, BLOB(m) + i * 8, 8); if (depth < 8) scan_list(h, depth + 1, s); } break;
@@ -1710,6 +1836,8 @@ static void prewarm_wait(void) {                   /* render thread, before its 
 }
 static void m4_report(void) {
     LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
+    if (!D.has_vids) printf("nvn_vk_vlay: no dynamic vertex input: %ld vertex layouts (%lld from ../cache/vk/vlayouts.bin, %lld new in this run), %lld looked up in the table (the draw before had another)\n",
+                            (long)g_nvlay, (long long)g_vlay_loaded, (long long)g_vlay_new, (long long)g_vlay_lookups);
     if (D.has_gpl) {
         double q = 1000.0 / (double)fq.QuadPart;
         printf("nvn_vk_gpl: pair libraries compiled by the workers: %lld (%.0f ms of worker time; %lld of them asked for as shared vertex stage x fragment stage without a program of its own: %d such fragment stages, %d shared vertex stages); "
@@ -1899,9 +2027,11 @@ static uint32_t g32(uint64_t a) { uint32_t v; memcpy(&v, (const void *)(uintptr_
 static uint64_t g64(uint64_t a) { uint64_t v; memcpy(&v, (const void *)(uintptr_t)a, 8); return v; }
 static void cont_predict(PairRec *pr, int i) {     /* g_sh_lock held */
     if (pr->sigs >> i & 1) return;
+    if (!D.has_vids && !pr->vs->vlay) return;      /* finding 116: layout not known yet (asked again when the pair is learnt again) */
     pr->sigs |= 1ull << i;
     PKey k = g_sig[i].k;
     k.vs = pr->vs->id; k.fs = pr->fs ? pr->fs->id : 0; k.sshade = pr->fs ? pr->sshade : 0;
+    if (!D.has_vids) pkey_vlay_set(&k, pr->vs->vlay);
     uint64_t h = fnv(0xcbf29ce484222325ULL, &k, sizeof k);
     if (pipe_find(&k, h)) return;
     Job *j = calloc(1, sizeof *j);

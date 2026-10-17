@@ -70,7 +70,7 @@ static void vkd_device_info(VkDeviceCreateInfo *di, const VkExtensionProperties 
     D.f2.pNext = &D.f11; D.f11.pNext = &D.f12; D.f12.pNext = &D.f13; tail = &D.f13.pNext;
     D.exts[D.next++] = "VK_KHR_swapchain";
 #define EXT(flag, name, st, stype) if (has_name(dext, ndext, name)) { D.flag = 1; D.exts[D.next++] = name; D.st.sType = stype; *tail = &D.st; tail = &D.st.pNext; }
-    EXT(has_vids, "VK_EXT_vertex_input_dynamic_state", vids, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_INPUT_DYNAMIC_STATE_FEATURES_EXT)
+    if (!(getenv("SSBU_VK_VIDS") && !atoi(getenv("SSBU_VK_VIDS")))) { EXT(has_vids, "VK_EXT_vertex_input_dynamic_state", vids, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_INPUT_DYNAMIC_STATE_FEATURES_EXT) }      /* SSBU_VK_VIDS=0, TEST: as a GPU without it (finding 116) */
     EXT(has_cbc, "VK_EXT_custom_border_color", cbc, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT)
     EXT(has_pv, "VK_EXT_provoking_vertex", pv, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROVOKING_VERTEX_FEATURES_EXT)
     EXT(has_iu8, "VK_EXT_index_type_uint8", iu8, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INDEX_TYPE_UINT8_FEATURES_EXT)
@@ -102,7 +102,9 @@ static void vkd_device_info(VkDeviceCreateInfo *di, const VkExtensionProperties 
                !D.ext_gpl ? "the driver has NO VK_EXT_graphics_pipeline_library: fallen back" : "the driver lacks extended dynamic state 3 or dynamic vertex input: fallen back", e ? e : "not set", VK_GPL_DEFAULT);
     }
     if (!D.f13.dynamicRendering || !D.f13.synchronization2) vkd_fail("the device lacks dynamicRendering / synchronization2");
-    if (!D.has_vids) nvn_vk_missing("a GPU without VK_EXT_vertex_input_dynamic_state (the vertex layout is not yet part of the pipeline key)");
+    if (!D.has_vids)                               /* finding 116: AMD Polaris (RX 400/500) on Windows, older drivers */
+        printf("nvn_vk: NO VK_EXT_vertex_input_dynamic_state%s: the vertex layout of a draw is part of its pipeline (numbered in ../cache/vk/vlayouts.bin); attribute divisors above 1: %s\n",
+               getenv("SSBU_VK_VIDS") && !atoi(getenv("SSBU_VK_VIDS")) ? " (SSBU_VK_VIDS=0, a test)" : " on this GPU", D.has_vad && D.vad.vertexAttributeInstanceRateDivisor ? "yes" : "NO");
     if (!D.f2.features.textureCompressionBC) nvn_vk_missing("a GPU without BC texture compression");
     di->enabledExtensionCount = D.next; di->ppEnabledExtensionNames = D.exts; di->pNext = &D.f2;
     printf("nvn_vk: features: vertex input dynamic %d, custom border colour %d, provoking vertex last %d, 8-bit indices %d, list restart %d, ASTC %d, depth clamp %d, wide lines %d, robust buffers %d\n",
@@ -541,6 +543,45 @@ static VkFormat vertex_vkfmt(int nf) {
     case 0x6A: return VK_FORMAT_A2B10G10R10_SINT_PACK32; case 0x6B: return VK_FORMAT_A2B10G10R10_USCALED_PACK32; case 0x6C: return VK_FORMAT_A2B10G10R10_SSCALED_PACK32;
     }
     return VK_FORMAT_UNDEFINED;
+}
+/* The vertex input of a draw as Vulkan describes it (the draw, and the look-ahead of nvn_vk_m4.c). Attribute i reads
+ * location i; a stream an attribute names that has a buffer (bit set in `present`) gets a binding of its own, in the order
+ * first met; an attribute without one reads (0, 0, 0, 1) from a constant binding placed last (integer inputs the integer
+ * copy at offset 16). bstream[b]: the stream of binding b, -1 for the constant one. *badfmt: a format Vulkan has no
+ * equivalent for (its attribute reads the constant), 0 when none. vstream: {stride, divisor} of each stream. */
+static void vin_describe(int nattr, const uint32_t *vattr, const uint32_t *vstream, uint32_t present, uint32_t ints, uint32_t sints,
+                         VkVertexInputBindingDescription2EXT *bd, uint32_t *pnb, VkVertexInputAttributeDescription2EXT *ad, uint32_t *pna, int *bstream, int *badfmt) {
+    uint32_t nb = 0, na = 0, bmap[32], need_const = 0;
+    memset(bmap, 0xff, sizeof bmap);
+    *badfmt = 0;
+    for (int i = 0; i < 16; i++) {
+        uint32_t a = i < nattr ? vattr[i] : 0;
+        int nf = (int)(a & 0xff), stream = (int)((a >> 8) & 31);
+        VkFormat f = nf ? vertex_vkfmt(nf) : VK_FORMAT_UNDEFINED;
+        if (nf && !f && !*badfmt) *badfmt = nf;
+        memset(&ad[na], 0, sizeof ad[na]);
+        ad[na].sType = VK_STRUCTURE_TYPE_VERTEX_INPUT_ATTRIBUTE_DESCRIPTION_2_EXT; ad[na].location = (uint32_t)i;
+        if (f && stream < 16 && (present >> stream & 1)) {
+            if (bmap[stream] == 0xffffffffu) {
+                bmap[stream] = nb;
+                memset(&bd[nb], 0, sizeof bd[nb]);
+                bd[nb].sType = VK_STRUCTURE_TYPE_VERTEX_INPUT_BINDING_DESCRIPTION_2_EXT; bd[nb].binding = nb; bd[nb].stride = vstream[stream * 2];
+                bd[nb].inputRate = vstream[stream * 2 + 1] ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX; bd[nb].divisor = vstream[stream * 2 + 1] ? vstream[stream * 2 + 1] : 1;
+                bstream[nb] = stream; nb++;
+            }
+            ad[na].binding = bmap[stream]; ad[na].format = f; ad[na].offset = a >> 14; na++;
+        } else {                                   /* not supplied: (0, 0, 0, 1), as OpenGL's current attribute value; integer inputs take the integer copy */
+            ad[na].binding = 16; ad[na].format = (ints >> i & 1) ? ((sints >> i & 1) ? VK_FORMAT_R32G32B32A32_SINT : VK_FORMAT_R32G32B32A32_UINT) : VK_FORMAT_R32G32B32A32_SFLOAT; ad[na].offset = (ints >> i & 1) ? 16 : 0;
+            need_const = 1; na++;
+        }
+    }
+    if (need_const) {
+        memset(&bd[nb], 0, sizeof bd[nb]);
+        bd[nb].sType = VK_STRUCTURE_TYPE_VERTEX_INPUT_BINDING_DESCRIPTION_2_EXT; bd[nb].binding = nb; bd[nb].stride = 0; bd[nb].inputRate = VK_VERTEX_INPUT_RATE_INSTANCE; bd[nb].divisor = 1;
+        for (uint32_t i = 0; i < na; i++) if (ad[i].binding == 16) ad[i].binding = nb;
+        bstream[nb] = -1; nb++;
+    }
+    *pnb = nb; *pna = na;
 }
 
 /* ---------------------------------------------------------------- images */
@@ -2288,6 +2329,14 @@ static int draw_prepare(unsigned prim) {
     if (nvn_front_draw_tag()) { memcpy(g_dt_voff, voff, sizeof g_dt_voff); memcpy(g_dt_vb, vbufs, sizeof g_dt_vb); }      /* round 17, test (SSBU_DRAWTAG) */
     R.cb_draws += from_cb;
     PT(3);
+    /* the vertex input, described before the pipeline: without VK_EXT_vertex_input_dynamic_state its layout is part of the key */
+    VkVertexInputBindingDescription2EXT vbd[17];
+    VkVertexInputAttributeDescription2EXT vad[16];
+    uint32_t vnb, vna, present = 0;
+    int vbs[17], badfmt;
+    for (int i = 0; i < 16; i++) if (voff[i] != ~0ull) present |= 1u << i;
+    vin_describe(R.nattr, R.vattr, (const uint32_t *)R.vstream, present, ints, sints, vbd, &vnb, vad, &vna, vbs, &badfmt);
+    if (badfmt) { static char msg[64]; snprintf(msg, sizeof msg, "vertex attribute format 0x%x", badfmt); nvn_vk_missing(msg); }
     /* 3. pass and pipeline */
     if (!pass_begin()) return 0;
     PT(4);
@@ -2299,6 +2348,7 @@ static int draw_prepare(unsigned prim) {
         k.a2c = R.ms[1] != 0; k.dclamp = R.depth_clamp && D.f2.features.depthClamp; k.blend_on = R.blend_on;
         memcpy(k.blend, R.blend, sizeof k.blend);
     }
+    if (!D.has_vids) { uint32_t n = vlay_number(vbd, vnb, vad, vna); pkey_vlay_set(&k, n); vs->vlay = n; }      /* finding 116 */
     pkey_targets(&k);
     Pipe *p = pipe_get(&k, vs, fs);
     if (!p) return 0;                              /* shader_wait = skip: the pipeline is being made by a worker, the draw is left out (counted in pipe_get) */
@@ -2311,43 +2361,13 @@ static int draw_prepare(unsigned prim) {
         if (topo[prim] != g_dsh_topo || !dsh_on()) { vkCmdSetPrimitiveTopology(R.cmd, (VkPrimitiveTopology)topo[prim]); g_dsh_topo = topo[prim]; g_dsh_sent++; } else g_dsh_kept++;
         if (rst != g_dsh_rst || !dsh_on()) { vkCmdSetPrimitiveRestartEnable(R.cmd, rst); g_dsh_rst = rst; g_dsh_sent++; } else g_dsh_kept++; }
     PT(6);
-    /* 4. vertex input */
+    /* 4. vertex input (described above; without the extension the bound pipeline holds the layout) */
     {
-        VkVertexInputBindingDescription2EXT bd[17];
-        VkVertexInputAttributeDescription2EXT ad[16];
         VkBuffer vb[17];
         VkDeviceSize vo[17];
-        uint32_t nb = 0, na = 0, bmap[32], need_const = 0;
-        memset(bmap, 0xff, sizeof bmap);
-        for (int i = 0; i < 16; i++) {
-            uint32_t a = i < R.nattr ? R.vattr[i] : 0;
-            int nf = (int)(a & 0xff), stream = (int)((a >> 8) & 31);
-            VkFormat f = nf ? vertex_vkfmt(nf) : VK_FORMAT_UNDEFINED;
-            if (nf && !f) { static char msg[64]; snprintf(msg, sizeof msg, "vertex attribute format 0x%x", nf); nvn_vk_missing(msg); }
-            memset(&ad[na], 0, sizeof ad[na]);
-            ad[na].sType = VK_STRUCTURE_TYPE_VERTEX_INPUT_ATTRIBUTE_DESCRIPTION_2_EXT; ad[na].location = (uint32_t)i;
-            if (f && stream < 16 && voff[stream] != ~0ull) {
-                if (bmap[stream] == 0xffffffffu) {
-                    bmap[stream] = nb;
-                    memset(&bd[nb], 0, sizeof bd[nb]);
-                    bd[nb].sType = VK_STRUCTURE_TYPE_VERTEX_INPUT_BINDING_DESCRIPTION_2_EXT; bd[nb].binding = nb; bd[nb].stride = R.vstream[stream].stride;
-                    bd[nb].inputRate = R.vstream[stream].divisor ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX; bd[nb].divisor = R.vstream[stream].divisor ? R.vstream[stream].divisor : 1;
-                    vb[nb] = vbufs[stream]; vo[nb] = voff[stream]; nb++;
-                }
-                ad[na].binding = bmap[stream]; ad[na].format = f; ad[na].offset = a >> 14; na++;
-            } else if (vs->dep >> i & 1 || 1) {       /* not supplied: (0, 0, 0, 1), as OpenGL's current attribute value; integer inputs take the integer copy */
-                ad[na].binding = 16; ad[na].format = (ints >> i & 1) ? ((sints >> i & 1) ? VK_FORMAT_R32G32B32A32_SINT : VK_FORMAT_R32G32B32A32_UINT) : VK_FORMAT_R32G32B32A32_SFLOAT; ad[na].offset = (ints >> i & 1) ? 16 : 0;
-                need_const = 1; na++;
-            }
-        }
-        if (need_const) {
-            memset(&bd[nb], 0, sizeof bd[nb]);
-            bd[nb].sType = VK_STRUCTURE_TYPE_VERTEX_INPUT_BINDING_DESCRIPTION_2_EXT; bd[nb].binding = nb; bd[nb].stride = 0; bd[nb].inputRate = VK_VERTEX_INPUT_RATE_INSTANCE; bd[nb].divisor = 1;
-            for (uint32_t i = 0; i < na; i++) if (ad[i].binding == 16) ad[i].binding = nb;
-            vb[nb] = R.zero; vo[nb] = 65536; nb++;
-        }
-        vkCmdSetVertexInputEXT(R.cmd, nb, bd, na, ad);
-        if (nb) vkCmdBindVertexBuffers(R.cmd, 0, nb, vb, vo);
+        for (uint32_t b = 0; b < vnb; b++) { if (vbs[b] < 0) { vb[b] = R.zero; vo[b] = 65536; } else { vb[b] = vbufs[vbs[b]]; vo[b] = voff[vbs[b]]; } }
+        if (D.has_vids) vkCmdSetVertexInputEXT(R.cmd, vnb, vbd, vna, vad);
+        if (vnb) vkCmdBindVertexBuffers(R.cmd, 0, vnb, vb, vo);
     }
     PT(7);
     /* 5. descriptors */
@@ -2486,7 +2506,7 @@ static void stencil_clear_masked(uint32_t mask, uint32_t value, int sx, int sy, 
     vkCmdSetDepthTestEnable(R.cmd, VK_FALSE); vkCmdSetDepthWriteEnable(R.cmd, VK_FALSE); vkCmdSetDepthCompareOp(R.cmd, VK_COMPARE_OP_ALWAYS); vkCmdSetStencilTestEnable(R.cmd, VK_TRUE);
     vkCmdSetStencilOp(R.cmd, VK_STENCIL_FACE_FRONT_AND_BACK, VK_STENCIL_OP_REPLACE, VK_STENCIL_OP_REPLACE, VK_STENCIL_OP_REPLACE, VK_COMPARE_OP_ALWAYS);
     vkCmdSetDepthBiasEnable(R.cmd, VK_FALSE); vkCmdSetPrimitiveRestartEnable(R.cmd, VK_FALSE); vkCmdSetRasterizerDiscardEnable(R.cmd, VK_FALSE);
-    vkCmdSetVertexInputEXT(R.cmd, 0, NULL, 0, NULL);
+    if (D.has_vids) vkCmdSetVertexInputEXT(R.cmd, 0, NULL, 0, NULL);      /* without the extension: layout 0 of the key, no vertex input */
     vkCmdDraw(R.cmd, 3, 1, 0, 0);
     R.pipe_bound = NULL; R.dyn_dirty = 1;
     dsh_forget();

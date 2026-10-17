@@ -44,7 +44,8 @@ the **builder package**: the same source plus the free tools the build needs, so
   and reads no keys.
 - Optional: your console's system font in `<dump>\sysdata\fonts\` ([BUILDING.md](BUILDING.md#system-fonts)); without it
   a font of your PC stands in.
-- Windows 10/11 x64 and a GPU with a Vulkan 1.3 driver.
+- Windows 10/11 x64 and a GPU with a Vulkan 1.3 driver. AMD RX 400/500 cards (Polaris) run on a fallback path that is new
+  and not yet confirmed on a real card: a log from one is welcome.
 - With the builder package: nothing else. From the source alone: Python 3.10+ and the free tools listed in
   [BUILDING.md](BUILDING.md#what-you-need-on-your-pc).
 
