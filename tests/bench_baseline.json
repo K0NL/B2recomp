@@ -1,0 +1,56 @@
+{
+ "date": "2026-10-16",
+ "exe": "build\\game_native.exe",
+ "route": "tests\\route_first_fight.txt",
+ "seconds": 200,
+ "window": 5400,
+ "runs": [
+  "mg_1",
+  "mg_2",
+  "mg_3",
+  "mg_4",
+  "mg_5"
+ ],
+ "metrics": {
+  "fps_window": 59.469,
+  "fps_heavy": 59.469,
+  "low1_heavy": 50.38,
+  "below57": 0,
+  "slow_frames": 61.2,
+  "cpu_render": 4.362,
+  "render_us_draw": 4.668,
+  "cpu_lifted": 9.868,
+  "heavy_segs": 17.6,
+  "load_s": 15.0
+ },
+ "spread": {
+  "fps_window": 0.073,
+  "fps_heavy": 0.072,
+  "low1_heavy": 3.1,
+  "below57": 0,
+  "slow_frames": 72,
+  "cpu_render": 1.028,
+  "render_us_draw": 0.206,
+  "cpu_lifted": 1.506,
+  "heavy_segs": 2,
+  "load_s": 0.0
+ },
+ "margin": {
+  "fps_window": 0.3,
+  "fps_heavy": 0.3,
+  "low1_heavy": 6.2,
+  "below57": 1,
+  "slow_frames": 144,
+  "cpu_render": 2.056,
+  "render_us_draw": 0.412,
+  "cpu_lifted": 3.012,
+  "heavy_segs": 4,
+  "load_s": 0.3
+ },
+ "shot_margin": {
+  "frame_1500.bmp": 12,
+  "frame_3000.bmp": 17.9
+ },
+ "tutorial_poll": 1223.4,
+ "note": "made by scripts/bench.py --save-baseline; screenshots in build/bench/baseline/shots"
+}

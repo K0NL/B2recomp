@@ -1,0 +1,128 @@
+# .gitignore of the separate, clean public B2recomp repository: copy THIS file into that folder as `.gitignore`
+# (never the private save-point repo's own .gitignore, which is a deny-list and lets notes/, CLAUDE.md etc. through).
+# Allowlist: everything is ignored, then each publishable path is let back in by name.
+# Build the public repo in a NEW folder: list the files this allowlist lets through with the command in
+# notes/release-audit.md section 5 ("Publish list"), copy exactly those, then copy this file in as .gitignore.
+# See notes/release-audit.md for why each path is (not) here.
+
+# ---- 1. ignore everything
+*
+# ...but let git descend into folders so the ! rules below can match files inside them
+!*/
+
+# ---- 2. top-level files we write for the public repo
+!/.gitignore
+!/LICENSE
+!/NOTICE.md
+!/README.md
+!/BUILDING.md
+
+# ---- 3. lifter (GPL-3.0 copy of ssbu-recomp tools/lifter + our changes)
+!/lifter/LICENSE
+!/lifter/gen_quad_tests.py
+!/lifter/README.md
+!/lifter/recomp.py
+!/lifter/recomp_eh.py
+!/lifter/regcache.py
+!/lifter/rt_ext.h
+!/lifter/sdklift.py
+!/lifter/sdklift_install.txt
+!/lifter/sdklift_roots.txt
+!/lifter/test_ext.py
+
+# ---- 4. runtime (GPL-3.0 copy of ssbu-recomp runtime/ + our changes): hand-written sources only
+!/runtime/LICENSE
+!/runtime/UPSTREAM.md
+!/runtime/*.c
+!/runtime/*.h
+!/runtime/*.inc
+!/runtime/build_glslang.bat
+!/runtime/gen/make_gen.py
+# runtime/gen/* other than make_gen.py is generated from the user's dump (sdk.elf, sdklift_gen.c, sdkdata.c,
+# image_layout.h, imports_all.txt, sdklift_report.txt, ...): stays ignored by rule 1.
+
+# ---- 5. launcher (source only; art and icon come from the user's own files at build time)
+!/launcher/launcher.c
+!/launcher/launcher.manifest
+
+# ---- 6. scripts (only the keyless versions; see the audit for the ones that must change first)
+!/scripts/build_launcher.py
+!/scripts/build_runtime.py
+!/scripts/compile_main.py
+!/scripts/cpk.py
+!/scripts/dumptex_compare.py
+!/scripts/gfx_compare.ps1
+!/scripts/setup.py
+!/scripts/bench.py
+!/scripts/make_package.py
+!/scripts/package/build.bat
+!/scripts/package/licenses/*.txt
+!/scripts/toolchain.py
+!/scripts/lift.py
+!/scripts/lift_gaps.py
+!/scripts/make_icon_local.py
+!/scripts/p15_summary.py
+!/scripts/pgdat.py
+!/scripts/play.ps1
+!/scripts/rt_stubs.c
+!/scripts/run_boot.ps1
+!/scripts/runtime_coverage.py
+!/scripts/sdk_dis.py
+!/scripts/ghidra/ExportOverview.java
+!/scripts/ghidra/Query.java
+# NOT allowed back in: nsp_extract.py, make_icon.py, fw_fonts.py (decrypt with prod.keys: the risky NSP option, kept out
+# of the public repo and of the default flow), ghidra-query.ps1 (personal path)
+!/tools/extract/nso2elf.py
+# (GPL-3.0 copy from ssbu-recomp: NSO -> ELF, LZ4 only, no keys; used by setup.py convert and runtime/gen/make_gen.py)
+
+# ---- 7. default configuration (copy the COMMITTED defaults, `git show HEAD:config/<file>`, never the working copies)
+!/config/graphics.ini
+!/config/controllers.ini
+
+# ---- 7b. the standard test run: scripted button presses and numbers (bench_baseline.json: see the end of the file)
+!/tests/route_first_fight.txt
+
+# ---- 8. documentation written for the public (never notes/, evidence/, CLAUDE.md)
+!/docs/*.md
+
+# ---- 9. belt and braces: these never go in, even if a rule above would match
+**/__pycache__/
+*.pyc
+*.elf
+*.nso
+*.nca
+*.nsp
+*.xci
+*.npdm
+*.keys
+*.cpk
+*.dat
+*.bnsh
+*.ico
+*.bmp
+*.png
+*.jpg
+*.res
+*.rc
+*.obj
+*.lib
+*.exp
+*.dll
+*.exe
+*.pdb
+*.ilk
+*.lnk
+*.json
+/build/
+/targets/
+/deps/
+/evidence/
+/snapshots/
+/notes/
+/CLAUDE.md
+/runtime/obj_host/
+/lifter/eh_main_tables.json
+
+# ---- 10. exceptions to rule 9 (a later rule wins): checked files only
+# numbers of the standard test run (fps, CPU ms, margins, run names); no game strings, no images
+!/tests/bench_baseline.json

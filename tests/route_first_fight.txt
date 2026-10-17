@@ -1,0 +1,88 @@
+# B2recomp standard test route (scripts/bench.py): the post-prologue save (build/saves/after-prologue) -> CONTINUE ->
+# the chapter's tutorial -> the first fight (rooftop, 700-1300 draws per frame, Bayonetta dodging); 90 s of it are scored.
+# SSBU_SEQ syntax (runtime/nnhid.c): <n>:<keys>[/<hold>] = wait n polls, hold the keys (default 8 polls);
+# @draws:<lo>-<hi>/<n> = wait for that draw count for n polls; @until:<lo>-<hi>/<n>:<keys>/<period> = press the keys
+# every period polls until the draw count stays in lo..hi for n polls. Keys: Z X C V = A B X Y, Q E = L R,
+# A S = ZL ZR, u d l r = left stick, ! = Plus, - = Minus. At most 256 steps. '#' starts a comment.
+# 'seconds = N': the run length; 'window = N': scripts/bench.py scores N presented frames from the fight's start.
+# Game controls used: X (C) punch, A (Z) kick, hold X/A mid-combo = guns, ZR (S) dodge; the tutorial's "Next" is Minus.
+seconds = 200
+window = 5400
+
+# title screen (65-95 draws) -> PRESS ANY BUTTON, LOAD GAME slot 1, auto-save notice, STORY, CONTINUE; touch-controls page
+@draws:65-95/30 30:Z 180:Z 150:Z 150:Z 150:Z 150:Z
+# the tutorial is drawn (300+ draws for 30 polls); two pages of the intro, 240 and 368 polls after it appeared. Not
+# /120: one frame under 300 draws (a camera cut 120-150 polls in) can restart that count, which moved every later step
+# by ~110 polls in the llvm-mingw build (finding 95)
+@draws:300-4000/30 210:Z 120:Z
+# lesson Punch (X), Next
+90:C 60:C 60:C 60:-
+# lesson Kick (A), Next
+90:Z 60:Z 60:Z 60:-
+# lesson Combo, Next
+90:C 15:C 15:C 15:Z 90:C 15:C 15:Z 15:Z 60:-
+# lesson Shoot: hold X or A mid-combo (several forms; extra ones do nothing once the lesson is done), Next
+40:C 10:C/120 60:- 40:Z 10:Z/120 60:- 40:C 10:C 10:C/120 60:- 40:C 10:Z/120 60:-
+# lesson Evade (ZR), Next
+60:S 40:S 40:S 60:- 60:S 40:S 60:-
+# lesson Witch Time (dodge at the last instant; timing luck): dodge + Next every 30 polls until the fade to the
+# fight (17 polls under 60 draws; the tutorial never goes under ~500). No Minus after this: in the fight it opens the menu.
+@until:0-100/8:S-/30
+# the fight is drawn (> 700 draws for 1 s)
+@draws:700-4000/60
+# the fight: Bayonetta only dodges (ZR, backwards / left / backwards / right) twice a second and never attacks, so the
+# first wave stays on screen and attacks her the whole time (700-1300 draws per frame). Her health still runs out: she
+# died 100-120 s into the fight dodging once a second, ~123 s at this rhythm; so only 90 s (window = 5400 frames) are
+# scored. A version that fought (combos into 4 s gun holds) killed the wave at a different moment in each run, ran into
+# the game's own 30 fps cutscene (65 s) and the next wave, where she died at different moments: runs went elsewhere.
+30:S 30:Sl 30:S 30:Sr
+30:S 30:Sl 30:S 30:Sr
+30:S 30:Sl 30:S 30:Sr
+30:S 30:Sl 30:S 30:Sr
+30:S 30:Sl 30:S 30:Sr
+30:S 30:Sl 30:S 30:Sr
+30:S 30:Sl 30:S 30:Sr
+30:S 30:Sl 30:S 30:Sr
+30:S 30:Sl 30:S 30:Sr
+30:S 30:Sl 30:S 30:Sr
+30:S 30:Sl 30:S 30:Sr
+30:S 30:Sl 30:S 30:Sr
+30:S 30:Sl 30:S 30:Sr
+30:S 30:Sl 30:S 30:Sr
+30:S 30:Sl 30:S 30:Sr
+30:S 30:Sl 30:S 30:Sr
+30:S 30:Sl 30:S 30:Sr
+30:S 30:Sl 30:S 30:Sr
+30:S 30:Sl 30:S 30:Sr
+30:S 30:Sl 30:S 30:Sr
+30:S 30:Sl 30:S 30:Sr
+30:S 30:Sl 30:S 30:Sr
+30:S 30:Sl 30:S 30:Sr
+30:S 30:Sl 30:S 30:Sr
+30:S 30:Sl 30:S 30:Sr
+30:S 30:Sl 30:S 30:Sr
+30:S 30:Sl 30:S 30:Sr
+30:S 30:Sl 30:S 30:Sr
+30:S 30:Sl 30:S 30:Sr
+30:S 30:Sl 30:S 30:Sr
+30:S 30:Sl 30:S 30:Sr
+30:S 30:Sl 30:S 30:Sr
+30:S 30:Sl 30:S 30:Sr
+30:S 30:Sl 30:S 30:Sr
+30:S 30:Sl 30:S 30:Sr
+30:S 30:Sl 30:S 30:Sr
+30:S 30:Sl 30:S 30:Sr
+30:S 30:Sl 30:S 30:Sr
+30:S 30:Sl 30:S 30:Sr
+30:S 30:Sl 30:S 30:Sr
+30:S 30:Sl 30:S 30:Sr
+30:S 30:Sl 30:S 30:Sr
+30:S 30:Sl 30:S 30:Sr
+30:S 30:Sl 30:S 30:Sr
+30:S 30:Sl 30:S 30:Sr
+30:S 30:Sl 30:S 30:Sr
+30:S 30:Sl 30:S 30:Sr
+30:S 30:Sl 30:S 30:Sr
+30:S 30:Sl 30:S 30:Sr
+30:S 30:Sl 30:S 30:Sr
+30:S 30:Sl 30:S 30:Sr

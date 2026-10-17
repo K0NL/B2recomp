@@ -1,0 +1,417 @@
+/* Boot driver: runs the game's own start-up code (nninitStartup, static
+ * constructors, nnMain) on the lifted binary and records which functions of
+ * other modules it asks for, in order. Unimplemented imports return 0. */
+#include <stdio.h>
+#include <stdlib.h>
+#include <malloc.h>
+#include <math.h>
+#include <windows.h>
+#include "runtime.h"
+#include "hostrt.h"
+
+#include "image_layout.h"          /* [Recomps#1] entry points of our main, by exported name */
+#define NNINIT_STARTUP (GUEST_BASE + NNINIT_STARTUP_OFF)
+#define NN_MAIN (GUEST_BASE + NN_MAIN_OFF)
+#include "image_layout.h"          /* [Recomps#1] INIT_ARRAY_OFF / INIT_ARRAY_SIZE from our main.elf */
+#define INIT_ARRAY (GUEST_BASE + INIT_ARRAY_OFF)
+
+#define A0 (c->x[0])
+#define A1 (c->x[1])
+#define A2 (c->x[2])
+#define RET(v) (c->x[0] = (uint64_t)(v))
+#define P(n) ((void *)(uintptr_t)c->x[n])
+
+/* ---- C heap */
+static void i_malloc(Ctx *c) { RET(_aligned_malloc(A0 ? (size_t)A0 : 1, 16)); }
+static void i_free(Ctx *c) { _aligned_free(P(0)); }
+static void i_calloc(Ctx *c) { size_t n = (size_t)(A0 * A1); void *p = _aligned_malloc(n ? n : 1, 16); if (p) memset(p, 0, n); RET(p); }
+static void i_realloc(Ctx *c) { RET(_aligned_realloc(P(0), A1 ? (size_t)A1 : 1, 16)); }
+static void i_aligned_alloc(Ctx *c) { RET(_aligned_malloc(A1 ? (size_t)A1 : 1, A0 < 16 ? 16 : (size_t)A0)); }
+static void i_new_aligned(Ctx *c) { RET(_aligned_malloc(A0 ? (size_t)A0 : 1, A1 < 16 ? 16 : (size_t)A1)); }
+static void i_posix_memalign(Ctx *c) {
+    void *p = _aligned_malloc(A2 ? (size_t)A2 : 1, A1 < 16 ? 16 : (size_t)A1);
+    wr64(A0, (uint64_t)p);
+    RET(p ? 0 : 12);
+}
+static void i_usable_size(Ctx *c) { RET(A0 ? _aligned_msize(P(0), 16, 0) : 0); }
+
+/* ---- C strings and memory */
+static void i_memcpy(Ctx *c) { memcpy(P(0), P(1), (size_t)A2); }
+static void i_memmove(Ctx *c) { memmove(P(0), P(1), (size_t)A2); }
+static void i_memset(Ctx *c) { memset(P(0), (int)A1, (size_t)A2); }
+static void i_memcmp(Ctx *c) { RET((int64_t)memcmp(P(0), P(1), (size_t)A2)); }
+static void i_memchr(Ctx *c) { RET(memchr(P(0), (int)A1, (size_t)A2)); }
+static void i_strlen(Ctx *c) { RET(strlen(P(0))); }
+static void i_strnlen(Ctx *c) { RET(strnlen(P(0), (size_t)A1)); }
+static void i_strcmp(Ctx *c) { RET((int64_t)strcmp(P(0), P(1))); }
+static void i_strncmp(Ctx *c) { RET((int64_t)strncmp(P(0), P(1), (size_t)A2)); }
+static void i_strcpy(Ctx *c) { strcpy(P(0), P(1)); }
+static void i_strncpy(Ctx *c) { strncpy(P(0), P(1), (size_t)A2); }
+static void i_strcat(Ctx *c) { strcat(P(0), P(1)); }
+static void i_strchr(Ctx *c) { RET(strchr(P(0), (int)A1)); }
+static void i_strrchr(Ctx *c) { RET(strrchr(P(0), (int)A1)); }
+static void i_strstr(Ctx *c) { RET(strstr(P(0), P(1))); }
+
+/* ---- C++ runtime */
+static void i_guard_acquire(Ctx *c) { RET(rd8(A0) == 0); }
+static void i_guard_release(Ctx *c) { wr8(A0, 1); }
+static void i_ret0(Ctx *c) { RET(0); }
+static void i_abort(Ctx *c) { guest_trap("guest called abort()", c->x[30] - 4); }
+
+/* ---- math: arguments and result in v0/v1 */
+#define M1F(n, fn) static void n(Ctx *c) { float r = fn(c->v[0].f[0]); vzero(&c->v[0]); c->v[0].f[0] = r; }
+#define M2F(n, fn) static void n(Ctx *c) { float r = fn(c->v[0].f[0], c->v[1].f[0]); vzero(&c->v[0]); c->v[0].f[0] = r; }
+#define M1D(n, fn) static void n(Ctx *c) { double r = fn(c->v[0].df[0]); vzero(&c->v[0]); c->v[0].df[0] = r; }
+#define M2D(n, fn) static void n(Ctx *c) { double r = fn(c->v[0].df[0], c->v[1].df[0]); vzero(&c->v[0]); c->v[0].df[0] = r; }
+M1F(m_sinf, sinf) M1F(m_cosf, cosf) M1F(m_tanf, tanf) M1F(m_asinf, asinf) M1F(m_acosf, acosf) M1F(m_atanf, atanf)
+M1F(m_expf, expf) M1F(m_exp2f, exp2f) M1F(m_logf, logf) M1F(m_log2f, log2f) M1F(m_log10f, log10f) M1F(m_sqrtf, sqrtf)
+M1F(m_floorf, floorf) M1F(m_ceilf, ceilf) M1F(m_roundf, roundf) M1F(m_truncf, truncf) M1F(m_fabsf, fabsf)
+M2F(m_atan2f, atan2f) M2F(m_powf, powf) M2F(m_fmodf, fmodf)
+M1D(m_sin, sin) M1D(m_cos, cos) M1D(m_tan, tan) M1D(m_asin, asin) M1D(m_acos, acos) M1D(m_atan, atan)
+M1D(m_exp, exp) M1D(m_log, log) M1D(m_log2, log2) M1D(m_log10, log10) M1D(m_sqrt, sqrt)
+M1D(m_floor, floor) M1D(m_ceil, ceil) M1D(m_round, round) M1D(m_trunc, trunc) M1D(m_fabs, fabs)
+M2D(m_atan2, atan2) M2D(m_pow, pow) M2D(m_fmod, fmod)
+
+static const ImportDef base_imports[] = {
+    {"malloc", i_malloc}, {"free", i_free}, {"calloc", i_calloc}, {"realloc", i_realloc},
+    {"aligned_alloc", i_aligned_alloc}, {"memalign", i_aligned_alloc}, {"posix_memalign", i_posix_memalign},
+    {"malloc_usable_size", i_usable_size},
+    {"_Znwm", i_malloc}, {"_Znam", i_malloc}, {"_ZdlPv", i_free}, {"_ZdaPv", i_free},
+    {"_ZnwmRKSt9nothrow_t", i_malloc}, {"_ZnamRKSt9nothrow_t", i_malloc},
+    {"_ZdlPvm", i_free}, {"_ZdaPvm", i_free}, {"_ZdlPvRKSt9nothrow_t", i_free}, {"_ZdaPvRKSt9nothrow_t", i_free},
+    {"_ZnwmSt11align_val_t", i_new_aligned}, {"_ZnamSt11align_val_t", i_new_aligned},
+    {"_ZdlPvSt11align_val_t", i_free}, {"_ZdaPvSt11align_val_t", i_free},
+    {"memcpy", i_memcpy}, {"memmove", i_memmove}, {"memset", i_memset}, {"memcmp", i_memcmp}, {"memchr", i_memchr},
+    {"strlen", i_strlen}, {"strnlen", i_strnlen}, {"strcmp", i_strcmp}, {"strncmp", i_strncmp}, {"strcpy", i_strcpy},
+    {"strncpy", i_strncpy}, {"strcat", i_strcat}, {"strchr", i_strchr}, {"strrchr", i_strrchr}, {"strstr", i_strstr},
+    {"__cxa_guard_acquire", i_guard_acquire}, {"__cxa_guard_release", i_guard_release}, {"__cxa_guard_abort", i_ret0},
+    {"__cxa_atexit", i_ret0}, {"abort", i_abort},
+    {"sinf", m_sinf}, {"cosf", m_cosf}, {"tanf", m_tanf}, {"asinf", m_asinf}, {"acosf", m_acosf}, {"atanf", m_atanf},
+    {"expf", m_expf}, {"exp2f", m_exp2f}, {"logf", m_logf}, {"log2f", m_log2f}, {"log10f", m_log10f}, {"sqrtf", m_sqrtf},
+    {"floorf", m_floorf}, {"ceilf", m_ceilf}, {"roundf", m_roundf}, {"truncf", m_truncf}, {"fabsf", m_fabsf},
+    {"atan2f", m_atan2f}, {"powf", m_powf}, {"fmodf", m_fmodf},
+    {"sin", m_sin}, {"cos", m_cos}, {"tan", m_tan}, {"asin", m_asin}, {"acos", m_acos}, {"atan", m_atan},
+    {"exp", m_exp}, {"log", m_log}, {"log2", m_log2}, {"log10", m_log10}, {"sqrt", m_sqrt},
+    {"floor", m_floor}, {"ceil", m_ceil}, {"round", m_round}, {"trunc", m_trunc}, {"fabs", m_fabs},
+    {"atan2", m_atan2}, {"pow", m_pow}, {"fmod", m_fmod},
+};
+
+void register_sdk_imports(void);         /* nnsdk.c */
+void register_cxx_imports(void);         /* libcxx.c */
+void register_thread_imports(void);      /* os_threads.c */
+void register_nvn_imports(void);         /* nvn_stub.c */
+void register_fs_imports(void);          /* nnfs.c */
+void register_clib_imports(void);        /* clib.c */
+void register_time_imports(void);        /* nntime.c */
+void register_hid_imports(void);         /* nnhid.c */
+void register_iostream_imports(void);    /* nniostream.c */
+void register_display_imports(void);     /* display.c */
+void register_pl_imports(void);          /* nnpl.c */
+void register_fontll_imports(void);      /* nnfontll.c */
+void register_movie_imports(void);       /* nnmovie.c */
+void register_misc_imports(void);        /* nnmisc.c */
+void register_audio_imports(void);       /* nnaudio.c */
+void register_ro_imports(void);          /* nnro.c */
+void register_sdk2_imports(void);        /* nnsdk2.c: sdklift_*.c, nnmii.c, nnapplet.c, nnalbum.c, nnnet.c, nnfsdir.c */
+void register_movie_mf_imports(void);    /* nnmovie_mf.c */
+void cxxrt_install_data(void);           /* nncxxrt.c: vtables / typeinfo objects of the C++ runtime (before runtime_init) */
+void register_unwind_imports(void);      /* nnunwind.c: C++ exception unwinding through lifted module code */
+void register_cxxrt_imports(void);       /* nncxxrt.c + nncxxlib.c + nnlibc2.c: C and C++ runtime, fills what is still missing */
+void display_init(void);
+int guest_thread_count(void);
+extern uint64_t g_main_stack_base, g_main_stack_size;
+
+void dump_guest_threads(FILE *out);      /* os_threads.c */
+void icall_dump(FILE *out, uint64_t main_ctx);   /* hostrt.c, SSBU_ICALLS */
+uint64_t icall_first_x0(uint64_t target);
+static Ctx *g_main_ctx;
+
+static const char *g_elf;
+
+/* Debug aid: SSBU_PROF=<start s>,<duration s> samples the main guest thread's host stack every ~2 ms in that
+ * window, unwinds it to guest functions and prints every (caller -> callee) pair seen with its sample count. */
+#define PROF_MAX 8192
+static struct { uint64_t callee, caller; unsigned n; } g_prof[PROF_MAX];
+static int g_prof_used;
+static HANDLE g_prof_target;
+static DWORD WINAPI profiler(LPVOID arg) {
+    int start = 0, dur = 0;
+    (void)arg;
+    char mode = 's';
+    if (sscanf(getenv("SSBU_PROF"), "%d,%d,%c", &start, &dur, &mode) < 2 || dur <= 0) return 0;
+    Sleep((DWORD)start * 1000);
+    ULONGLONG end = GetTickCount64() + (ULONGLONG)dur * 1000;
+    unsigned samples = 0;
+    if (mode == 'f') {        /* SSBU_PROF=<start>,<dur>,f : spin reading c->fn / x30: every function the main thread enters */
+        while (GetTickCount64() < end) {
+            for (int r = 0; r < 4096; r++) {
+                uint64_t callee = g_main_ctx->fn, caller = g_main_ctx->x[30];
+                unsigned h = (unsigned)((callee >> 2) * 2654435761u) % PROF_MAX;
+                while (g_prof[h].callee && g_prof[h].callee != callee) h = (h + 1) % PROF_MAX;
+                if (!g_prof[h].callee) { if (g_prof_used >= PROF_MAX - 16) continue; g_prof[h].callee = callee; g_prof[h].caller = caller; g_prof_used++; }
+                g_prof[h].n++;
+                samples++;
+            }
+        }
+        printf("\n[prof] %u reads of the main thread's current function (function, first lr seen: reads)\n", samples);
+        for (int j = 0; j < PROF_MAX; j++)
+            if (g_prof[j].callee)
+                printf("[prof] f_%llx lr %llx: %u\n", (unsigned long long)g_prof[j].callee, (unsigned long long)g_prof[j].caller, g_prof[j].n);
+        return 0;
+    }
+    while (GetTickCount64() < end) {
+        CONTEXT ctx;
+        uint64_t chain[64];
+        int k = 0;
+        memset(&ctx, 0, sizeof ctx);
+        ctx.ContextFlags = CONTEXT_FULL;
+        SuspendThread(g_prof_target);
+        GetThreadContext(g_prof_target, &ctx);
+        for (int depth = 0; depth < 400 && k < 64; depth++) {
+            uint64_t g = guest_function_of(ctx.Rip);
+            if (g && (k == 0 || chain[k - 1] != g)) chain[k++] = g;
+            DWORD64 base;
+            RUNTIME_FUNCTION *rf = RtlLookupFunctionEntry(ctx.Rip, &base, NULL);
+            if (!rf) break;
+            void *hd; DWORD64 est;
+            RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, ctx.Rip, rf, &ctx, &hd, &est, NULL);
+            if (!ctx.Rip) break;
+        }
+        ResumeThread(g_prof_target);
+        samples++;
+        for (int i = 0; i < k; i++) {
+            uint64_t callee = chain[i], caller = i + 1 < k ? chain[i + 1] : 0;
+            int j;
+            for (j = 0; j < g_prof_used; j++) if (g_prof[j].callee == callee && g_prof[j].caller == caller) break;
+            if (j == g_prof_used) { if (g_prof_used == PROF_MAX) continue; g_prof[g_prof_used].callee = callee; g_prof[g_prof_used].caller = caller; g_prof_used++; }
+            g_prof[j].n++;
+        }
+        for (ULONGLONG t0 = GetTickCount64(); GetTickCount64() - t0 < 1;) YieldProcessor();
+    }
+    printf("\n[prof] %u samples of the main thread (callee <- caller: samples)\n", samples);
+    for (int j = 0; j < g_prof_used; j++)
+        printf("[prof] f_%llx <- f_%llx: %u\n", (unsigned long long)g_prof[j].callee, (unsigned long long)g_prof[j].caller, g_prof[j].n);
+    return 0;
+}
+
+#include "prof15.c"       /* SSBU_PROF15: sampling profiler of every busy thread (test only). Included here, like nvn_vk.c includes its parts, so that
+                           * every link that has boot.c has it (build.py's source list is not changed): do NOT name prof15.c as a source of its own. */
+
+static size_t main_stack_size_from_npdm(void) {
+    const char *ov = getenv("SSBU_MAIN_STACK");
+    if (ov && strtoull(ov, NULL, 0) >= 0x10000) return (size_t)(strtoull(ov, NULL, 0) + 0xfff) & ~(size_t)0xfff;
+    char path[1024];
+    snprintf(path, sizeof path, "%s", g_elf);
+    char *sl = strrchr(path, '/'), *bs = strrchr(path, '\\');
+    char *cut = sl > bs ? sl : bs;
+    snprintf(cut ? cut + 1 : path, sizeof path - (size_t)((cut ? cut + 1 : path) - path), "main.npdm");
+    FILE *f = fopen(path, "rb");
+    unsigned char h[0x20];
+    if (!f || fread(h, 1, sizeof h, f) != sizeof h || memcmp(h, "META", 4)) {
+        fprintf(stderr, "missing input: %s (the program's meta data: main thread stack size)\n", path); exit(7);
+    }
+    fclose(f);
+    uint32_t size; memcpy(&size, h + 0x1c, 4);
+    printf("main.npdm: main thread stack 0x%x bytes, priority %u, default core %u\n", size, h[0xe], h[0xf]);
+    return ((size_t)size + 0xfff) & ~(size_t)0xfff;
+}
+
+/* how much of the main guest stack was ever written (pages are zero until used) */
+void main_stack_report(void) {
+    extern uint64_t g_main_stack_base, g_main_stack_size;
+    if (!g_main_stack_base) return;
+    const uint64_t *p = (const uint64_t *)(uintptr_t)g_main_stack_base, *e = p + g_main_stack_size / 8;
+    while (p < e && !*p) p++;
+    MEMORY_BASIC_INFORMATION lo, hi;
+    VirtualQuery((void *)(uintptr_t)(g_main_stack_base - 0x1000), &lo, sizeof lo);
+    VirtualQuery((void *)(uintptr_t)(g_main_stack_base + g_main_stack_size), &hi, sizeof hi);
+    printf("main guest stack: 0x%llx bytes at %llx, deepest use 0x%llx bytes (%.1f%%); page below: %s, page above: %s\n",
+           (unsigned long long)g_main_stack_size, (unsigned long long)g_main_stack_base,
+           (unsigned long long)((const uint8_t *)e - (const uint8_t *)p), 100.0 * (double)((const uint8_t *)e - (const uint8_t *)p) / (double)g_main_stack_size,
+           lo.State == MEM_RESERVE ? "no access" : "ACCESSIBLE", hi.State == MEM_RESERVE ? "no access" : "ACCESSIBLE");
+}
+
+static DWORD WINAPI guest_main(LPVOID arg) {
+    (void)arg;
+    static Ctx c;
+    /* close5: the main thread's stack has the size the program's own meta data asks for (main.npdm, META header +0x1c:
+     * 0x100000 for this game; read from the file next to the ELF), with no-access pages below and above it, so that an
+     * overflow faults as it does on the console instead of running on. Guest frames are the original's (the lifted code
+     * moves the guest SP exactly as the ARM code does); the host's own frames live on the host stack and are not
+     * guest-visible. SSBU_MAIN_STACK=<bytes> overrides (diagnosis only). */
+    size_t stack_size = main_stack_size_from_npdm();
+    uint8_t *stack_res = VirtualAlloc(NULL, stack_size + 0x20000, MEM_RESERVE, PAGE_NOACCESS);
+    uint8_t *stack = stack_res ? VirtualAlloc(stack_res + 0x10000, stack_size, MEM_COMMIT, PAGE_READWRITE) : NULL;
+    if (!stack) { fprintf(stderr, "cannot allocate the main thread's stack (0x%llx bytes)\n", (unsigned long long)stack_size); exit(1); }
+    uint8_t *tls = VirtualAlloc(NULL, 0x10000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    c.x[31] = (uint64_t)(stack + stack_size);          /* the initial SP is the top of the stack (16-byte aligned: the size is whole pages) */
+    c.tpidr = (uint64_t)tls;
+    { uint64_t os_main_thread_type(void); memcpy(tls + 0x1f8, &(uint64_t){os_main_thread_type()}, 8); }   /* [sdk 0x3349dc..e0] nn::os::detail::ThreadManager(): the main thread's ThreadType pointer */
+    g_main_ctx = &c;
+    { void module_coverage_start(Ctx *main_ctx); module_coverage_start(&c); }   /* nnro.c: SSBU_MODCOV=1 */
+    { void os_apply_main_sched(void); os_apply_main_sched(); }                  /* os_threads.c: SSBU_OS_CONSOLE_CORES=1 */
+    { void hitch_set_main(Ctx *c); hitch_set_main(&c); }      /* hitch.c: SSBU_HITCH */
+    g_main_stack_base = (uint64_t)stack;
+    g_main_stack_size = stack_size;
+
+    printf("\n[phase 1] nninitStartup\n");
+    trace_printf("=== phase 1: nninitStartup\n");
+    call_guest(&c, NNINIT_STARTUP);
+
+    int count = (int)(INIT_ARRAY_SIZE / 8);
+    printf("[phase 2] %d static constructors\n", count);
+    trace_printf("=== phase 2: static constructors\n");
+    for (int i = 0; i < count; i++) {
+        uint64_t fn = rd64(INIT_ARRAY + (uint64_t)i * 8);
+        if (!fn) continue;
+        trace_printf("--- constructor %d at %llx\n", i, (unsigned long long)fn);
+        call_guest(&c, fn);
+    }
+
+    { void debug_mode_init(void); debug_mode_init(); }       /* debug_mode.c: test-only fast mode, nothing without SSBU_* variables */
+    printf("[phase 3] nnMain\n");
+    trace_printf("=== phase 3: nnMain\n");
+    call_guest(&c, NN_MAIN);
+    { void clib_run_atexit(Ctx *c); clib_run_atexit(&c); }   /* clib.c: functions registered with atexit, as a normal exit does */
+
+    printf("\nnnMain returned.\n");
+    print_import_summary(stdout);
+    return 0;
+}
+
+int main(int argc, char **argv) {
+    g_elf = argc > 1 ? argv[1] : "main.elf";        /* [Recomps#1] path of our main.elf; sdk.elf must sit beside it */
+    setvbuf(stdout, NULL, _IONBF, 0);
+    {   /* pad tools and their self-test (nnpad_sdl.c): no game is started */
+        int nnhid_pad_selftest(void), nnpad_tool(int, char **);
+        int tool;
+        if (getenv("SSBU_PAD_SELFTEST")) return nnhid_pad_selftest() != 0;
+        if ((tool = nnpad_tool(argc, argv)) >= 0) return tool;
+    }
+    /* track V: `--prepare-shaders [folder]` translates every stage of the shader containers in the folder (default
+     * ..\cache\vk_containers, filled by tools_vk/bnsh_extract.py) into ..\cache\vk; no game, no window, no GPU (nvn_vk_m4.c) */
+    if (argc > 1 && !strcmp(argv[1], "--prepare-shaders")) { int nvn_vk_prepare_shaders(const char *); return nvn_vk_prepare_shaders(argc > 2 ? argv[2] : NULL); }
+    /* data symbols the game imports from the SDK module get their real values (see gen_sdkdata.py) */
+    for (int i = 0; i < sdk_data_count; i++) {
+        void *copy = _aligned_malloc(sdk_data[i].size, 16);
+        memcpy(copy, sdk_data[i].bytes, sdk_data[i].size);
+        import_set_address(sdk_data[i].name, copy);
+    }
+    cxxrt_install_data();
+    runtime_init(g_elf, getenv("SSBU_TRACE") ? getenv("SSBU_TRACE") : "boot_trace.txt");
+    register_imports(base_imports, (int)(sizeof base_imports / sizeof base_imports[0]));
+    register_sdk_imports();
+    register_cxx_imports();
+    register_thread_imports();               /* later registrations replace earlier ones */
+    register_nvn_imports();
+    register_fs_imports();
+    register_clib_imports();                 /* full printf engine replaces the integer-only versions */
+    register_time_imports();
+    register_hid_imports();
+    register_display_imports();
+    register_pl_imports();
+    register_fontll_imports();
+    register_movie_imports();
+    register_misc_imports();                 /* only fills names nobody else implements */
+    register_audio_imports();
+    register_ro_imports();
+    register_movie_mf_imports();             /* replaces nnmovie.c's failing placeholder unless SSBU_MOVIE=0 */
+    register_iostream_imports();             /* libc++ stream base classes */
+    register_cxxrt_imports();                /* C / C++ runtime: everything still without a handler (keep last) */
+    register_unwind_imports();               /* installs the unwinder the C++ runtime calls on a throw */
+    { void register_r2_imports(void); register_r2_imports(); }   /* [Recomps#1] R2: our SDK 3.6.0 imports (r2_imports.c); register_sdk2 below only fills gaps */
+    register_sdk2_imports();                 /* SDK families (lifted sdk.elf code + offline service answers): fills only; after the C runtime because its self-test needs every handler */
+    { void audit_startup(void); audit_startup(); }   /* hostrt.c: fake audit / SSBU_STRICT (plan\FAKE_AUDIT.md) */
+    display_init();
+    int seconds = argc > 2 ? atoi(argv[2]) : 0;      /* no number = no time limit (a player's launch); tests pass theirs */
+    /* the lifted code uses the host stack for every guest call: give it plenty */
+    HANDLE t = CreateThread(NULL, (SIZE_T)1 << 30, guest_main, NULL, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
+    if (getenv("SSBU_PROF")) { g_prof_target = t; CloseHandle(CreateThread(NULL, 0, profiler, NULL, 0, NULL)); }
+    { void prof15_start(void); prof15_start(); }         /* prof15.c: SSBU_PROF15, every busy thread (test only; nothing without the variable) */
+    DWORD wr = WaitForSingleObject(t, seconds > 0 ? (DWORD)seconds * 1000 : INFINITE);
+    {   unsigned nvn_gl_held_ms(void);                   /* nvn_gl.c: time the presents were held for shader preparation is not run time */
+        for (unsigned done = 0, h; wr == WAIT_TIMEOUT && (h = nvn_gl_held_ms()) > done + 50; done = h) wr = WaitForSingleObject(t, h - done);
+    }
+    if (wr == WAIT_TIMEOUT) {
+        printf("\nstill running after %d s with %d guest thread(s) started: stopping here.\n", seconds, guest_thread_count());
+        trace_printf("=== stopped by the time limit after %d s\n", seconds);
+        main_stack_report();
+        if (g_main_ctx) {
+            printf("main thread: last function f_%llx  lr=%llx  %s%s (from %llx)\n", (unsigned long long)g_main_ctx->fn,
+                   (unsigned long long)g_main_ctx->x[30], g_main_ctx->in_import ? "in " : "",
+                   g_main_ctx->in_import ? g_main_ctx->in_import : "guest code", (unsigned long long)g_main_ctx->import_from);
+            for (int i = 19; i < 29; i++) printf("  x%d %016llx%s", i, (unsigned long long)g_main_ctx->x[i], i % 3 == 0 ? "\n" : "");
+            printf("\n");
+            if (0) {   /* [Recomps#1] off: a Smash-specific std::map at 0x710593c3c0 (meaningless in our image) */
+                uint64_t m = 0x710593c3c0ULL;
+                printf("map header: [+0]=%llx [+8]=%llx [+10]=%llx  size=%llx\n", (unsigned long long)rd64(m),
+                       (unsigned long long)rd64(m + 8), (unsigned long long)rd64(m + 16), (unsigned long long)rd64(m + 24));
+                uint64_t n = rd64(m + 8);
+                for (int k = 0; k < 6 && n > 0x1000 && n != m; k++) {
+                    printf("  node %llx: left=%llx right=%llx parent=%llx color=%llx key=%llx\n", (unsigned long long)n,
+                           (unsigned long long)rd64(n), (unsigned long long)rd64(n + 8), (unsigned long long)rd64(n + 16),
+                           (unsigned long long)rd64(n + 24), (unsigned long long)rd64(n + 32));
+                    n = rd64(n);
+                }
+            }
+            /* where is the main host thread really? sample its instruction pointer and unwind */
+            for (int s = 0; s < 3; s++) {
+                Sleep(50);
+                CONTEXT ctx;
+                memset(&ctx, 0, sizeof ctx);
+                ctx.ContextFlags = CONTEXT_FULL;
+                SuspendThread(t);
+                GetThreadContext(t, &ctx);
+                printf("  host rip sample %d: rip=%p -> f_%llx |", s, (void *)ctx.Rip, (unsigned long long)guest_function_of(ctx.Rip));
+                uint64_t last = 0;
+                for (int depth = 0, shown = 0; depth < 200 && shown < 12; depth++) {
+                    uint64_t g = guest_function_of(ctx.Rip);
+                    if (g && g != last) { printf(" f_%llx", (unsigned long long)g); shown++; last = g; }
+                    else if (!g && depth == 0) printf(" [host %p]", (void *)ctx.Rip);
+                    DWORD64 base;
+                    RUNTIME_FUNCTION *rf = RtlLookupFunctionEntry(ctx.Rip, &base, NULL);
+                    if (!rf) break;
+                    void *hd; DWORD64 est;
+                    RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, ctx.Rip, rf, &ctx, &hd, &est, NULL);
+                    if (!ctx.Rip) break;
+                }
+                printf("\n");
+                ResumeThread(t);
+            }
+            for (int s = 0; s < 8; s++) {            /* is it moving? sample a few times */
+                Sleep(37);
+                printf("  sample %d: f_%llx lr=%llx x0=%llx x1=%llx x8=%llx x9=%llx x11=%llx x12=%llx\n", s,
+                       (unsigned long long)g_main_ctx->fn, (unsigned long long)g_main_ctx->x[30], (unsigned long long)g_main_ctx->x[0],
+                       (unsigned long long)g_main_ctx->x[1], (unsigned long long)g_main_ctx->x[8], (unsigned long long)g_main_ctx->x[9],
+                       (unsigned long long)g_main_ctx->x[11], (unsigned long long)g_main_ctx->x[12]);
+            }
+        }
+        dump_guest_threads(stdout);
+        icall_dump(stdout, (uint64_t)(uintptr_t)g_main_ctx);
+        if (getenv("SSBU_CHAIN")) {
+            /* SSBU_CHAIN=<fn>:<off>,<off>,...[;<fn>:...] (hex): start from x0 of the first recorded indirect call to fn
+             * (needs SSBU_ICALLS), follow pointers at the given offsets, print 0x40 bytes at every step */
+            char buf[1024];
+            snprintf(buf, sizeof buf, "%s", getenv("SSBU_CHAIN"));
+            for (char *spec = strtok(buf, ";"); spec; spec = strtok(NULL, ";")) {
+                char *colon = strchr(spec, ':');
+                uint64_t p = icall_first_x0(strtoull(spec, NULL, 16));
+                printf("[chain] %s: x0=%llx\n", spec, (unsigned long long)p);
+                for (char *o = colon ? colon + 1 : NULL; p; o = o ? strchr(o, ',') : NULL) {
+                    MEMORY_BASIC_INFORMATION mi;
+                    if (!VirtualQuery((void *)(uintptr_t)p, &mi, sizeof mi) || mi.State != MEM_COMMIT) { printf("[chain]   %llx not mapped\n", (unsigned long long)p); break; }
+                    printf("[chain]   %llx:", (unsigned long long)p);
+                    for (int w = 0; w < 0x130; w += 8) printf("%s%016llx", w % 0x40 ? " " : "\n[chain]     ", (unsigned long long)rd64(p + w));
+                    printf("\n");
+                    if (!o) break;
+                    if (*o == ',') o++;
+                    uint64_t off = strtoull(o, NULL, 16);
+                    p = rd64(p + off);
+                    printf("[chain]   [+%llx] = %llx\n", (unsigned long long)off, (unsigned long long)p);
+                }
+            }
+        }
+        report_and_exit(0);
+    }
+    return 0;
+}

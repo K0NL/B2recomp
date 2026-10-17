@@ -1,0 +1,47 @@
+# [Recomps#1] roots for sdklift.py on OUR sdk (SDK 3.6.0). sdk offsets; NVN functions have no symbols (found through the
+# NVN name table, evidence/sdk-nvn-procs.json); the GPU classes through their vtables (notes/findings.md).
+# nvn_sdk.c: texture storage rules
+addr 2c9748 nvnTextureBuilderGetStorageSize
+addr 2c8d10 nvnTextureBuilderGetStorageAlignment
+addr 2c8e58 nvnTextureBuilderGetStorageClass
+addr 2ca370 nvnTextureBuilderGetSparseTileLayout
+addr 2ca418 nvnTextureGetSparseTileLayout
+addr 2ca01c nvnTextureGetStorageClass
+addr 2ca9a8 nvnTextureGetStorageSize
+addr 2c97ac texture_layout_block
+# reached through vtables at run time: NvRmGpuDeviceChooseKind -> device +0x30 (get HAL) -> HAL +0x50 (choose kind) -> +0x58..+0x70
+addr 26c84c NvRmNvgpuDevice_get_hal
+addr 269d00 HwHalFunctions_GM200_vt_50
+addr 26a2ec HwHalFunctions_GM200_vt_58
+addr 26a30c HwHalFunctions_GM200_vt_60
+addr 26a12c HwHalFunctions_GM200_vt_68
+addr 26a134 HwHalFunctions_GM200_vt_70
+addr 26a22c HwHalFunctions_GM200_vt_78
+
+# nn::mem::NumberLineAllocator (all 10 imports of our main): pure SDK code (no SVC; host calls only nn::os Lock/UnlockMutex,
+# memset). Lifted as a whole so every entry point works on the real object layout in guest memory.
+_ZN2nn3mem19NumberLineAllocator10InitializeEPFPvmS2_ES2_PFvS2_S2_ES2_b
+_ZN2nn3mem19NumberLineAllocator16GetTotalFreeSizeEv
+_ZN2nn3mem19NumberLineAllocator18GetAllocatableSizeEv
+_ZN2nn3mem19NumberLineAllocator4DumpEmi
+_ZN2nn3mem19NumberLineAllocator4FreeEi
+_ZN2nn3mem19NumberLineAllocator8AddRangeEii
+_ZN2nn3mem19NumberLineAllocator8AllocateEPii
+_ZN2nn3mem19NumberLineAllocator8AllocateEPiii
+_ZN2nn3mem19NumberLineAllocator8FinalizeEv
+_ZN2nn3mem19NumberLineAllocator9GetSizeOfEi
+
+# libc / libc++ the game imports from the sdk: pure (no SVC, no host calls); __release_shared calls the object's own virtual
+# __on_zero_shared through its vtable (game code)
+div
+_ZNSt3__119__shared_weak_count12__add_sharedEv
+_ZNSt3__119__shared_weak_count16__release_sharedEv
+
+# hid / oe / friends pure functions our main reaches (no SVC; handles computed from the npad id and style)
+_ZN2nn3hid23GetSixAxisSensorHandlesEPNS0_19SixAxisSensorHandleEiRKjNS_4util10BitFlagSetILi32ENS0_12NpadStyleTagEEE
+_ZN2nn3hid25GetVibrationDeviceHandlesEPNS0_21VibrationDeviceHandleEiRKjNS_4util10BitFlagSetILi32ENS0_12NpadStyleTagEEE
+_ZN2nn7friends12UserPresence10InitializeEv
+_ZN2nn7friends12UserPresence14SetDescriptionEPKc
+# UserPresence::Initialize -> friends::detail::GetCurrentUser -> account::ListOpenUsers reads the SDK's account-library state,
+# which this runtime models on the host (nnfs.c, one local user): cut it to the host model
+cut _ZN2nn7account13ListOpenUsersEPiPNS0_3UidEi

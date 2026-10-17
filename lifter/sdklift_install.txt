@@ -1,0 +1,17 @@
+# [Recomps#1] imports whose existing host handler is REPLACED by the lifted SDK code (one mangled name per line).
+# Imports without any handler get lifted code automatically (sdklift_rt.c register_sdklift_imports).
+# nn::mem::NumberLineAllocator: nnsdk.c has host versions of 4 of the 10; all 10 must be the SDK's own code together.
+_ZN2nn3mem19NumberLineAllocator10InitializeEPFPvmS2_ES2_PFvS2_S2_ES2_b
+_ZN2nn3mem19NumberLineAllocator16GetTotalFreeSizeEv
+_ZN2nn3mem19NumberLineAllocator18GetAllocatableSizeEv
+_ZN2nn3mem19NumberLineAllocator4DumpEmi
+_ZN2nn3mem19NumberLineAllocator4FreeEi
+_ZN2nn3mem19NumberLineAllocator8AddRangeEii
+_ZN2nn3mem19NumberLineAllocator8AllocateEPii
+_ZN2nn3mem19NumberLineAllocator8AllocateEPiii
+_ZN2nn3mem19NumberLineAllocator8FinalizeEv
+_ZN2nn3mem19NumberLineAllocator9GetSizeOfEi
+# libc / libc++ (non-nn names are not installed automatically)
+div
+_ZNSt3__119__shared_weak_count12__add_sharedEv
+_ZNSt3__119__shared_weak_count16__release_sharedEv
