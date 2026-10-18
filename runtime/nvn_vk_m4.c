@@ -519,6 +519,32 @@ static void gpl_ms(VkPipelineMultisampleStateCreateInfo *ms, VkSampleMask *smask
     if (sshade == 1 && D.f2.features.sampleRateShading) { ms->sampleShadingEnable = VK_TRUE; ms->minSampleShading = 1.0f; }
 }
 /* Any thread, no lock held: the pair library; *how: 0 it was there, 1 compiled by this call, 2 waited for the thread compiling it. */
+/* [Recomps#1] finding 120: a driver whose compiler gives up on one of our stages (a player's RX 9070 XT: the stage library of
+ * one vertex stage of 1,294 returned VK_ERROR_INITIALIZATION_FAILED) no longer ends the game. A library that cannot be made
+ * leaves its stage to WHOLE pipelines; a whole pipeline that cannot be made leaves its draws out. One line per failure names
+ * the stage by its variant hash: translation is deterministic, so the same .st / .spv files are in our own cache.
+ * TEST: SSBU_VK_FAILLIB=<n> makes the n-th stage or pair library fail (-1: every one), SSBU_VK_FAILPIPE=<n> the n-th whole pipeline. */
+static LONG64 g_fail_lib, g_fail_pipe, g_fail_draws;
+static int fail_test(const char *env, volatile LONG *count) {
+    static int lib = -2, pipe = -2;
+    int *v = env[12] == 'L' ? &lib : &pipe;        /* SSBU_VK_FAIL[L]IB / SSBU_VK_FAIL[P]IPE */
+    if (*v == -2) *v = getenv(env) ? atoi(getenv(env)) : 0;
+    return *v && (*v < 0 || InterlockedIncrement(count) == *v);
+}
+static void fail_note(const char *what, const VStage *vs, const VStage *fs, int alone, VkResult r, const char *then) {
+    static volatile LONG lines;
+    StageRec rec;
+    char spv[48] = "";
+    LONG n = InterlockedIncrement(&lines);
+    if (n > 64) { if (n == 65) printf("nvn_vk: more than 64 refusals by the driver: the rest are only counted (nvn_vk_fail line at exit)\n"); return; }
+    if (vs && stage_rec_read(vs->stage, vs->h, &rec)) snprintf(spv, sizeof spv, ", SPIR-V spv\\%016llx.spv", (unsigned long long)rec.spv);
+    printf("nvn_vk: THE DRIVER REFUSED %s: %s (%s code %016llx, variant %016llx = cache\\vk\\stage\\%d_%016llx.st%s, key %x %x %x %x, forced outputs %x%s%s",
+           what, vk_result_name(r), vs && vs->stage == 1 ? "fragment" : "vertex", vs ? (unsigned long long)vs->hb : 0ull, vs ? (unsigned long long)vs->h : 0ull, vs ? vs->stage : 0, vs ? (unsigned long long)vs->h : 0ull, spv,
+           vs ? vs->key[0] : 0, vs ? vs->key[1] : 0, vs ? vs->key[2] : 0, vs ? vs->key[3] : 0, vs ? vs->fo : 0, alone ? ", drawn without a fragment stage" : "", fs ? "" : ")");
+    if (fs) printf("; fragment code %016llx, variant %016llx)", (unsigned long long)fs->hb, (unsigned long long)fs->h);
+    printf(": %s\n", then);
+    fflush(stdout);
+}
 static PairLib *pairlib_ensure(VStage *vs, VStage *fs, int samples, int sshade, int *how) {
     unsigned h = (vs->id * 2654435761u ^ (fs ? fs->id * 40503u : 0) ^ (unsigned)(samples * 131 + sshade)) & 1023;
     PairLib *l;
@@ -570,8 +596,13 @@ static PairLib *pairlib_ensure(VStage *vs, VStage *fs, int samples, int sshade, 
     VkGraphicsPipelineCreateInfo gi = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
     gi.pNext = &gl; gi.flags = VK_PIPELINE_CREATE_LIBRARY_BIT_KHR | VK_PIPELINE_CREATE_RETAIN_LINK_TIME_OPTIMIZATION_INFO_BIT_EXT; gi.stageCount = fs ? 2 : 1; gi.pStages = st; gi.pViewportState = &vp; gi.pRasterizationState = &rs; gi.pMultisampleState = &ms;
     gi.pDepthStencilState = &ds; gi.pDynamicState = &dy; gi.layout = l->layout;
-    VkResult r = vkCreateGraphicsPipelines(V.device, g_pcache, 1, &gi, NULL, &l->lib);
-    if (r != VK_SUCCESS) vkd_fail("vkCreateGraphicsPipelines, pair library (vertex stage %u, fragment stage %u): %s", vs->id, fs ? fs->id : 0, vk_result_name(r));
+    static volatile LONG nfail;
+    VkResult r = fail_test("SSBU_VK_FAILLIB", &nfail) ? VK_ERROR_INITIALIZATION_FAILED : vkCreateGraphicsPipelines(V.device, g_pcache, 1, &gi, NULL, &l->lib);
+    if (r != VK_SUCCESS) {                         /* finding 120: its pipelines are made whole */
+        l->lib = VK_NULL_HANDLE;
+        InterlockedIncrement64(&g_fail_lib);
+        fail_note("A PAIR LIBRARY", vs, fs, 0, r, "pipelines of this pair are made whole instead");
+    }
     LONG64 dt = tk() - t0;
     EnterCriticalSection(&g_sh_lock);
     l->state = 2;
@@ -715,8 +746,18 @@ static VkPipeline stagelib_ensure(VStage *v, int alone, int *how) {
     FbRec fb_all = {0, 0}, fb_st = {0, 0};
     FbInfo fbi = {(VkStructureType)1000192000, NULL, &fb_all, 1, &fb_st};
     ri.pNext = &fbi;
-    VkResult r = vkCreateGraphicsPipelines(V.device, g_pcache, 1, &gi, NULL, lib);
-    if (r != VK_SUCCESS) vkd_fail("vkCreateGraphicsPipelines, stage library (%s stage %u): %s", isfs ? "fragment" : "vertex", v->id, vk_result_name(r));
+    static volatile LONG nfail;
+    VkResult r = fail_test("SSBU_VK_FAILLIB", &nfail) ? VK_ERROR_INITIALIZATION_FAILED : vkCreateGraphicsPipelines(V.device, g_pcache, 1, &gi, NULL, lib);
+    if (r != VK_SUCCESS) {                         /* finding 120: state 3 = no library; pipe_build makes this stage's pipelines whole */
+        *lib = VK_NULL_HANDLE;
+        InterlockedIncrement64(&g_fail_lib);
+        fail_note("A STAGE LIBRARY", v, NULL, alone, r, "pipelines with this stage are made whole instead");
+        EnterCriticalSection(&g_sh_lock);
+        *state = 3;
+        WakeAllConditionVariable(&g_sh_cv);
+        LeaveCriticalSection(&g_sh_lock);
+        return VK_NULL_HANDLE;
+    }
     LONG64 dt = tk() - t0;
     fb_note(0, &fb_all, dt);
     EnterCriticalSection(&g_sh_lock);
@@ -783,6 +824,7 @@ static double pipe_build(Pipe *p) {
         libs[n++] = stagelib_ensure(vs, !fs, &how);
         if (fs) libs[n++] = stagelib_ensure(fs, 0, &how2);
         libs[n++] = gpl_olib(k);
+        if (!libs[1] || (fs && !libs[2])) goto whole;  /* finding 120: a stage library the driver refused */
         if (how2 == 1 || how == 1) how = 1; else if (how2 == 2 || how == 2) how = 2;
         LONG64 t1 = tk();
         VkPipelineLibraryCreateInfoKHR pli = {VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR};
@@ -793,7 +835,7 @@ static double pipe_build(Pipe *p) {
         FbInfo fbi = {(VkStructureType)1000192000, NULL, &fb_all, 0, NULL};
         pli.pNext = &fbi;
         VkResult r = vkCreateGraphicsPipelines(V.device, g_pcache, 1, &gi, NULL, &p->p);
-        if (r != VK_SUCCESS) vkd_fail("vkCreateGraphicsPipelines, link of stage libraries (vertex stage %u, fragment stage %u, %d colour targets, depth format %d): %s", k->vs, k->fs, k->ncolor, k->dfmt, vk_result_name(r));
+        if (r != VK_SUCCESS) { p->p = VK_NULL_HANDLE; fail_note("A LINK OF STAGE LIBRARIES", vs, fs, !fs, r, "this pipeline is made whole instead"); goto whole; }
         LONG64 dt = tk() - t1;
         fb_note(1, &fb_all, dt);
         p->layout = g_ulayout; p->dl[0] = g_udl[0]; p->dl[1] = g_udl[1]; p->nb[0] = 66; p->nb[1] = 128; p->push0 = 0; p->libbed = 1; p->lib_how = (uint8_t)how;
@@ -810,6 +852,7 @@ static double pipe_build(Pipe *p) {
     if (D.has_gpl) {                               /* session 9: linked from libraries */
         int how;
         PairLib *l = pairlib_ensure(vs, fs, k->samples, k->sshade, &how);
+        if (!l->lib) goto whole;                   /* finding 120: a pair library the driver refused */
         VkPipeline libs[3];
         libs[0] = gpl_vilib(k->topo_class < 3 ? k->topo_class : 2); libs[1] = l->lib; libs[2] = gpl_olib(k);
         LONG64 t1 = tk();
@@ -818,7 +861,7 @@ static double pipe_build(Pipe *p) {
         VkGraphicsPipelineCreateInfo gi = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
         gi.pNext = &pli; gi.layout = l->layout;
         VkResult r = vkCreateGraphicsPipelines(V.device, g_pcache, 1, &gi, NULL, &p->p);
-        if (r != VK_SUCCESS) vkd_fail("vkCreateGraphicsPipelines, link of libraries (vertex stage %u, fragment stage %u, %d colour targets, depth format %d): %s", k->vs, k->fs, k->ncolor, k->dfmt, vk_result_name(r));
+        if (r != VK_SUCCESS) { p->p = VK_NULL_HANDLE; fail_note("A LINK OF LIBRARIES", vs, fs, 0, r, "this pipeline is made whole instead"); goto whole; }
         LONG64 dt = tk() - t1;
         p->layout = l->layout; p->dl[0] = l->dl[0]; p->dl[1] = l->dl[1]; p->nb[0] = l->nb[0]; p->nb[1] = l->nb[1]; p->push0 = l->push0; p->libbed = 1; p->lib_how = (uint8_t)how;
         InterlockedIncrement64(&R.pipelines);
@@ -830,6 +873,7 @@ static double pipe_build(Pipe *p) {
         LeaveCriticalSection(&g_sh_lock);
         { LARGE_INTEGER fq; QueryPerformanceFrequency(&fq); return (double)(tk() - t0) * 1000.0 / (double)fq.QuadPart; }
     }
+whole:;
     VkDescriptorSetLayoutBinding b0[80], b1[140];
     layout_bindings(vs, 0, b0, &p->nb[0], b1, &p->nb[1]);
     if (fs) layout_bindings(fs, 1, b0, &p->nb[0], b1, &p->nb[1]);
@@ -903,8 +947,13 @@ static double pipe_build(Pipe *p) {
     gi.pNext = &ri; gi.stageCount = fs ? 2 : 1; gi.pStages = st; gi.pInputAssemblyState = &ia; gi.pViewportState = &vp; gi.pRasterizationState = &rs; gi.pMultisampleState = &ms;
     gi.pDepthStencilState = &ds; gi.pColorBlendState = &cb; gi.pDynamicState = &dy; gi.layout = p->layout;
     if (!D.has_vids) gi.pVertexInputState = &vi;
-    VkResult r = vkCreateGraphicsPipelines(V.device, g_pcache, 1, &gi, NULL, &p->p);
-    if (r != VK_SUCCESS) vkd_fail("vkCreateGraphicsPipelines (vertex stage %u, fragment stage %u, %d colour targets, depth format %d): %s", k->vs, k->fs, k->ncolor, k->dfmt, vk_result_name(r));
+    static volatile LONG nfail;
+    VkResult r = fail_test("SSBU_VK_FAILPIPE", &nfail) ? VK_ERROR_INITIALIZATION_FAILED : vkCreateGraphicsPipelines(V.device, g_pcache, 1, &gi, NULL, &p->p);
+    if (r != VK_SUCCESS) {                         /* finding 120: no pipeline: its draws are left out (pipe_get's callers), the game goes on */
+        p->p = VK_NULL_HANDLE;
+        InterlockedIncrement64(&g_fail_pipe);
+        fail_note("A WHOLE PIPELINE", vs, fs, !fs, r, "the draws with it are left out");
+    }
     InterlockedIncrement64(&R.pipelines);
     EnterCriticalSection(&g_sh_lock);
     p->state = 2;
@@ -1839,6 +1888,9 @@ static void m4_report(void) {
     LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
     if (!D.has_vids) printf("nvn_vk_vlay: no dynamic vertex input: %ld vertex layouts (%lld from ../cache/vk/vlayouts.bin, %lld new in this run), %lld looked up in the table (the draw before had another)\n",
                             (long)g_nvlay, (long long)g_vlay_loaded, (long long)g_vlay_new, (long long)g_vlay_lookups);
+    if (g_fail_lib || g_fail_pipe)                 /* finding 120 */
+        printf("nvn_vk_fail: the driver refused %lld libraries (their pipelines made whole) and %lld whole pipelines (%lld draws left out); the \"THE DRIVER REFUSED\" lines name the stages\n",
+               (long long)g_fail_lib, (long long)g_fail_pipe, (long long)g_fail_draws);
     if (D.has_gpl) {
         double q = 1000.0 / (double)fq.QuadPart;
         printf("nvn_vk_gpl: pair libraries compiled by the workers: %lld (%.0f ms of worker time; %lld of them asked for as shared vertex stage x fragment stage without a program of its own: %d such fragment stages, %d shared vertex stages); "

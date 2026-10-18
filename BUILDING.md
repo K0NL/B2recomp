@@ -309,5 +309,8 @@ game or a compiler is running (`--wait` waits instead); measure on a quiet machi
   is needed); `renderer = opengl` in `config/graphics.ini` is the older fallback renderer (NVIDIA only). A driver
   without `VK_EXT_vertex_input_dynamic_state` (AMD RX 400/500 on Windows) takes a slower start-up path: the log says
   `NO VK_EXT_vertex_input_dynamic_state`, and its first runs build more pipelines while playing.
+- A log line `THE DRIVER REFUSED ...`: the graphics driver could not compile one of the game's shaders. The game goes on
+  (that shader's pipelines are made another way, or, if the driver refuses that too, the object is not drawn); please
+  report the line with your GPU and driver version.
 - A compiler job that fails while the PC is under heavy load or after a power loss: run the same command again.
 - Output with non-ASCII characters from Windows tools is shown with `?`; the logs in `build/logs` are the originals.

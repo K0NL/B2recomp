@@ -2413,6 +2413,7 @@ static int draw_prepare(unsigned prim) {
     pkey_targets(&k);
     Pipe *p = pipe_get(&k, vs, fs);
     if (!p) return 0;                              /* shader_wait = skip: the pipeline is being made by a worker, the draw is left out (counted in pipe_get) */
+    if (!p->p) { g_fail_draws++; return 0; }       /* finding 120: the driver refused this pipeline: the draw is left out */
     if (!R.pipe_bound) R.dyn3_dirty = 1;          /* a new command buffer, or a pipeline of our own with static state was bound */
     if (R.pipe_bound != p) { vkCmdBindPipeline(R.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p->p); R.pipe_bound = p; }
     PT(5);
@@ -2545,6 +2546,7 @@ static void stencil_clear_masked(uint32_t mask, uint32_t value, int sx, int sy, 
     k.vs = vs->id; k.sample_mask = 0xffffffffu; k.topo_class = 2; k.poly = 2; k.logic = 3;
     pkey_targets(&k);
     Pipe *p = pipe_get(&k, vs, NULL);
+    if (!p || !p->p) return;                       /* finding 120: no pipeline (the driver refused it): the masked clear is left out */
     VkViewport vp = {0, 0, (float)R.pass_w, (float)R.pass_h, 0, 1};
     VkRect2D sc = {{sx, sy}, {(uint32_t)sw, (uint32_t)sh}};
     float zero4[4] = {0, 0, 0, 0};
