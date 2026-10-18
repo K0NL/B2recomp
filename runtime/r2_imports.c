@@ -66,7 +66,7 @@ static void os_SetMemoryHeapSize(Ctx *c) {
              * a fight (finding 88). SSBU_NO_WRITEWATCH=1 (nvn_gl.c) still turns the use of it off. */
             g_heap = VirtualAlloc(NULL, (SIZE_T)size, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE);
             if (!g_heap) g_heap = VirtualAlloc(NULL, (SIZE_T)size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-            if (g_heap) { g_heap_size = size; void watch_heap_created(uint64_t); watch_heap_created((uint64_t)(uintptr_t)g_heap); }
+            if (g_heap) { g_heap_size = size; void watch_heap_created(uint64_t); void watch_heap_bounds(uint64_t, uint64_t); watch_heap_bounds((uint64_t)(uintptr_t)g_heap, size); watch_heap_created((uint64_t)(uintptr_t)g_heap); }
             else r = RESULT_OS_OUT_OF_MEMORY;
         }
     }

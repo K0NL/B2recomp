@@ -123,6 +123,17 @@ Dependencies (2026-10-16: found through an environment variable or `deps/<name>`
 - `display.c`, `nnapplet.c`: project name **B2recomp** (2026-10-16): window title "B2recomp" (SSBU_TITLE still overrides), class
   `b2recomp_window`, software keyboard dialog "Software keyboard (B2recomp)" (replace "Bayonetta 2 (Study Build)",
   `bayonetta2_study_window`, "Software keyboard (Bayonetta 2 Study Build)"; notes/release-audit.md, "Project name").
+- Keyboard and mouse (finding 106, 2026-10-17): `nnpad_sdl.c` [keyboard] takes two keys per button ("E, MOUSE3";
+  packed vk | vk2 << 8), the names MOUSE1..MOUSE5, LSHIFT RSHIFT LCTRL RCTRL LALT RALT, and mouse_camera / mouse_sensitivity /
+  mouse_invert_y; new default layout after Bayonetta 1 on PC (WASD, attacks on the mouse, Space, Shift, Alt) in g_kb_default
+  and the default-file text; `nnpad_mouse_cfg()` export. `nnhid.c` key_for tests both keys; `mouse_stick()` turns the
+  mouse's speed into the keyboard player's right stick (full at 1200 counts/s x sensitivity). `display.c` registers raw
+  mouse input for a visible window (WM_INPUT, gathered only while wanted), hides the cursor over the picture and holds it
+  in the window (ClipCursor) while the window is in front; let go on losing the foreground, WM_CLOSE and exit.
+  `nnpad_sdl.c` [keyboard] `player = auto` is player 1, merged with player 1's pad (upstream: the first slot no pad had,
+  player 2 with one pad, which this one-player game never reads); pads may take the keyboard's slot (g_kb_shared).
+  `display.c`: a window smaller than its monitor captures the mouse only after a click into the picture (the click is held
+  back from the game: display_mouse_hold, read by nnhid.c kb_down); Esc lets it go; borderless / fullscreen capture at once.
 - Render thread cost per draw (finding 93): `nvn_vk_draw.c` keeps a shadow of the dynamic state recorded into the
   current command buffer and records only values that changed (forgotten at cmd_begin and after the internal stencil
   clear; `SSBU_VK_DYNSHADOW=0` = old behaviour); the set-0 descriptor writes are filled whole instead of a 12 KB memset
@@ -169,9 +180,17 @@ Both are marked `[Recomps#1]` in the code; the values the game sees are unchange
   keeps only what the sdk answers from its live device object (0x38 = 32 deko3d, 0x3b = 1 OPEN, 0x18 = 0 this runtime)
   and the publicly sourced values as documented fallback. Every pname the game asked for in any run gets the same answer
   as before (trace lines compared); 0x30 is now the sdk's 14 (upstream's table had 15; on a path no run reaches).
-- 2026-10-17, `nvn_vk_draw.c`: the Vulkan disk cache (`..\cachek`: SPIR-V, stage records, `pipes.bin`, the driver's pipeline
+- 2026-10-17, `nvn_vk_draw.c`: the Vulkan disk cache (`..\cache\vk`: SPIR-V, stage records, `pipes.bin`, the driver's pipeline
   cache) was never written here: the code made `../cache/vk` but not its parent `../cache` (upstream's layout has it
   already), and CreateDirectory makes one level. The four places now make the parent first. Tested: a cold run wrote
   117 MB (1,773 SPIR-V files, 118 pipelines, 25 MB pipeline cache); warm runs read it back and made 0 pipelines at
   draw time; standard test run PASS. `shader_prepare` (Smash's preparation from data.arc) has no effect for Bayonetta 2:
   said so in `gfx_options.c`'s default text, and the launcher greys the option out.
+- 2026-10-17, `nvn_vk_draw.c` / `gfx_options.c|h`: `aspect = keep | stretch` (graphics.ini; keep by default): the present keeps
+  the picture's shape in a window of another shape, black bars around it (finding 105). `RS_MAX` 2.0 -> 3.0: for Bayonetta 2
+  (1280x720) 3.0 is 4K, the pixel count upstream's 2.0 was measured for with Smash (1920x1080).
+- 2026-10-17, `nnfs.c`: RomFS mods (the emulators' LayeredFS, finding 109): folders under `mods\` with a `romfs\`
+  replace or add game files at the same rom: path; `config\mods.ini` [mods] / [prompts]; button prompt mods are layered
+  only when chosen (`button_prompts`). `mod_family` guesses a prompt mod's kind from a word that starts with ds4, ds5,
+  dualshock, dualsense, playstation, ps4, ps5 / xbox (or the word ps), so the DS4Prompts / XBOXPrompts folders of the
+  GameBanana prompt mod 360121 need no [prompts] line.

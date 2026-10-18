@@ -8,6 +8,7 @@
 #include <windows.h>
 #include "runtime.h"
 #include "hostrt.h"
+#include "gfx_options.h"           /* [Recomps#1] graphics.ini read before the game starts (frame_rate) */
 
 #include "image_layout.h"          /* [Recomps#1] entry points of our main, by exported name */
 #define NNINIT_STARTUP (GUEST_BASE + NNINIT_STARTUP_OFF)
@@ -291,6 +292,7 @@ int main(int argc, char **argv) {
     /* track V: `--prepare-shaders [folder]` translates every stage of the shader containers in the folder (default
      * ..\cache\vk_containers, filled by tools_vk/bnsh_extract.py) into ..\cache\vk; no game, no window, no GPU (nvn_vk_m4.c) */
     if (argc > 1 && !strcmp(argv[1], "--prepare-shaders")) { int nvn_vk_prepare_shaders(const char *); return nvn_vk_prepare_shaders(argc > 2 ? argv[2] : NULL); }
+    gfx_options();      /* [Recomps#1] read graphics.ini before the game starts: frame_rate sets the lifted code's switches (gfx_options.c) */
     /* data symbols the game imports from the SDK module get their real values (see gen_sdkdata.py) */
     for (int i = 0; i < sdk_data_count; i++) {
         void *copy = _aligned_malloc(sdk_data[i].size, 16);

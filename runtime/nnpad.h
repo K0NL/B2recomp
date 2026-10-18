@@ -14,6 +14,7 @@ typedef struct {
     float gyro[3];              /* in revolutions per second, same axes */
 } NnPadState;
 
+int  nnpad_button_prompts(void);                /* [Recomps#1] [general] button_prompts: 1 switch, 2 playstation, 3 xbox (auto resolved) */
 int  nnpad_init(void);                           /* SDL up (no video, no window); 0 = failed. Also loads controllers.ini. */
 void nnpad_poll(int force);                      /* hot-plug, config reload; cheap when called often (at most once per ms) */
 int  nnpad_present(int player);                  /* a device is assigned to this player slot */

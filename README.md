@@ -42,22 +42,90 @@ the **builder package**: the same source plus the free tools the build needs, so
   [BUILDING.md](BUILDING.md#what-you-extract-from-your-own-console)). The build checks that it is exactly that version
   and explains a mismatch. Encrypted packages (`.nsp`, `.xci`, `.nca`, ...) are refused: this project decrypts nothing
   and reads no keys.
-- Optional: your console's system font in `<dump>\sysdata\fonts\` ([BUILDING.md](BUILDING.md#system-fonts)); without it
-  a font of your PC stands in.
 - Windows 10/11 x64 and a GPU with a Vulkan 1.3 driver. AMD RX 400/500 cards (Polaris) run on a fallback path that is new
   and not yet confirmed on a real card: a log from one is welcome.
 - With the builder package: nothing else. From the source alone: Python 3.10+ and the free tools listed in
   [BUILDING.md](BUILDING.md#what-you-need-on-your-pc).
 
-## Build
+## Getting started (step by step)
 
-**With the builder package** (`B2recomp-builder-<version>.zip`, from this repository's Releases page): unzip it and
-start **`B2recomp.exe`**. Choose your dump folder (Browse, or drag it onto the window) and press **Build**; the window
-shows each step and the progress, and when the build is done it turns into the launcher. (`Build B2recomp.bat` does
-the same from a console.) The package holds no game files: only this source, the compiler (llvm-mingw), Python, SDL3,
-the Vulkan headers, the shader-compiler shim and their licences (`THIRD-PARTY-NOTICES.md`).
+**1. Have your dump ready.** One folder that holds `exefs\` and `romfs\`, extracted from your own copy of the game
+with update 1.2 applied (plain files, not an `.nsp` or `.xci`). Put it where it can stay: the game reads `romfs\`
+from there every time it runs. Optional: `sysdata\fonts\` with your console's system font
+([BUILDING.md](BUILDING.md#system-fonts)); without it a font of your PC stands in.
 
-**From the source**, with the tools installed yourself:
+**2. Get the builder.** Download `B2recomp-builder-<version>.zip` from this repository's **Releases** page and unzip
+it to a folder of its own, with about 1.5 GB free. It holds no game files: only this source, the compiler and the tools
+the build needs, so you install nothing.
+
+**3. Build the game.** Start **`B2recomp.exe`**. Click **Browse...** and choose your dump folder (or drag the folder
+onto the window); it tells you at once whether the folder looks right. Press **Build** and wait, about 5 minutes on a
+fast PC. If something is wrong, the window says what (for example the wrong game version); **Logs folder** has the
+details.
+
+**4. Set it up.** When the build is done, the window turns into the launcher. Good first settings:
+
+| Setting | What to choose |
+|---|---|
+| Window mode | **Borderless window** or **Fullscreen** to fill the screen; Windowed with a size you like |
+| Resolution scale | **1.5** for a 1080p screen, **2.0** for 1440p, **3.0** for 4K (strong graphics cards only) |
+| Aspect ratio | **Keep 16:9** (black bars on an ultrawide screen) or **Stretch** |
+| Frame rate (beta) | **60** is the game as made. Up to **120** for a high-refresh screen: experimental, some effects and menus may run faster |
+| Preset | **Low** only for a weak or laptop graphics chip |
+| Vertical sync, Input latency | leave them as they are |
+
+Hover over any setting for a short explanation. Press **Save** (Play also saves).
+
+**5. Choose your controls.**
+- **Controller** (DualSense, DualShock, Xbox, Switch Pro and most others): connect it before you press Play. "Face
+  buttons" decides whether A is the right button (as on a Switch) or the button printed A. **Test controller...**
+  shows whether your pad is seen; **Remap controller...** fixes a pad whose buttons are mixed up.
+- **PlayStation or Xbox button pictures** (optional): the game shows Switch buttons. Download *Controller Prompts
+  Replacement (DS4/XBOX)* by Timo654 ([GameBanana 360121](https://gamebanana.com/mods/360121), the **Switch**
+  version), unpack it and put its `DS4Prompts` and/or `XBOXPrompts` folder into the `mods\` folder beside
+  `B2recomp.exe` (make the folder if it is not there). With **Button prompts** on Auto the game then shows the
+  buttons of the controller you play with; or choose PlayStation or Xbox. It is chosen when the game starts.
+- **Keyboard and mouse** work at the same time as a controller, with a layout like the original Bayonetta on PC:
+
+  | Action | Keys |
+  |---|---|
+  | Move | W A S D |
+  | Camera | mouse (or the arrow keys) |
+  | Punch / Kick | left mouse / right mouse |
+  | Jump | Space |
+  | Shoot | E or middle mouse |
+  | Dodge (and Witch Time) | left Shift |
+  | Lock-on | left Alt |
+  | Umbran Climax | Q |
+  | Pause | Esc |
+  | Menus: confirm / back | Enter / Backspace |
+
+  **Keyboard and mouse...** changes any key: click a slot, then press the key or mouse button you want (Delete clears
+  it). The same window sets the mouse sensitivity and can turn the mouse camera off. In game the cursor is hidden and
+  kept in the window; Alt+Tab lets it go. **Input** (top of the controller panel) can lock the game to the keyboard
+  and mouse only, or to the controller only.
+
+**6. Play.** Press **Play**. The first start takes about 10 seconds longer, and the first time you see a new place
+the game can hitch briefly while it prepares its graphics; this is saved, so it happens only once. Your saves are in
+`build\play\userdata`.
+
+**Next time:** start `B2recomp.exe` and press Play. Keep the dump folder where it was.
+
+**Mods (optional).** Put mods made for the Switch version (emulator mod folders) into a folder `mods\` beside
+`B2recomp.exe`, then click **Mods...** to switch them on or off. Texture, model and sound mods work at the next start.
+Code mods (`.pchtxt`, `.ips`) need **Apply (rebuild)**: about a minute, with the game closed. Details:
+[BUILDING.md](BUILDING.md#code-mods-pchtxt--ips).
+
+**If something goes wrong:**
+- Black window or a Vulkan error at start: update your graphics driver.
+- Keys or the controller do nothing: click the game window first (input is read only while it is in front).
+- The build says the version is wrong: extract again with update 1.2 (v131072) applied.
+- "File in use" during a rebuild: close the game and press the button again.
+- More: [BUILDING.md, Troubleshooting](BUILDING.md#troubleshooting).
+
+## Building from the source
+
+The builder package does all of this for you. To build from a clone instead, with the tools installed yourself:
 
 ```
 git clone <URL of the B2recomp repository>
@@ -65,22 +133,12 @@ cd B2recomp
 python scripts/setup.py --dump <your dump folder>
 ```
 
-Either way it is one command with resumable steps; about **5 minutes** on a 16-thread PC and 0.8 GB in `build/`.
-Details, options, measured times and troubleshooting: [BUILDING.md](BUILDING.md).
+It is one command with resumable steps; about **5 minutes** on a 16-thread PC and 0.8 GB in `build/`. Then start
+`build\launcher.exe` (the same launcher as `B2recomp.exe`; `scripts\play.ps1` starts the game from a console). Details,
+options, measured times and troubleshooting: [BUILDING.md](BUILDING.md).
 
-`targets/` and `build/` (and the generated files in `runtime/gen/`) hold material made from your copy of the game.
-They are ignored by git: never commit, upload or share them.
-
-## Play
-
-```
-B2recomp.exe          (builder package)
-build\launcher.exe    (either way)
-```
-
-The launcher has the settings (`config/graphics.ini`, `config/controllers.ini`: resolution scale, filtering, frame
-pacing, controller mapping) and a Play button. `scripts\play.ps1` starts the game the same way from a console. Saves go
-to `build\play\userdata`.
+`targets/`, `build/` and `cache/` (and the generated files in `runtime/gen/`) hold material made from your copy of
+the game. They are ignored by git: never commit, upload or share them.
 
 ## Credits and licence
 

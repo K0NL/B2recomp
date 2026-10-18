@@ -163,6 +163,18 @@ static void seq_tick(void) {                              /* once per poll of pl
         if (g_seq_count) printf("input sequence: %d steps\n", g_seq_count);
         seq_begin(0);
     }
+    {   /* SSBU_SEQ_HZ=<n>: the sequence advances at most n polls per second of real time, so a run whose frame rate
+           changes (the fps census alternating 60 / 120, notes/fps-research.md) gets its inputs at the same real-time
+           rhythm throughout; keys held stay held in between. Unset: one step per poll, as always. */
+        static int hz = -1; static LONG64 t0, done; static LARGE_INTEGER f;
+        if (hz < 0) { const char *e = getenv("SSBU_SEQ_HZ"); hz = e ? atoi(e) : 0; QueryPerformanceFrequency(&f); }
+        if (hz > 0) {
+            LARGE_INTEGER t; QueryPerformanceCounter(&t);
+            if (!t0) t0 = t.QuadPart;
+            if (done >= (t.QuadPart - t0) * hz / f.QuadPart + 1) return;
+            done++;
+        }
+    }
     g_seq_polls++;
     {   /* SSBU_SEQ_LOG=<n>: the draw count every n polls, to find the ranges for @draws */
         static int every = -1;
@@ -508,13 +520,20 @@ static int player_connected(uint32_t id) {
     return x_present(g_source[id]);
 }
 
+/* [Recomps#1] one bound key or mouse button down; the click that captured the mouse for the camera does not count (display.c) */
+int display_mouse_hold(void);
+static int kb_down(int vk) {
+    if (!vk) return 0;
+    if ((vk == VK_LBUTTON || vk == VK_RBUTTON || vk == VK_MBUTTON || vk == VK_XBUTTON1 || vk == VK_XBUTTON2) && display_mouse_hold()) return 0;
+    return (GetAsyncKeyState(vk) & 0x8000) != 0;
+}
 /* Player 1 gets the test scripts (SSBU_PRESS / SSBU_SCRIPT / SSBU_SEQ); the keyboard's player gets the real keys. */
 static int key_for(uint32_t id, int vk, int kbidx) {         /* vk = the fixed key of the test scripts; kbidx = which configurable binding (controllers.ini) the real keyboard uses */
     int down = 0;
     if (id == 0) down = scripted(vk) || script_key(vk) || seq_key(vk);
     if (!down && (int)id == g_keyboard_player) {
-        int real = sdl_on() ? nnpad_kb_vk(kbidx) : vk;
-        down = real && keyboard_ours() && (GetAsyncKeyState(real) & 0x8000) != 0;
+        int real = sdl_on() ? nnpad_kb_vk(kbidx) : vk;      /* [Recomps#1] up to two keys: vk | vk2 << 8 (mouse buttons too) */
+        down = real && keyboard_ours() && (kb_down(real & 0xff) || kb_down(real >> 8 & 0xff));
     }
     return down;
 }
@@ -531,6 +550,35 @@ static void fight_shot_poll(int ticks) {
     if (next >= n || !mark_seen("fight")) return;
     ff += ticks;
     if (ff >= list[next]) { printf("shot: fight frame %lld reached at poll %lld (wanted %d): the next queued present is saved\n", ff, (long long)g_seq_polls, list[next]); fflush(stdout); nvn_front_shot_fight(list[next]); next++; }
+}
+/* [Recomps#1] The mouse as the keyboard player's right stick (the camera): display.c gathers the raw mouse movement while the
+ * game window is active (and hides / holds the cursor there); here the movement since the last poll becomes a stick position
+ * proportional to the mouse's speed: full deflection at 1200 counts per second x mouse_sensitivity (controllers.ini
+ * [keyboard]). Polls closer together than 4 ms (the game reads the pads more than once a frame) get the same value. */
+int nnpad_mouse_cfg(float *sens, int *invert);          /* nnpad_sdl.c */
+void display_mouse_want(int on); void display_mouse_take(int *dx, int *dy);      /* display.c */
+static int mouse_stick(int *ox, int *oy) {
+    static LARGE_INTEGER fq, last;
+    static int lx, ly, want = -1;
+    float sens = 1.0f;
+    int inv = 0, on = keyboard_ours() && nnpad_mouse_cfg(&sens, &inv);
+    if (want != on) { want = on; display_mouse_want(on); }
+    if (!on) { last.QuadPart = 0; return 0; }
+    LARGE_INTEGER now;
+    if (!fq.QuadPart) QueryPerformanceFrequency(&fq);
+    QueryPerformanceCounter(&now);
+    double dt = last.QuadPart ? (double)(now.QuadPart - last.QuadPart) / (double)fq.QuadPart : 0.0;
+    if (last.QuadPart && dt < 0.004) { *ox = lx; *oy = ly; return 1; }
+    int dx, dy;
+    display_mouse_take(&dx, &dy);
+    last = now;
+    if (dt <= 0.0 || dt > 0.1) dt = 1.0 / 60;
+    double kx = dx / dt * sens / 1200.0, ky = -dy / dt * sens / 1200.0;      /* mouse down = stick down */
+    if (inv) ky = -ky;
+    if (kx > 1) kx = 1; if (kx < -1) kx = -1; if (ky > 1) ky = 1; if (ky < -1) ky = -1;
+    lx = (int)(kx * STICK_MAX); ly = (int)(ky * STICK_MAX);
+    *ox = lx; *oy = ly;
+    return 1;
 }
 static void fill_pad(uint64_t out, uint32_t id, int style_is_fullkey) {
     { void r1_wrote(uint64_t, uint64_t); r1_wrote(out, 0x28); }   /* R1: marked (nothing without SSBU_R1_MARK) */
@@ -557,6 +605,12 @@ static void fill_pad(uint64_t out, uint32_t id, int style_is_fullkey) {
         lx = (key_for(id, VK_RIGHT, 18) - key_for(id, VK_LEFT, 16)) * STICK_MAX;
         ly = (key_for(id, VK_UP, 17) - key_for(id, VK_DOWN, 19)) * STICK_MAX;
         if (sdl_on()) { rx = (key_for(id, 0, 22) - key_for(id, 0, 20)) * STICK_MAX; ry = (key_for(id, 0, 21) - key_for(id, 0, 23)) * STICK_MAX; }
+        int mx, my;
+        if (sdl_on() && (int)id == g_keyboard_player && mouse_stick(&mx, &my)) {      /* [Recomps#1] the mouse moves the camera */
+            rx += mx; ry += my;
+            if (rx > STICK_MAX) rx = STICK_MAX; if (rx < -STICK_MAX) rx = -STICK_MAX;
+            if (ry > STICK_MAX) ry = STICK_MAX; if (ry < -STICK_MAX) ry = -STICK_MAX;
+        }
     }
     int slot = g_source[id];
     if (sdl_on()) {

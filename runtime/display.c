@@ -245,8 +245,69 @@ static void speed_init(void) {
 }
 
 int oe_exit_request(void);                            /* nnmisc.c */
+/* [Recomps#1] The mouse camera (nnhid.c mouse_stick, controllers.ini [keyboard] mouse_camera): raw mouse movement is gathered
+ * here (WM_INPUT) and taken by the pad poll, only while the mouse is captured. Captured = the cursor hidden over the picture
+ * and held inside the window (ClipCursor). A window that fills its monitor (borderless / fullscreen) captures it as soon as
+ * it is in front; a smaller window only after a click into the picture, so the title bar stays reachable for moving the
+ * window (the user could not drag it: the clip pulled the cursor back). Esc (pause), losing the foreground (Alt+Tab, a click
+ * elsewhere) and the end of the game let it go. The click that captures is not passed to the game (display_mouse_hold). */
+static volatile LONG g_mdx, g_mdy, g_mouse_want, g_mouse_hold;
+static int g_mouse_clipped, g_mouse_grab;
+void display_mouse_want(int on) {
+    InterlockedExchange(&g_mouse_want, on);
+    if (g_hwnd) PostMessageA(g_hwnd, WM_APP + 7, 0, 0);       /* the window thread applies it */
+}
+void display_mouse_take(int *dx, int *dy) { *dx = InterlockedExchange(&g_mdx, 0); *dy = InterlockedExchange(&g_mdy, 0); }
+int display_mouse_hold(void) {                              /* 1 while the buttons of the capturing click are still down */
+    if (!g_mouse_hold) return 0;
+    static const int b[5] = {VK_LBUTTON, VK_RBUTTON, VK_MBUTTON, VK_XBUTTON1, VK_XBUTTON2};
+    for (int i = 0; i < 5; i++) if (GetAsyncKeyState(b[i]) & 0x8000) return 1;
+    InterlockedExchange(&g_mouse_hold, 0);
+    return 0;
+}
+static void mouse_clip(HWND h, int on) {
+    if (on) { RECT r; GetClientRect(h, &r); MapWindowPoints(h, NULL, (POINT *)&r, 2); ClipCursor(&r); }
+    else if (g_mouse_clipped) ClipCursor(NULL);
+    g_mouse_clipped = on;
+}
+static void mouse_release(void) { if (g_mouse_clipped) ClipCursor(NULL); }
+static int fills_monitor(HWND h) {
+    MONITORINFO mi = { sizeof mi };
+    RECT r;
+    if (!GetWindowRect(h, &r) || !GetMonitorInfoA(MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST), &mi)) return 0;
+    return r.left <= mi.rcMonitor.left && r.top <= mi.rcMonitor.top && r.right >= mi.rcMonitor.right && r.bottom >= mi.rcMonitor.bottom;
+}
+static void mouse_update(HWND h) {
+    int front = g_mouse_want && GetForegroundWindow() == h && !IsIconic(h);
+    if (!front) g_mouse_grab = 0;
+    else if (fills_monitor(h)) g_mouse_grab = 1;
+    if (!g_mouse_grab) { InterlockedExchange(&g_mdx, 0); InterlockedExchange(&g_mdy, 0); }
+    mouse_clip(h, front && g_mouse_grab);
+}
 static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    if (m == WM_INPUT) {
+        if (g_mouse_want && g_mouse_grab) {
+            RAWINPUT ri;
+            UINT n = sizeof ri;
+            if (GetRawInputData((HRAWINPUT)l, RID_INPUT, &ri, &n, sizeof(RAWINPUTHEADER)) != (UINT)-1 && ri.header.dwType == RIM_TYPEMOUSE
+                && !(ri.data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE)) {
+                InterlockedAdd(&g_mdx, ri.data.mouse.lLastX); InterlockedAdd(&g_mdy, ri.data.mouse.lLastY);
+                if (!g_mouse_clipped) mouse_update(h);
+            }
+        }
+        return DefWindowProcA(h, m, w, l);
+    }
+    if ((m == WM_LBUTTONDOWN || m == WM_RBUTTONDOWN || m == WM_MBUTTONDOWN || m == WM_XBUTTONDOWN) && g_mouse_want && !g_mouse_grab
+        && GetForegroundWindow() == h) {
+        g_mouse_grab = 1;
+        InterlockedExchange(&g_mouse_hold, 1);
+        mouse_update(h);
+    }
+    if (m == WM_KEYDOWN && w == VK_ESCAPE && g_mouse_grab && !fills_monitor(h)) { g_mouse_grab = 0; mouse_update(h); }
+    if (m == WM_APP + 7 || m == WM_ACTIVATE || m == WM_SIZE || m == WM_MOVE) { mouse_update(h); if (m == WM_APP + 7) return 0; }
+    if (m == WM_SETCURSOR && g_mouse_want && g_mouse_grab && LOWORD(l) == HTCLIENT && GetForegroundWindow() == h) { SetCursor(NULL); return TRUE; }
     if (m == WM_CLOSE) {                             /* the exit request: nn::oe decides (nnmisc.c oe_exit_request) whether the game ends now or after its exit-request handling section */
+        mouse_release();
         printf("\nwindow closed by the user after %lld frames\n", (long long)g_frames);
         { extern volatile LONG g_display_close; InterlockedExchange(&g_display_close, 1); }      /* session 14: a hold of ours (the first-run shader preparation) ends at once */
         if (!oe_exit_request()) report_and_exit(0);
@@ -301,6 +362,11 @@ static DWORD WINAPI window_thread(LPVOID arg) {
     }
     if (wc.hIcon) SendMessageA(g_hwnd, WM_SETICON, ICON_SMALL, (LPARAM)LoadImageA(wc.hInstance, MAKEINTRESOURCEA(1), IMAGE_ICON,   /* [Recomps#1] title bar size */
                                                                                 GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), 0));
+    if (visible) {                                   /* [Recomps#1] raw mouse movement for the mouse camera (WM_INPUT, foreground only) */
+        RAWINPUTDEVICE rid = {1, 2, 0, g_hwnd};       /* generic desktop, mouse */
+        RegisterRawInputDevices(&rid, 1, sizeof rid);
+        atexit(mouse_release);
+    }
     InterlockedExchange(&g_ready, 1);
     MSG msg;
     while (GetMessageA(&msg, NULL, 0, 0) > 0) { TranslateMessage(&msg); DispatchMessageA(&msg); }

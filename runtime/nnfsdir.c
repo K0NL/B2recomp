@@ -36,7 +36,8 @@
 typedef struct { char name[0x301]; int is_file; int64_t size; } HostEntry;
 typedef struct { uint32_t magic; int count, pos; HostEntry *entries; } HostDir;
 
-int fs_dir_roots(const char *guest, char roots[2][MAX_PATH], uint32_t *result);   /* nnfs.c: mount table + save data journal view */
+#define FS_DIR_ROOTS 18                                   /* = nnfs.c's: RomFS mods (ROM_MOD_MAX 16) + working + committed folder */
+int fs_dir_roots(const char *guest, char roots[][MAX_PATH], uint32_t *result);   /* nnfs.c: mount table, save data journal, RomFS mods */
 int fs_dir_hidden(const char *guest_dir, const char *name);
 uint32_t fs_delete_directory(const char *guest);
 static int dir_host_path(const char *guest, char *out) {  /* superseded by fs_dir_roots (kept for the self-test's scratch folder) */
@@ -57,10 +58,11 @@ static int dir_host_path(const char *guest, char *out) {  /* superseded by fs_di
 static void fs_OpenDirectory(Ctx *c) {                    /* (DirectoryHandle *out, const char *path, int mode) -> Result */
     uint64_t out = A0;
     int mode = (int)A2;
-    char roots[2][MAX_PATH], pattern[MAX_PATH + 4];
+    char roots[FS_DIR_ROOTS][MAX_PATH], pattern[MAX_PATH + 4];
     uint32_t result = 0;
     if (out) wr64(out, 0);
-    /* the folders that make up this directory: for journaled save data the working folder, then the committed one */
+    /* the folders that make up this directory: for journaled save data the working folder, then the committed one; for the
+     * rom the RomFS mods, then the game's folder. An entry of an earlier folder hides the same name in later ones. */
     int nroots = fs_dir_roots((const char *)(uintptr_t)A1, roots, &result);
     if (result) { RET(result); return; }
     HostDir *d = calloc(1, sizeof *d);
@@ -79,7 +81,7 @@ static void fs_OpenDirectory(Ctx *c) {                    /* (DirectoryHandle *o
             char name[0x301];
             memset(name, 0, sizeof name);
             if (!WideCharToMultiByte(CP_UTF8, 0, fd.cFileName, -1, name, 0x300, NULL, NULL)) continue;
-            if (r == nroots - 1 && nroots == 2) {            /* committed folder under a working folder: skip what the working state replaced or deleted */
+            if (r == nroots - 1 && nroots >= 2) {            /* committed folder under a working folder: skip what the working state replaced or deleted */
                 char ansi[MAX_PATH];
                 WideCharToMultiByte(CP_ACP, 0, fd.cFileName, -1, ansi, sizeof ansi, NULL, NULL);
                 if (fs_dir_hidden((const char *)(uintptr_t)A1, ansi)) continue;
@@ -99,7 +101,7 @@ static void fs_OpenDirectory(Ctx *c) {                    /* (DirectoryHandle *o
         } while (FindNextFileW(h, &fd));
         FindClose(h);
     }
-    if (nroots == 2) {                                       /* drop the entries the open mode does not ask for */
+    if (nroots >= 2) {                                       /* drop the entries the open mode does not ask for */
         int n = 0;
         for (int k = 0; k < d->count; k++) if (d->entries[k].is_file ? (mode & 2) : (mode & 1)) d->entries[n++] = d->entries[k];
         d->count = n;

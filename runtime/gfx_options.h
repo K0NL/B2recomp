@@ -15,6 +15,9 @@ typedef struct {
     int shader_skip;         /* shader_wait: 0 hold (a draw waits for its shader or pipeline: the frame is late), 1 skip (near a fight the draw is left out until they are ready; nvn_vk_m4.c skip_on; env SSBU_VK_NOHOLD wins) */
     int profile;            /* 0 custom (the keys as written), 1 low: scale, aniso and present are set by the profile (gfx_options.c) */
     int shader_prepare;     /* track V session 14 (appended: older objects keep their offsets): 0 first_run (the game is held at its first frame until every shader of the game's data is prepared, once per GPU + driver), 1 background (as before), 2 off;  env SSBU_VK_PREPARE wins */
+    int aspect_stretch;     /* [Recomps#1] aspect = keep (0, default: the picture keeps its shape, black bars on a wider or taller
+                               window, e.g. an ultrawide monitor) | stretch (1: it fills the window); nvn_vk_draw.c present (Vulkan) */
+    int frame_rate;         /* [Recomps#1] frame_rate = 60 (the game as made) .. 120: above 60 the lifted frame-rate patch is on, capped there */
 } GfxOptions;
 const GfxOptions *gfx_options(void);      /* any thread; read once (the file is written with defaults when it does not exist) */
 #endif

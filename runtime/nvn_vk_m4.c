@@ -226,6 +226,7 @@ static void vstage_build(VStage *v, const SSrc *src) {
         if (!mx_translate(&in, &out)) { printf("nvn_vk: %s: machine code not translated: %s\n", what, out.why); fflush(stdout); }
         else {
             uint64_t spv_hash = 0;
+            glsl_dump(src->serial, s, out.glsl);       /* [Recomps#1] TEST ONLY: SSBU_VK_GLSLDUMP (nvn_vk_draw.c) */
             if (in.screen_scale) { InterlockedIncrement64(&g_rs_stages); if (strstr(out.glsl, "mx_fcs)")) InterlockedIncrement64(&g_rs_fcs); if (strstr(out.glsl, "mx_tf(")) InterlockedIncrement64(&g_rs_tf); }
             v->mod = module_from_glsl(s, out.glsl, what, &spv_hash);
             v->cbufs = out.cbufs; v->ssbos = out.ssbos; v->ssbo_w = out.ssbo_written; v->images = out.images; v->in_attr = out.in_attr; v->out_attr = out.out_attr;
@@ -1853,6 +1854,11 @@ static void m4_report(void) {
                (long long)g_fb_fhit[0], (double)g_fb_fhit_tk[0] * q2, (long long)g_fb_fmiss[0], (double)g_fb_fmiss_tk[0] * q2, (long long)g_fb_fhit[1], (double)g_fb_fhit_tk[1] * q2, (long long)g_fb_fmiss[1], (double)g_fb_fmiss_tk[1] * q2);
     }
     if (D.has_gpl) printf("nvn_vk_gpl: mode %s; pipelines linked again with optimisation by the workers: %lld of %lld queued, %.0f ms of worker time\n", gpl_sep() ? "2 (a library per stage)" : "1 (a library per stage pair)", (long long)g_gpl_opt_n, (long long)g_gpl_opt_q, (double)g_gpl_opt_tk * 1000.0 / (double)fq.QuadPart);
+    {   /* [Recomps#1] finding 118 (nvn_vk_draw.c lr_record / lr_land) */
+        LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
+        printf("nvn_vk_linread: texels the game reads on the CPU: %lld read-backs recorded, %lld landed in guest memory (%.1f MB, %.1f ms of render-thread time), %lld dropped (texture finalized), %lld images of another kind, %lld over the per-buffer limit\n",
+               (long long)g_lr_recorded, (long long)g_lr_landed, (double)g_lr_bytes / 1048576.0, (double)g_lr_land_tk * 1000.0 / (double)fq.QuadPart, (long long)g_lr_dropped, (long long)g_lr_skipped, (long long)g_lr_full);
+    }
     printf("nvn_vk_skip: shader_wait = %s; draws left out because a stage or pipeline was not ready: %lld in %lld frames (stage not ready %lld, pipeline not ready %lld)\n", skip_on() ? "skip (near a fight)" : "hold (the default)", (long long)g_skip_n, (long long)g_skip_frames, (long long)g_skip_stage, (long long)g_skip_pipe);
     if (g_pix_ready) printf("nvn_vk_prep: containers announced whole from the index: %lld because a pool was laid over their code, %lld because one of their programs was handed over (%lld of all these while IN A FIGHT), %lld variations queued; pools looked up: %lld found in the index, %lld not; programs handed over whose variation several files hold (no container named): %lld; header searches not made near a fight: %lld\n",
                             (long long)g_pix_ann_pool, (long long)g_pix_ann_prog, (long long)g_pix_ann_fight, (long long)g_pix_ann_vars, (long long)g_pix_pool_hit, (long long)g_pix_pool_miss, (long long)g_pix_ambiguous, (long long)g_cs_skipped);

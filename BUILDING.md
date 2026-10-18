@@ -12,7 +12,7 @@ cd B2recomp
 python scripts/setup.py --dump <your dump folder>
 ```
 
-One command, nine resumable steps, about 5 minutes. When it ends it prints how to start the game.
+One command, ten resumable steps, about 5 minutes. When it ends it prints how to start the game.
 
 ## The builder package (nothing to install)
 
@@ -25,7 +25,7 @@ and libraries, a built `ssbu_glslang.dll` and the Microsoft Visual C++ runtime f
 2. Start `B2recomp.exe`. While the game is not built it shows the **Build** screen: choose your dump folder (below,
    "What you extract from your own console") with Browse or by dragging it onto the window; it says at once whether
    the folder looks right. Press Build: it runs `scripts\setup.py` with the bundled Python and tools only (any Python or
-   compiler settings of your PC are ignored), ticks off the nine steps, shows the progress and setup's output, and
+   compiler settings of your PC are ignored), ticks off the ten steps, shows the progress and setup's output, and
    when it is done the same window becomes the launcher. Close stops a build (finished steps are kept); "Logs folder"
    opens `build\logs`. `B2recomp.exe --build` shows the Build screen again, to rebuild.
 3. Later: start `B2recomp.exe` (or `build\launcher.exe`); it opens straight into the launcher.
@@ -132,6 +132,7 @@ generated from your `sdk` in step `tables`.
 | `deps` | checks the Python packages and every tool above; compiles and runs a test program (runs every time: it also finds the tools for the later steps) |
 | `verify` | the version check above; refuses encrypted packages |
 | `convert` | copies your ExeFS to `targets/exefs/`, converts `main` and `sdk` (NSO) to `main.elf` / `sdk.elf` with `tools/extract/nso2elf.py` (LZ4 only; each segment's SHA-256 checked against the NSO header); makes `targets\romfs` and `targets\sysdata\fonts` junctions to the dump's folders |
+| `mods` | optional: applies your own code mods from `mods\` to `main.elf` (below, "Code mods"); with no mods it changes nothing (runs every time, it is cheap) |
 | `tables` | `runtime/gen/make_gen.py`: generates `runtime/gen/*` from your `sdk` and `main` (image layout, import list, lifted SDK functions, SDK constants, the graphics driver's device answers, self-test vectors) |
 | `lift` | `lifter/recomp_eh.py`: translates your `main.elf` to C in `build/gen_eh` |
 | `compile` | `scripts/compile_main.py`: compiles that C with clang -O2 into `build/obj` (functions over 5,000 statements are left unoptimised: clang 23 takes minutes on a few huge ones) |
@@ -142,7 +143,9 @@ generated from your `sdk` in step `tables`.
 `--status` shows what is done, `--from <step>` repeats a step and those after it, `--only <step>` runs one (plus
 `deps`), `--jobs N` sets the number of compiler processes (default: the number of CPU threads, at most 24). A failed step is
 reported with the tail of its log (`build/logs/<step>.log`); fix the cause and run the same command again. A new
-`--dump` folder starts every step again. `compile` has no up-to-date check: running it again recompiles all files.
+`--dump` folder starts every step again. `compile` compiles only the C files that changed since its last run (the lift
+rewrites only those) and keeps a record in `build/obj/_stamps.json`; a new compiler, other flags or a changed runtime
+header compiles everything again. `python scripts/compile_main.py --force` compiles everything on purpose.
 
 ### Measured (clean clone, 16-thread PC, `--jobs 16`, nothing else running)
 
@@ -162,6 +165,87 @@ Disk: `build/` is about 0.8 GB; `build/gen_eh` and `build/obj` (about 0.6 GB) ca
 to end: the build above ran the title and attract sequence for 60 s (exit code 0, every system call handled) and passed
 the standard test run below.
 
+## Code mods (.pchtxt / .ips)
+
+Code mods made for Switch emulators (Yuzu, Ryujinx and their successors) patch the game's `main` program: frame-rate,
+ultrawide and similar mods ship as IPSwitch text patches (`.pchtxt`) or IPS patches (`.ips`). B2recomp translates that
+same program, so the build can take them too: put the files into a folder `mods\` beside `scripts\` (any layout below
+it, so an emulator mod pack's `<mod name>\exefs\` folder can be copied in as it is) and run `setup.py` again. Step
+`mods` patches `targets\exefs\main.elf` with them, so the translated game has them built in, and because their bytes
+changed it runs `tables`, `lift`, `compile`, `link` and `check` again by itself. Only the translated files that a patch
+changes are compiled again, so this takes about a minute (measured: lift 12 s, compile of the one changed file 7 s, then
+link and self-test; the very first build, and the first one after this feature arrived, compile everything once).
+Removing the files, or switching them off, and running `setup.py` again gives back the unmodified build, byte for byte.
+`--mods <folder>` reads another folder (remembered). This project ships no patches, and none are tested with it: mods
+are yours to find and use.
+
+**On / off, as in an emulator.** The launcher's **Mods...** button lists every mod in `mods\` (the first folder below
+`mods\` is the mod's name; a file lying directly in `mods\` is a mod of its own), the files inside each mod and the
+blocks of each `.pchtxt` (titled by the `//` comment above their `@enabled` / `@disabled` line), each with a check box;
+a mod with only RomFS files (below) is listed too. **Apply (rebuild)** saves the switches and runs `setup.py` in the
+window, with its log; close the game first (the rebuild replaces `build\game.dll`). When only RomFS-only mods changed,
+Apply just saves: the game reads them when it starts. A file marked `!` (in red) cannot be used, for example one written for another version of
+the game: switch it off or remove it. The switches are kept in `config\mods.ini`, section `[mods]`, which you can also
+edit by hand (`setup.py` reads it on every run):
+
+```
+[mods]
+60 FPS = off
+Ultrawide/exefs/main.pchtxt = off
+Ultrawide/exefs/main.pchtxt :: Wider HUD = on
+```
+
+A key is a mod (its folder name; this also turns off the mod's `romfs\` files, below), a file (its path below `mods\`,
+with `/`), or a block (`<file> :: <block title>`, or `<file> :: #<n>` for an untitled or repeated title). Anything not listed keeps its default: mods and files on, blocks as their `@enabled` / `@disabled` line says (`on`
+also applies a block written under `@disabled`). A mod or file switched off is not read at all.
+
+- Only patches for **your** `main` are taken: a `.pchtxt` names it with `@nsobid-f19b2e01e1794f933a9720c1404bb6f6`,
+  an `.ips` file is named after it (`f19b2e01e1794f933a9720c1404bb6f6.ips`). A file for another version of the game
+  or another program (`sdk`, `subsdk0`) stops the step with a message naming it: take it out of `mods\`.
+- What is applied is what an emulator applies: in a `.pchtxt`, the blocks under `@enabled` (not `@disabled`), until
+  `@stop`; `@flag offset_shift`, `@little-endian` / `@big-endian`, hex bytes or `"strings"`; offsets are counted from
+  the start of the NSO header, as in the emulators. Several files may patch the same bytes; the one whose path sorts
+  last wins (the log says so). To leave a file out, rename it (for example to `.pchtxt.off`).
+- Every patch line applied is listed with its offset and the old and new bytes, on screen and in `build\logs\mods.log`.
+- A code mod changes the game's program, nothing more. One that relies on an emulator setting, or that patches the RomFS,
+  `sdk` or `subsdk0`, does nothing here or does not load. A patch can also break the game, as it can on an emulator.
+  Report problems with mods removed first.
+- `python scripts/pchtxt.py list mods targets\exefs\main` shows what would be applied without building.
+
+## RomFS mods (textures, models, sounds) and button prompts
+
+Asset mods made for the emulators ship a `romfs\` folder: files that replace the game's files at the same path, or add
+new ones (the emulators call this LayeredFS). The game itself picks them up: at start it lists its RomFS and reads a loose
+file in place of the copy inside its `data00x.cpk` archives. B2recomp does the same with no build step: each folder
+directly under `mods\` that holds a `romfs\` folder (in it, or one folder further down, as an archive unpacked into a
+folder of its own) is a mod, and the game sees its files the next time it starts. A mod can have both `exefs\` code
+patches (above, built in by `setup.py`) and a `romfs\` folder.
+
+- Where two mods have the same file, the one whose folder name sorts last wins.
+- `config\mods.ini` turns a mod off without deleting it: under `[mods]`, a line `<folder name> = off`.
+- The console window and the trace say at start which mods are active, how many of their files replace the game's
+  (each one is listed in the trace, `SSBU_TRACE`), and each file the game then reads from a mod.
+- `SSBU_MODS=<folder>` reads another folder, `SSBU_MODS=none` none (for tests).
+
+**Button prompts.** A prompt mod (PlayStation or Xbox button pictures in place of the Switch ones) is used only when its
+kind is chosen: "Button prompts" in the launcher, or `button_prompts` in `controllers.ini` `[general]`:
+`auto` (the default: the kind of player 1's controller when the game starts, PlayStation pads and Xbox pads get their
+own prompts, every other controller and the keyboard the Switch ones), `switch`, `playstation` or `xbox`. Install both
+kinds side by side in `mods\`; which folder is which is guessed from its name (a word starting with `ds4`, `ds5`,
+`dualshock`, `dualsense`, `playstation`, `ps4`, `ps5` / `xbox`, or the word `ps`; so the `DS4Prompts` and `XBOXPrompts`
+folders of Timo654's *Controller Prompts Replacement (DS4/XBOX)*, GameBanana 360121, Switch version, need nothing
+more), or set in `config\mods.ini`:
+
+```
+[prompts]
+playstation = <folder name>
+xbox = <folder name>
+```
+
+The prompts are chosen when the game starts; restart it after changing the controller or the setting. This project
+ships no prompt pictures (or any other game file): the mods are yours to find. Mods made for the Switch version of the
+game fit; Wii U mods do not.
+
 ## Running
 
 ```
@@ -169,7 +253,8 @@ build\launcher.exe
 ```
 
 The launcher edits `config/graphics.ini` and `config/controllers.ini` (each option is explained in the file) and starts
-the game (Play), the controller test (`--pad-test`) or the controller mapping (`--pad-map 1`). From a console,
+the game (Play), the controller test (`--pad-test`) or the controller mapping (`--pad-map 1`); **Mods...** switches code
+mods on and off and rebuilds the game with them ("Code mods" above). From a console,
 `scripts\play.ps1` does what Play does: window and sound, no time limit, saves in `build\play\userdata`
 (`-NewSave` starts from an empty one). Controllers are read through SDL3 (DualSense, Xbox, Switch Pro and others) while
 the game window has focus.

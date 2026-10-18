@@ -1,0 +1,49 @@
+# Frame counters that run once per logic pass and must advance per 60 Hz frame of game time when the game runs faster
+# than 60 fps (scripts/fps_patch.py; notes/fps-research.md sections 6-8, findings 108, 113, 114).
+# Found by the census (per-site hit counts with the frame rate alternating 60 <-> 120, evidence/fps-research), then read
+# one by one: only clear timers are listed. Left out on purpose: list sizes and ring indexes rebuilt every frame,
+# every-Nth-frame phase counters (mod 3 / cyclic reloads used for load balancing), the global frame number
+# (0x7100992cdc / 0x71009923b4), and the UI and engine counters.
+#
+# <function> <store label> <kind> <comment>; kind int = the +/-1 that feeds the store becomes +/- tick,
+# f1 = the +/-1.0 operand of the float add that feeds the store is multiplied by tick; f1op = the same, the label
+# naming the add itself.
+
+# player (Bayonetta's object)
+7100026048 L_71000269f8 int  +0x4e14 countdown, stops at 0
+7100026048 L_7100026a18 int  countdown, stops at 0
+7100027754 L_7100027eb4 int  +0xfddc countdown, stops at 0
+7100027754 L_7100028b04 int  +0x10a88 countdown, stops at 0
+7100027754 L_71000287ac f1   +10432 float countdown (-1.0 while > 0)
+7100034968 L_71000367e4 int  +0xee70 countdown, reloaded with 10
+71000579d0 L_7100057a04 int  countdown, stops at 0
+71000579d0 L_7100057a3c int  +0x4e48 countdown, stops at 0
+71000579d0 L_7100057a58 int  countdown, stops at 0
+71000579d0 L_7100057a74 int  countdown, stops at 0
+71000579d0 L_7100057a90 int  countdown, stops at 0
+71000579d0 L_7100057aac int  countdown, stops at 0
+
+# enemies
+710018a7fc L_710018a83c int  +15824 countdown, tested > 0
+7100226fc4 L_7100227248 int  +4844 countdown, tested
+71003c6a48 L_71003c6b7c int  +1536 countdown, stops at 0
+710035f108 L_710035f8c4 f1op em0074 ShieldFloat: +1.0 per frame (the add itself: two paths join at the store)
+
+# game systems
+710093caec L_710093cb94 f1   +2852 +1.0 per frame
+710093caec L_710093cb9c f1   +2860 +1.0 per frame
+710093caec L_710093cba4 f1   +2856 +1.0 per frame
+710093caec L_710093cbb0 f1   +2864 +1.0 per frame
+71009786d4 L_710097898c f1   +12 +1.0 per frame (stage effect, pre_rocks_NM_height)
+710098fc64 L_710098fdfc int  +288 frames alive
+7100ae25a0 L_7100ae2784 int  +448 frames alive (enemy sound control, SE_EC_em*)
+7100ae25a0 L_7100ae27c0 int  +716 countdown, stops at 0
+7100ae25a0 L_7100ae27dc int  +720 countdown, stops at 0
+7100af29fc L_7100af2d08 int  countdown, stops at 0 (core_ActLv)
+
+# core game logic
+7100b01ce8 L_7100b01ddc int  +84 countdown, stops at 0 (Witch Time end, State_FinishSlowOff)
+7100b01ce8 L_7100b01dec int  +80 countdown, stops at 0 (same pass as +84; read, not measured)
+7100b01ce8 L_7100b01e0c int  +48 countdown, stops at 0
+7100b095b0 L_7100b09798 f1   +364 float countdown (-1.0 while > 0)
+7100b610f8 L_7100b61124 int  global countdown, tested

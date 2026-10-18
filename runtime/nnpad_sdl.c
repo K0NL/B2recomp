@@ -34,7 +34,11 @@ typedef struct {
     char pguid[8][40]; int pnone[8];    /* [players]: a GUID reserves the slot for that device, none = nobody */
     char ignore[16][40]; int nignore;   /* [general] ignore = <GUID>: devices that are never used */
     int kb_player;                      /* -2 auto, -1 none, 0..7 */
-    int kb_vk[24];
+    int kb_vk[24];                      /* [Recomps#1] up to two keys per binding: vk | vk2 << 8 */
+    int mouse_cam, mouse_inv;           /* [Recomps#1] [keyboard] mouse_camera (default on), mouse_invert_y */
+    float mouse_sens;                   /* [Recomps#1] [keyboard] mouse_sensitivity (default 1.0) */
+    int prompts;                        /* [Recomps#1] [general] button_prompts: 0 auto, 1 switch, 2 playstation, 3 xbox */
+    int input;                          /* [Recomps#1] [general] input: 0 both, 1 keyboard (pads unused), 2 controller (keyboard and mouse unused) */
 } Cfg;
 typedef struct {
     int used, ignored;
@@ -51,8 +55,14 @@ static const char *const g_gpax[6] = {"leftx", "lefty", "rightx", "righty", "lef
 static const char *const g_stk[4] = {"LX", "LY", "RX", "RY"};
 static const char *const g_kbn[24] = {"A", "B", "X", "Y", "STICK_L", "STICK_R", "L", "R", "ZL", "ZR", "PLUS", "MINUS", "LEFT", "UP", "RIGHT", "DOWN",
     "LSTICK_LEFT", "LSTICK_UP", "LSTICK_RIGHT", "LSTICK_DOWN", "RSTICK_LEFT", "RSTICK_UP", "RSTICK_RIGHT", "RSTICK_DOWN"};
-static const int g_kb_default[24] = {'Z', 'X', 'C', 'V', 0, 0, 'Q', 'E', 'A', 'S', VK_RETURN, VK_BACK, 'J', 'I', 'L', 'K',
-    VK_LEFT, VK_UP, VK_RIGHT, VK_DOWN, 0, 0, 0, 0};
+/* [Recomps#1] the default layout for Bayonetta 2, after the original Bayonetta on PC (WASD, the attacks on the mouse, Space
+ * jump, Shift evade, Alt lock-on): A kick = right mouse or Enter, B jump = Space or Backspace, X punch = left mouse,
+ * Y shoot = E or middle mouse, L (Umbran Climax) = Q, R = F, ZL = left Alt, ZR (dodge) = left Shift, stick clicks C / R,
+ * Plus = Esc, Minus = Tab, D-pad = 1 2 3 4 (up right down left), left stick = W A S D, right stick = the arrows and the mouse */
+#define KB2(a, b) ((a) | (b) << 8)
+static const int g_kb_default[24] = {KB2(VK_RBUTTON, VK_RETURN), KB2(VK_SPACE, VK_BACK), VK_LBUTTON, KB2('E', VK_MBUTTON), 'C', 'R',
+    'Q', 'F', VK_LMENU, VK_LSHIFT, VK_ESCAPE, VK_TAB, '4', '1', '2', '3',
+    'A', 'W', 'D', 'S', VK_LEFT, VK_UP, VK_RIGHT, VK_DOWN};
 
 static CRITICAL_SECTION g_cs;
 static volatile LONG g_cs_ready;
@@ -62,6 +72,7 @@ static Dev g_dev[MAXDEV];
 static struct { char guid[40]; int slot; } g_mem[32];
 static int g_mem_n;
 static int g_kb_slot = -3;                  /* resolved lazily */
+static int g_kb_shared;                     /* [Recomps#1] pads may take the keyboard's slot too (merged; finding 106) */
 static ULONGLONG g_init_ms;
 static LARGE_INTEGER g_qpf, g_last_poll;
 static ULONGLONG g_last_cfg_check;
@@ -144,6 +155,13 @@ static const char *const g_default_ini =
 "; Vibration: on / off and a strength factor (0..2)\r\n"
 "rumble = on\r\n"
 "rumble_strength = 1.0\r\n"
+"; Button prompts the game shows: auto (by player 1's controller when the game starts: PlayStation pads -> playstation, Xbox\r\n"
+";   pads -> xbox, all others -> switch), switch, playstation, xbox. playstation / xbox need a prompt mod of your own in mods\\\r\n"
+";   (BUILDING.md, \"RomFS mods\"); without one the game's own Switch prompts stay.\r\n"
+"button_prompts = auto\r\n"
+"; Which input the game takes: both (pads and the keyboard + mouse, merged), keyboard (pads are ignored), controller (the\r\n"
+";   keyboard and mouse are ignored). The keyboard part takes effect when the game starts, the pads part at once.\r\n"
+"input = both\r\n"
 "; Devices that must never be used (GUIDs from --pad-test; e.g. a keyboard receiver that presents itself as a joystick). One line per device:\r\n"
 "; ignore = 03000000efbe00006d04000000000000\r\n"
 "\r\n"
@@ -153,15 +171,22 @@ static const char *const g_default_ini =
 "player1 = auto\r\nplayer2 = auto\r\nplayer3 = auto\r\nplayer4 = auto\r\nplayer5 = auto\r\nplayer6 = auto\r\nplayer7 = auto\r\nplayer8 = auto\r\n"
 "\r\n"
 "[keyboard]\r\n"
-"; auto = the first free player slot after the pads found at start (so a machine with one pad has pad = player 1, keyboard = player 2,\r\n"
-"; and without any pad the keyboard is player 1); 1..8 = that player (merged with the pad of that player); none = no keyboard.\r\n"
+"; auto = player 1, together with player 1's pad (Bayonetta 2 is a one-player game: it reads only player 1); 1..8 = that\r\n"
+"; player (merged with the pad of that player); none = no keyboard.\r\n"
 "; The environment variable SSBU_KEYBOARD_PLAYER (0 = none, 1..8) overrides this line. The keyboard counts only while the game window has the focus.\r\n"
 "player = auto\r\n"
-"; Keys: a letter or digit, LEFT UP RIGHT DOWN ENTER BACKSPACE SPACE TAB ESC SHIFT CTRL ALT F1..F12, NUM0..NUM9, or 0x<virtual key code>; none = unbound.\r\n"
-"A = Z\r\nB = X\r\nX = C\r\nY = V\r\nL = Q\r\nR = E\r\nZL = A\r\nZR = S\r\nPLUS = ENTER\r\nMINUS = BACKSPACE\r\n"
-"STICK_L = none\r\nSTICK_R = none\r\nLEFT = J\r\nUP = I\r\nRIGHT = L\r\nDOWN = K\r\n"
-"LSTICK_LEFT = LEFT\r\nLSTICK_UP = UP\r\nLSTICK_RIGHT = RIGHT\r\nLSTICK_DOWN = DOWN\r\n"
-"RSTICK_LEFT = none\r\nRSTICK_UP = none\r\nRSTICK_RIGHT = none\r\nRSTICK_DOWN = none\r\n"
+"; Keys: a letter or digit, LEFT UP RIGHT DOWN ENTER BACKSPACE SPACE TAB ESC SHIFT CTRL ALT LSHIFT RSHIFT LCTRL RCTRL LALT RALT F1..F12,\r\n"
+"; NUM0..NUM9, MOUSE1..MOUSE5 (left, right, middle, back, forward), or 0x<virtual key code>; none = unbound. Two keys for one\r\n"
+"; button: separated by a comma (Y = E, MOUSE3). The layout follows the original Bayonetta on PC: Pro buttons as Bayonetta 2\r\n"
+"; uses them: X punch, A kick, B jump, Y shoot, ZR dodge, L Umbran Climax, Plus pause; Enter / Backspace confirm / go back in menus.\r\n"
+"; The launcher's \"Keyboard and mouse...\" window edits these lines.\r\n"
+"A = MOUSE2, ENTER\r\nB = SPACE, BACKSPACE\r\nX = MOUSE1\r\nY = E, MOUSE3\r\nL = Q\r\nR = F\r\nZL = LALT\r\nZR = LSHIFT\r\nPLUS = ESC\r\nMINUS = TAB\r\n"
+"STICK_L = C\r\nSTICK_R = R\r\nLEFT = 4\r\nUP = 1\r\nRIGHT = 2\r\nDOWN = 3\r\n"
+"LSTICK_LEFT = A\r\nLSTICK_UP = W\r\nLSTICK_RIGHT = D\r\nLSTICK_DOWN = S\r\n"
+"RSTICK_LEFT = LEFT\r\nRSTICK_UP = UP\r\nRSTICK_RIGHT = RIGHT\r\nRSTICK_DOWN = DOWN\r\n"
+"; The mouse moves the camera (the right stick) once you click into the game (borderless / fullscreen: at once): the cursor\r\n"
+"; is hidden and kept in the window; Esc (pause) or Alt+Tab lets it go. mouse_sensitivity: 1.0 = full stick at a brisk move.\r\n"
+"mouse_camera = on\r\nmouse_sensitivity = 1.0\r\nmouse_invert_y = off\r\n"
 "\r\n"
 "; Per device (GUID from --pad-test). Every key is optional; what is missing falls back to [general] and the built-in default:\r\n"
 "; [device 03000000de280000ff11000000007801]\r\n"
@@ -188,10 +213,12 @@ static void cfg_defaults(Cfg *c) {
     c->def.layout = 2; c->def.dz = 0.10f; c->def.outer = 0.98f; c->def.trig = 0.33f; c->def.rstr = 1.0f; c->def.rumble = 1;
     c->kb_player = -2;
     memcpy(c->kb_vk, g_kb_default, sizeof c->kb_vk);
+    c->mouse_cam = 1; c->mouse_sens = 1.0f;
 }
-static int parse_vk(const char *t) {
+static int parse_vk1(const char *t) {
     char b[24];
     snprintf(b, sizeof b, "%s", t);
+    while (b[0] == ' ' || b[0] == '\t') memmove(b, b + 1, strlen(b));
     for (char *p = b + strlen(b); p > b && (p[-1] == ' ' || p[-1] == '\t' || p[-1] == '\r' || p[-1] == '\n'); ) *--p = 0;
     if (!b[0] || !_stricmp(b, "none")) return 0;
     if (b[1] == 0) { char ch = b[0]; if (ch >= 'a' && ch <= 'z') ch -= 32; return ch; }
@@ -200,10 +227,23 @@ static int parse_vk(const char *t) {
     if (!_stricmp(b, "ENTER")) return VK_RETURN; if (!_stricmp(b, "BACKSPACE")) return VK_BACK;
     if (!_stricmp(b, "SPACE")) return VK_SPACE; if (!_stricmp(b, "TAB")) return VK_TAB; if (!_stricmp(b, "ESC")) return VK_ESCAPE;
     if (!_stricmp(b, "SHIFT")) return VK_SHIFT; if (!_stricmp(b, "CTRL")) return VK_CONTROL; if (!_stricmp(b, "ALT")) return VK_MENU;
+    /* [Recomps#1] the mouse buttons and the left / right modifier keys */
+    if (!_strnicmp(b, "MOUSE", 5) && b[5] >= '1' && b[5] <= '5' && !b[6]) { static const int mb[5] = {VK_LBUTTON, VK_RBUTTON, VK_MBUTTON, VK_XBUTTON1, VK_XBUTTON2}; return mb[b[5] - '1']; }
+    if (!_stricmp(b, "LSHIFT")) return VK_LSHIFT; if (!_stricmp(b, "RSHIFT")) return VK_RSHIFT;
+    if (!_stricmp(b, "LCTRL")) return VK_LCONTROL; if (!_stricmp(b, "RCTRL")) return VK_RCONTROL;
+    if (!_stricmp(b, "LALT")) return VK_LMENU; if (!_stricmp(b, "RALT")) return VK_RMENU;
     if ((b[0] == 'F' || b[0] == 'f') && atoi(b + 1) >= 1 && atoi(b + 1) <= 12) return VK_F1 + atoi(b + 1) - 1;
     if (!_strnicmp(b, "NUM", 3) && b[3] >= '0' && b[3] <= '9') return VK_NUMPAD0 + b[3] - '0';
     if (b[0] == '0' && (b[1] == 'x' || b[1] == 'X')) return (int)strtol(b, NULL, 16);
     return 0;
+}
+static int parse_vk(const char *t) {           /* [Recomps#1] one key, or two separated by a comma ("E, MOUSE3"): vk | vk2 << 8 */
+    char b[48];
+    snprintf(b, sizeof b, "%s", t);
+    char *c = strchr(b, ',');
+    if (!c) return parse_vk1(b);
+    *c = 0;
+    return parse_vk1(b) | parse_vk1(c + 1) << 8;
 }
 static int parse_bool(const char *v) { return !(_stricmp(v, "off") && _stricmp(v, "0") && _stricmp(v, "no") && _stricmp(v, "false")) ? 0 : 1; }
 
@@ -264,7 +304,11 @@ static void cfg_parse(Cfg *c, char *text) {
         while (*val == ' ' || *val == '\t') val++;
         if (_stricmp(key, "name")) for (char *p = val; *p; p++) if ((*p == ';' || *p == '#') && p > val && (p[-1] == ' ' || p[-1] == '\t')) { *p = 0; break; }
         for (char *p = val + strlen(val); p > val && (p[-1] == ' ' || p[-1] == '\t'); ) *--p = 0;
-        if (sect == 1 && !_stricmp(key, "ignore")) { if (c->nignore < 16) snprintf(c->ignore[c->nignore++], sizeof c->ignore[0], "%s", val); }
+        if (sect == 1 && !_stricmp(key, "input"))                                              /* [Recomps#1] */
+            c->input = !_stricmp(val, "keyboard") ? 1 : !_stricmp(val, "controller") ? 2 : 0;
+        else if (sect == 1 && !_stricmp(key, "button_prompts"))                                /* [Recomps#1] */
+            c->prompts = !_stricmp(val, "switch") ? 1 : !_stricmp(val, "playstation") ? 2 : !_stricmp(val, "xbox") ? 3 : 0;
+        else if (sect == 1 && !_stricmp(key, "ignore")) { if (c->nignore < 16) snprintf(c->ignore[c->nignore++], sizeof c->ignore[0], "%s", val); }
         else if (sect == 1) cfg_set(c, &c->def, 0, key, val);
         else if (sect == 4 && cur) cfg_set(c, cur, 1, key, val);
         else if (sect == 2 && !_strnicmp(key, "player", 6) && key[6] >= '1' && key[6] <= '8' && !key[7]) {
@@ -273,6 +317,9 @@ static void cfg_parse(Cfg *c, char *text) {
             if (!_stricmp(val, "none")) c->pnone[p] = 1; else if (_stricmp(val, "auto")) snprintf(c->pguid[p], sizeof c->pguid[0], "%s", val);
         } else if (sect == 3) {
             if (!_stricmp(key, "player")) c->kb_player = !_stricmp(val, "auto") ? -2 : !_stricmp(val, "none") ? -1 : atoi(val) >= 1 && atoi(val) <= 8 ? atoi(val) - 1 : -2;
+            else if (!_stricmp(key, "mouse_camera")) c->mouse_cam = parse_bool(val);            /* [Recomps#1] */
+            else if (!_stricmp(key, "mouse_sensitivity")) { float v = (float)atof(val); if (v > 0.01f && v <= 20.0f) c->mouse_sens = v; }
+            else if (!_stricmp(key, "mouse_invert_y")) c->mouse_inv = parse_bool(val);
             else for (int i = 0; i < 24; i++) if (!_stricmp(key, g_kbn[i])) c->kb_vk[i] = parse_vk(val);
         }
     }
@@ -356,9 +403,9 @@ static int assign_slot(const Dev *d) {
     for (int p = 0; p < 8; p++) if (g_cfg.pguid[p][0] && !_stricmp(g_cfg.pguid[p], d->guid) && !slot_taken(p)) return p;
     for (int i = 0; i < g_mem_n; i++) {
         int p = g_mem[i].slot;
-        if (!_stricmp(g_mem[i].guid, d->guid) && !slot_taken(p) && slot_usable(p, d->guid) && p != g_kb_slot) return p;
+        if (!_stricmp(g_mem[i].guid, d->guid) && !slot_taken(p) && slot_usable(p, d->guid) && (p != g_kb_slot || g_kb_shared)) return p;
     }
-    for (int p = 0; p < 8; p++) if (!slot_taken(p) && slot_usable(p, d->guid) && !g_cfg.pguid[p][0] && p != g_kb_slot) return p;
+    for (int p = 0; p < 8; p++) if (!slot_taken(p) && slot_usable(p, d->guid) && !g_cfg.pguid[p][0] && (p != g_kb_slot || g_kb_shared)) return p;
     return -1;
 }
 static void remember(const char *guid, int slot) {
@@ -593,7 +640,7 @@ static Dev *dev_of(int player) { for (int i = 0; i < MAXDEV; i++) if (g_dev[i].u
 
 int nnpad_present(int player) {
     int r = 0;
-    if (!g_sdl_ok || player < 0 || player > 7) return 0;
+    if (!g_sdl_ok || player < 0 || player > 7 || g_cfg.input == 1) return 0;          /* [Recomps#1] input = keyboard: no pads */
     nnpad_poll(0);
     lock();
     Dev *d = dev_of(player);
@@ -604,7 +651,7 @@ int nnpad_present(int player) {
 }
 int nnpad_get(int player, NnPadState *out) {
     int r = 0;
-    if (!g_sdl_ok || player < 0 || player > 7) return 0;
+    if (!g_sdl_ok || player < 0 || player > 7 || g_cfg.input == 1) return 0;          /* [Recomps#1] input = keyboard */
     nnpad_poll(0);
     lock();
     Dev *d = dev_of(player);
@@ -631,7 +678,7 @@ void nnpad_rumble(int player, float low, float high) {
     Dev *d;
     if (!g_sdl_ok || player < 0 || player > 7) return;
     lock();
-    if ((d = dev_of(player)) != NULL && (d->gp || d->js)) {
+    if ((d = dev_of(player)) != NULL && (d->gp || d->js) && g_cfg.input != 1) {        /* [Recomps#1] input = keyboard: pads stay still */
         float s = eff_rumble(d) ? EFF(d, rstr) : 0.0f;
         float l = low * s, h = high * s;
         Uint16 rl = (Uint16)(l >= 1 ? 65535 : l <= 0 ? 0 : (int)(l * 65535.0f)), rh = (Uint16)(h >= 1 ? 65535 : h <= 0 ? 0 : (int)(h * 65535.0f));
@@ -648,27 +695,54 @@ void nnpad_rumble(int player, float low, float high) {
 static int env_kb(void) { const char *k = getenv("SSBU_KEYBOARD_PLAYER"); return k && k[0] ? atoi(k) : -1; }   /* -1 unset; 0 none; 1..8 */
 int nnpad_keyboard_player(void) {
     int r;
-    if (g_kb_slot == -3 && g_sdl_ok && !getenv("SSBU_SEQ") && !getenv("SSBU_PLAY") && !getenv("SSBU_SCRIPT") && !getenv("SSBU_PRESS") && env_kb() < 0 && g_cfg.kb_player == -2) {
-        /* pads on Windows can show up a moment after SDL starts: give them up to 1.5 s before the keyboard takes a slot */
-        ULONGLONG el = GetTickCount64() - g_init_ms;
-        if (el < 1500) Sleep((DWORD)(1500 - el));
-        nnpad_poll(1);
-    }
     lock();
     if (g_kb_slot == -3) {
         int e = env_kb();
+        if (!g_cfg.path[0]) cfg_load(1);
         if (e >= 0) g_kb_slot = e == 0 ? -1 : e <= 8 ? e - 1 : -1;
+        else if (g_cfg.input == 2) g_kb_slot = -1;                /* [Recomps#1] input = controller: no keyboard, no mouse camera */
         else if (g_cfg.kb_player == -1) g_kb_slot = -1;
-        else if (g_cfg.kb_player >= 0) g_kb_slot = g_cfg.kb_player;
-        else {
-            g_kb_slot = -1;
-            for (int p = 0; p < 8 && g_kb_slot < 0; p++) if (!slot_taken(p) && slot_usable(p, "") && !g_cfg.pguid[p][0]) g_kb_slot = p;
-        }
+        else if (g_cfg.kb_player >= 0) { g_kb_slot = g_cfg.kb_player; g_kb_shared = 1; }
+        else { g_kb_slot = 0; g_kb_shared = 1; }
+        /* [Recomps#1] auto = player 1, merged with player 1's pad (and a 1..8 player merges with that player's pad, as the
+         * file says). Upstream gave auto the first slot no pad had at start: with a pad connected that was player 2, which
+         * Bayonetta 2, a one-player game, never reads (keys did nothing). Pads keep taking the keyboard's slot (g_kb_shared),
+         * so the 1.5 s wait for late pads before choosing the keyboard's slot is gone too. */
         if (g_kb_slot >= 0) say("nn::pad: keyboard = player %d\n", g_kb_slot + 1); else say("nn::pad: keyboard = nobody\n");
     }
     r = g_kb_slot;
     unlock();
     return r;
+}
+int nnpad_mouse_cfg(float *sens, int *invert) {      /* [Recomps#1] mouse_camera on? (+ its sensitivity, invert-y) */
+    if (!g_inited) { lock(); if (!g_cfg.path[0]) { cfg_load(1); } unlock(); }
+    if (sens) *sens = g_cfg.mouse_sens > 0 ? g_cfg.mouse_sens : 1.0f;
+    if (invert) *invert = g_cfg.mouse_inv;
+    return g_cfg.mouse_cam;
+}
+/* [Recomps#1] button_prompts of [general] -> 1 switch, 2 playstation, 3 xbox. auto: the SDL gamepad type of player 1's pad
+ * (else of the first pad) at the moment of the call -- nnfs.c asks once, when it sets up the RomFS mods at the first file
+ * access. Scripted runs (SSBU_SEQ) and the XInput backend never read pads, so auto means switch there. */
+int nnpad_button_prompts(void) {
+    lock(); if (!g_cfg.path[0]) cfg_load(1); int p = g_cfg.prompts; unlock();
+    if (p) return p;
+    const char *seq = getenv("SSBU_SEQ"), *backend = getenv("SSBU_PAD_BACKEND");
+    if ((seq && seq[0]) || (backend && !_stricmp(backend, "xinput")) || !nnpad_init()) return 1;
+    lock();
+    const Dev *best = NULL;
+    for (int i = 0; i < MAXDEV; i++) {
+        const Dev *d = &g_dev[i];
+        if (!d->used || d->ignored || !d->gp) continue;
+        if (d->slot == 0) { best = d; break; }
+        if (!best) best = d;
+    }
+    int t = best ? best->gtype : SDL_GAMEPAD_TYPE_UNKNOWN;
+    unlock();
+    switch (t) {
+    case SDL_GAMEPAD_TYPE_PS3: case SDL_GAMEPAD_TYPE_PS4: case SDL_GAMEPAD_TYPE_PS5: return 2;
+    case SDL_GAMEPAD_TYPE_XBOX360: case SDL_GAMEPAD_TYPE_XBOXONE: return 3;
+    default: return 1;
+    }
 }
 int nnpad_kb_vk(int idx) {
     if (!g_inited) { lock(); if (!g_cfg.path[0]) { cfg_load(1); } unlock(); }

@@ -27,6 +27,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <windows.h>
 #include <io.h>                 /* [Recomps#1] _get_osfhandle: was implicitly declared (int return), an error in clang >= 16 */
 #include "runtime.h"
@@ -84,12 +85,14 @@ static void fs_lock(void) {
 }
 static void fs_unlock(void) { LeaveCriticalSection(&g_fs_lock); }
 
+static void rom_mods_init(void);
 static void fs_roots(void) {
     if (g_rom_root[0]) return;
     const char *env = getenv("SSBU_ROMFS"), *user = getenv("SSBU_USERDATA");
     strncpy(g_rom_root, env && env[0] ? env : "..\\romfs", MAX_PATH - 1);
     strncpy(g_user_root, user && user[0] ? user : "..\\userdata", MAX_PATH - 1);
     CreateDirectoryA(g_user_root, NULL);
+    rom_mods_init();
 }
 const char *fs_user_root(void) { fs_roots(); return g_user_root; }
 
@@ -115,6 +118,195 @@ static void remove_tree(const char *dir) {
         FindClose(h);
     }
     RemoveDirectoryA(dir);
+}
+
+/* ---- [Recomps#1] RomFS mods: the emulators' LayeredFS. A mod is a folder directly under the mods folder (%SSBU_MODS%,
+ * else <exe folder>\..\mods; SSBU_MODS=none turns them off) that holds a romfs\ folder, itself or one level down (an
+ * emulator pack's <mod>\romfs\..., or an archive unpacked into a folder of its own). Its files replace the game's file at
+ * the same rom: path, or are added; the game sees them because it lists rom:/ at boot (CRI's loose files beside the CPKs).
+ * Order: a mod whose name sorts later wins, as for the code mods (scripts/pchtxt.py). config\mods.ini (beside
+ * controllers.ini): [mods] <name> = off leaves a mod out; [prompts] playstation = <name> / xbox = <name> names the button
+ * prompt mods (else guessed from the folder name: a word starting ds4, ds5, dualshock, dualsense, playstation, ps4, ps5 /
+ * xbox, or the word ps; so DS4Prompts / XBOXPrompts of the GameBanana prompt mod 360121 need no [prompts] line). Prompt
+ * mods are layered only when chosen: controllers.ini [general] button_prompts (nnpad_button_prompts), above all others.
+ * Read once, at the first file access: changes apply at the next start, no rebuild. */
+#include "nnpad.h"
+#define ROM_MOD_MAX 16
+#define FS_DIR_ROOTS (ROM_MOD_MAX + 2)
+static char g_rom_mod[ROM_MOD_MAX][MAX_PATH];            /* <mod>\romfs folders, the one that wins first */
+static int g_rom_mods;
+static int mod_cmp(const void *a, const void *b) { return _stricmp(*(char *const *)a, *(char *const *)b); }
+static int mod_family(const char *name) {                /* 2 playstation, 3 xbox, 0 neither: by the words of the name */
+    char w[64]; int n = 0, fam = 0;
+    for (const char *p = name; ; p++) {
+        int alnum = *p && (isalnum((unsigned char)*p));
+        if (alnum && n < 63) { w[n++] = (char)tolower((unsigned char)*p); continue; }
+        w[n] = 0;
+        if (n) {                                         /* a word that starts with one of these: Timo654's prompt mod (GameBanana
+                                                            360121) unpacks as DS4Prompts / XBOXPrompts; "ps" only as a whole word */
+            static const char *const ps[] = {"ds4", "ds5", "dualshock", "dualsense", "playstation", "ps4", "ps5"};
+            for (int i = 0; i < (int)(sizeof ps / sizeof ps[0]); i++) if (!strncmp(w, ps[i], strlen(ps[i]))) fam = 2;
+            if (!strcmp(w, "ps")) fam = 2;
+            if (!strncmp(w, "xbox", 4)) fam = 3;
+        }
+        n = 0;
+        if (!*p) break;
+    }
+    return fam;
+}
+static void mods_ini_path(char *out) {                   /* beside controllers.ini (SSBU_CONFIG) or graphics.ini, else <exe>\..\config */
+    const char *c = getenv("SSBU_CONFIG"), *g = getenv("SSBU_GRAPHICS_CONFIG"), *f = c && c[0] ? c : g && g[0] ? g : NULL;
+    char tmp[MAX_PATH];
+    if (f) {
+        snprintf(tmp, sizeof tmp, "%s", f);
+        char *s = strrchr(tmp, '\\'), *s2 = strrchr(tmp, '/');
+        if (s2 > s) s = s2;
+        if (s) { *s = 0; snprintf(out, MAX_PATH, "%s\\mods.ini", tmp); } else snprintf(out, MAX_PATH, "mods.ini");
+        return;
+    }
+    GetModuleFileNameA(NULL, tmp, MAX_PATH);
+    char *s = strrchr(tmp, '\\');
+    if (s) *s = 0;
+    snprintf(out, MAX_PATH, "%s\\..\\config\\mods.ini", tmp);
+}
+/* mods.ini value of key in [sect] ("" when missing); trims blanks and a "; comment" after the value */
+static void mods_ini_get(const char *text, const char *sect, const char *key, char *out, size_t on) {
+    char cur[64] = "";
+    out[0] = 0;
+    for (const char *l = text; l && *l; ) {
+        const char *e = strchr(l, '\n');
+        size_t n = e ? (size_t)(e - l) : strlen(l);
+        char line[512];
+        if (n >= sizeof line) n = sizeof line - 1;
+        memcpy(line, l, n); line[n] = 0;
+        l = e ? e + 1 : NULL;
+        char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        size_t k = strlen(p);
+        while (k && (p[k - 1] == '\r' || p[k - 1] == ' ' || p[k - 1] == '\t')) p[--k] = 0;
+        if (!*p || *p == ';' || *p == '#') continue;
+        if (*p == '[') { char *r = strchr(p, ']'); if (r) *r = 0; snprintf(cur, sizeof cur, "%s", p + 1); continue; }
+        char *eq = strchr(p, '=');
+        if (!eq || _stricmp(cur, sect)) continue;
+        *eq = 0;
+        char *v = eq + 1;
+        for (char *q = eq; q > p && (q[-1] == ' ' || q[-1] == '\t'); ) *--q = 0;
+        if (_stricmp(p, key)) continue;
+        while (*v == ' ' || *v == '\t') v++;
+        for (char *q = v; *q; q++) if ((*q == ';' || *q == '#') && q > v && (q[-1] == ' ' || q[-1] == '\t')) { *q = 0; break; }
+        k = strlen(v);
+        while (k && (v[k - 1] == ' ' || v[k - 1] == '\t')) v[--k] = 0;
+        snprintf(out, on, "%s", v);                       /* the last one counts */
+    }
+}
+static int find_romfs(const char *mod, char *out) {      /* <mod>\romfs or <mod>\<one folder>\romfs */
+    char pat[MAX_PATH];
+    WIN32_FIND_DATAA fd;
+    snprintf(out, MAX_PATH, "%s\\romfs", mod);
+    if (is_dir(out)) return 1;
+    snprintf(pat, sizeof pat, "%s\\*", mod);
+    HANDLE h = FindFirstFileA(pat, &fd);
+    int found = 0;
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    do {
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || fd.cFileName[0] == '.') continue;
+        snprintf(out, MAX_PATH, "%s\\%s\\romfs", mod, fd.cFileName);
+        found = is_dir(out);
+    } while (!found && FindNextFileA(h, &fd));
+    FindClose(h);
+    return found;
+}
+static void mod_report(const char *dir, const char *rel, int *files, int *repl, int depth) {   /* counts, and lists replacements in the trace */
+    char pat[MAX_PATH], sub[MAX_PATH], subrel[MAX_PATH], base[MAX_PATH];
+    WIN32_FIND_DATAA fd;
+    snprintf(pat, sizeof pat, "%s\\*", dir);
+    HANDLE h = FindFirstFileA(pat, &fd);
+    if (h == INVALID_HANDLE_VALUE || depth > 16) return;
+    do {
+        if (!strcmp(fd.cFileName, ".") || !strcmp(fd.cFileName, "..")) continue;
+        snprintf(sub, sizeof sub, "%s\\%s", dir, fd.cFileName);
+        if (rel[0]) snprintf(subrel, sizeof subrel, "%s\\%s", rel, fd.cFileName); else snprintf(subrel, sizeof subrel, "%s", fd.cFileName);
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) { mod_report(sub, subrel, files, repl, depth + 1); continue; }
+        (*files)++;
+        snprintf(base, sizeof base, "%s\\%s", g_rom_root, subrel);
+        int r = exists(base);
+        *repl += r;
+        char shown[MAX_PATH];
+        snprintf(shown, sizeof shown, "%s", subrel);
+        for (char *p = shown; *p; p++) if (*p == '\\') *p = '/';
+        trace_printf("     romfs mod: %s rom:/%s\n", r ? "replaces" : "adds    ", shown);
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+}
+static void rom_mods_init(void) {
+    const char *env = getenv("SSBU_MODS");
+    char dir[MAX_PATH], tmp[MAX_PATH], ini_path[MAX_PATH], pat[MAX_PATH], want[2][MAX_PATH];
+    if (env && (!_stricmp(env, "none") || !strcmp(env, "0"))) return;
+    if (env && env[0]) snprintf(tmp, sizeof tmp, "%s", env);
+    else {
+        GetModuleFileNameA(NULL, tmp, MAX_PATH);
+        char *s = strrchr(tmp, '\\');
+        if (s) *s = 0;
+        strncat(tmp, "\\..\\mods", sizeof tmp - strlen(tmp) - 1);
+    }
+    if (!_fullpath(dir, tmp, MAX_PATH)) snprintf(dir, sizeof dir, "%s", tmp);
+    if (!is_dir(dir)) return;
+    char *names[64]; int n = 0;
+    WIN32_FIND_DATAA fd;
+    snprintf(pat, sizeof pat, "%s\\*", dir);
+    HANDLE h = FindFirstFileA(pat, &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && fd.cFileName[0] != '.' && n < 64) names[n++] = _strdup(fd.cFileName);
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+    qsort(names, (size_t)n, sizeof names[0], mod_cmp);
+    mods_ini_path(ini_path);
+    char *ini = NULL;
+    FILE *f = fopen(ini_path, "rb");
+    if (f) {
+        fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+        ini = calloc(1, (size_t)(sz > 0 ? sz : 0) + 1);
+        if (ini && sz > 0) fread(ini, 1, (size_t)sz, f);
+        fclose(f);
+    }
+    mods_ini_get(ini ? ini : "", "prompts", "playstation", want[0], MAX_PATH);
+    mods_ini_get(ini ? ini : "", "prompts", "xbox", want[1], MAX_PATH);
+    char roots[64][MAX_PATH], prompt[MAX_PATH] = "";
+    int nroots = 0, nprompt = 0, chosen = -1;
+    for (int i = 0; i < n; i++) {
+        char val[32], mod[MAX_PATH], romfs[MAX_PATH];
+        snprintf(mod, sizeof mod, "%s\\%s", dir, names[i]);
+        if (!find_romfs(mod, romfs)) continue;            /* a code-only mod (exefs\): scripts/setup.py's business */
+        mods_ini_get(ini ? ini : "", "mods", names[i], val, sizeof val);
+        if (!_stricmp(val, "off") || !_stricmp(val, "0") || !_stricmp(val, "false") || !_stricmp(val, "no")) {
+            printf("romfs mods: %s is off (mods.ini)\n", names[i]);
+            continue;
+        }
+        int fam = !_stricmp(names[i], want[0]) ? 2 : !_stricmp(names[i], want[1]) ? 3 : (want[0][0] || want[1][0]) ? 0 : mod_family(names[i]);
+        if (fam) {                                        /* a button prompt mod: layered only when its family is chosen */
+            nprompt++;
+            if (chosen < 0) chosen = nnpad_button_prompts();
+            if (fam == chosen && !prompt[0]) snprintf(prompt, sizeof prompt, "%s", romfs);
+            else printf("romfs mods: %s holds %s button prompts, not used (button_prompts = %s)\n", names[i],
+                        fam == 2 ? "PlayStation" : "Xbox", chosen == 2 ? "playstation" : chosen == 3 ? "xbox" : "switch");
+            continue;
+        }
+        if (nroots < 64) snprintf(roots[nroots++], MAX_PATH, "%s", romfs);
+    }
+    if (prompt[0]) snprintf(g_rom_mod[g_rom_mods++], MAX_PATH, "%s", prompt);
+    for (int i = nroots - 1; i >= 0 && g_rom_mods < ROM_MOD_MAX; i--) snprintf(g_rom_mod[g_rom_mods++], MAX_PATH, "%s", roots[i]);
+    if (nroots + (prompt[0] != 0) > ROM_MOD_MAX) printf("romfs mods: more than %d mods with a romfs\\, the first ones by name are left out\n", ROM_MOD_MAX);
+    for (int i = 0; i < g_rom_mods; i++) {
+        int files = 0, repl = 0;
+        mod_report(g_rom_mod[i], "", &files, &repl, 0);
+        printf("romfs mods: %s%s: %d files (%d replace the game's, %d added)\n", g_rom_mod[i] + strlen(dir) + 1,
+               !strcmp(g_rom_mod[i], prompt) ? " (button prompts)" : "", files, repl, files - repl);
+        trace_printf("     romfs mod %d (first wins): %s, %d files, %d replace the game's\n", i, g_rom_mod[i], files, repl);
+    }
+    if (g_rom_mods) printf("romfs mods: %d active from %s%s\n", g_rom_mods, dir, nprompt && !prompt[0] ? " (Switch button prompts)" : "");
+    for (int i = 0; i < n; i++) free(names[i]);
+    free(ini);
 }
 
 /* ---- tombstones */
@@ -164,6 +356,8 @@ static uint32_t split_path(const char *guest, Mount **mount, char *rel) {
 static void join(char *out, const char *root, const char *rel) { if (rel[0]) snprintf(out, MAX_PATH, "%s\\%s", root, rel); else snprintf(out, MAX_PATH, "%s", root); }
 /* The host path that currently holds `rel` in the mount's view; returns 0 when it does not exist in the view. */
 static int view_path(Mount *m, const char *rel, char *out) {
+    if (m->kind == MK_ROM)                                /* [Recomps#1] RomFS mods first */
+        for (int i = 0; i < g_rom_mods; i++) { join(out, g_rom_mod[i], rel); if (exists(out)) return 1; }
     if (m->work[0]) {
         if (tomb_hides(m, rel)) { join(out, m->work, rel); return exists(out); }      /* re-created after a deletion: only the working copy counts */
         join(out, m->work, rel);
@@ -180,8 +374,9 @@ static int view_parent_is_dir(Mount *m, const char *rel) {
     *s = 0;
     return view_path(m, parent, host) && is_dir(host);
 }
-/* Used by nnfsdir.c: the host folders to list for a guest directory (working folder first), 0 = no such directory. */
-int fs_dir_roots(const char *guest, char roots[2][MAX_PATH], uint32_t *result) {
+/* Used by nnfsdir.c: the host folders to list for a guest directory (working folder or RomFS mods first, the one that wins
+ * first), 0 = no such directory. roots holds FS_DIR_ROOTS entries. */
+int fs_dir_roots(const char *guest, char roots[][MAX_PATH], uint32_t *result) {
     Mount *m; char rel[MAX_PATH], host[MAX_PATH];
     int n = 0;
     fs_lock();
@@ -189,6 +384,7 @@ int fs_dir_roots(const char *guest, char roots[2][MAX_PATH], uint32_t *result) {
     if (!*result) {
         if (!view_path(m, rel, host) || !is_dir(host)) *result = RESULT_PATH_NOT_FOUND;
         else {
+            if (m->kind == MK_ROM) for (int i = 0; i < g_rom_mods; i++) { join(roots[n], g_rom_mod[i], rel); if (is_dir(roots[n])) n++; }
             if (m->work[0]) { join(roots[n], m->work, rel); if (is_dir(roots[n])) n++; }
             if (!m->work[0] || !tomb_hides(m, rel)) { join(roots[n], m->root, rel); if (is_dir(roots[n])) n++; }
         }
@@ -205,7 +401,7 @@ int fs_dir_hidden(const char *guest_dir, const char *name) {      /* 1 = this en
     return hidden;
 }
 uint32_t fs_delete_directory(const char *guest) {
-    Mount *m; char rel[MAX_PATH], host[MAX_PATH], roots[2][MAX_PATH];
+    Mount *m; char rel[MAX_PATH], host[MAX_PATH], roots[FS_DIR_ROOTS][MAX_PATH];
     uint32_t r;
     fs_lock();
     r = split_path(guest, &m, rel);
@@ -488,6 +684,7 @@ static void fs_QueryMountRomCacheSize(Ctx *c) {          /* (size_t *out) */
     uint64_t dir_bytes = 0x18, file_bytes = 0;
     fs_roots();
     romfs_walk(g_rom_root, &dirs, &files, &dir_bytes, &file_bytes);
+    for (int i = 0; i < g_rom_mods; i++) romfs_walk(g_rom_mod[i], &dirs, &files, &dir_bytes, &file_bytes);   /* mods: counted twice where they replace, more is safe */
     uint64_t size = 4ull * romfs_buckets(dirs) + dir_bytes + 4ull * romfs_buckets(files) + file_bytes;
     trace_printf("     fs QueryMountRomCacheSize: %u directories, %u files -> %llu bytes\n", dirs, files, (unsigned long long)size);
     wr64(A0, size);
@@ -517,8 +714,10 @@ static void fs_OpenFile(Ctx *c) {                     /* (FileHandle *out, const
         h = CreateFileA(path, GENERIC_READ | (write ? GENERIC_WRITE : 0), FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
         if (h == INVALID_HANDLE_VALUE) r = RESULT_PATH_NOT_FOUND;
     }
-    if (InterlockedIncrement(&g_open_log) <= 200 || r)     /* D2: every failed open is logged, not only the first 200 */
-        trace_printf("     fs open \"%s\" mode %d -> %s\n", STR(1), (int)A2, r == RESULT_NOT_MOUNTED ? "NOT MOUNTED" : r ? "NOT FOUND" : "ok");
+    int modded = !r && m->kind == MK_ROM && g_rom_mods && _strnicmp(path, m->root, strlen(m->root)) != 0;   /* [Recomps#1] */
+    if (InterlockedIncrement(&g_open_log) <= 200 || r || modded)     /* D2: every failed open is logged, not only the first 200 */
+        trace_printf("     fs open \"%s\" mode %d -> %s%s%s\n", STR(1), (int)A2, r == RESULT_NOT_MOUNTED ? "NOT MOUNTED" : r ? "NOT FOUND" : "ok",
+                     modded ? ", from the romfs mod " : "", modded ? path : "");
     {   static int on = -1; if (on < 0) on = getenv("SSBU_FSLOG") != NULL;       /* D2 debug: every open on stdout */
         if (on) printf("fslog: open \"%s\" mode %d -> %s\n", STR(1), (int)A2, r ? "NOT FOUND" : "ok"); }
     if (r) { wr64(A0, 0); RET(r); return; }

@@ -29,6 +29,7 @@
 !/lifter/sdklift_install.txt
 !/lifter/sdklift_roots.txt
 !/lifter/test_ext.py
+!/lifter/fps_ticks.txt
 
 # ---- 4. runtime (GPL-3.0 copy of ssbu-recomp runtime/ + our changes): hand-written sources only
 !/runtime/LICENSE
@@ -53,6 +54,8 @@
 !/scripts/dumptex_compare.py
 !/scripts/gfx_compare.ps1
 !/scripts/setup.py
+!/scripts/pchtxt.py
+!/scripts/fps_patch.py
 !/scripts/bench.py
 !/scripts/make_package.py
 !/scripts/package/build.bat
@@ -121,6 +124,11 @@
 /snapshots/
 /notes/
 /CLAUDE.md
+# players' own code mods (setup.py step mods): never in the repository
+/mods/
+/config/mods.ini
+*.pchtxt
+*.ips
 /runtime/obj_host/
 /lifter/eh_main_tables.json
 

@@ -40,7 +40,8 @@ MSVC_CRT = ('msvcp140.dll', 'vcruntime140.dll', 'vcruntime140_1.dll')
 LLVM_BIN = ('clang-23.exe', 'clang.exe', 'clang-target-wrapper.exe', 'x86_64-w64-mingw32-clang.exe', 'x86_64-w64-windows-gnu.cfg',
             'x86_64-pc-windows-gnu.cfg', 'mingw32-common.cfg', 'ld.lld.exe', 'llvm-rc.exe', 'llvm-symbolizer.exe', 'libLLVM-23.dll',
             'libclang-cpp.dll', 'libc++.dll', 'libunwind.dll')
-FORBIDDEN_EXT = ('.elf', '.nso', '.nca', '.nsp', '.xci', '.nsz', '.xcz', '.keys', '.cpk', '.npdm', '.ico', '.bmp', '.res', '.dat')
+FORBIDDEN_EXT = ('.elf', '.nso', '.nca', '.nsp', '.xci', '.nsz', '.xcz', '.keys', '.cpk', '.npdm', '.ico', '.bmp', '.res', '.dat',
+                 '.pchtxt', '.ips')                  # players' code mods (scripts/pchtxt.py): never shipped
 FORBIDDEN_NAME = ('game.dll', 'game_native.exe', 'launcher.exe', 'main', 'sdk', 'subsdk0', 'rtld', 'eh_main_tables.json',
                   'sdklift_gen.c', 'sdkdata.c', 'image_layout.h', 'imports_all.txt', 'sdklift_report.txt')
 

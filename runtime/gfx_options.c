@@ -76,12 +76,13 @@ static const char *const k_default_ini =
 "console_mode = docked\r\n"
 "\r\n"
 "; resolution_scale = 1.0\r\n"
-/* PR #8 (stephenjayakar): the range goes above 1.0 (supersampling); capped at 2.0 here (review 2026-10-16), strong GPUs only */
-/* [Recomps#1] Bayonetta 2's sizes (1280x720) and the measurements of finding 83 */
-";   Internal resolution scale, 0.25 to 2.0 (Vulkan only; OpenGL ignores it). 1.0 = the game's own size: Bayonetta 2\r\n"
-";   renders at 1280x720. 1.5 = 1920x1080, 2.0 = 2560x1440 (drawn larger, reduced to the window: sharper edges).\r\n"
-";   Measured in the first tutorial fight on an RTX 5070 (2026-10-16): GPU time per frame 1.68 ms at 1.0, 1.96 ms at 1.5,\r\n"
-";   2.32 ms at 2.0; 59.3 fps in all three; 1.5 takes 153 MB more video memory, 2.0 271 MB. Below 1.0 not tested.\r\n"
+/* PR #8 (stephenjayakar): the range goes above 1.0 (supersampling); capped at 2.0 there (review 2026-10-16), strong GPUs only */
+/* [Recomps#1] Bayonetta 2's sizes (1280x720) and the measurements of finding 83; up to 3.0 = 4K (finding 105) */
+";   Internal resolution scale, 0.25 to 3.0 (Vulkan only; OpenGL ignores it). 1.0 = the game's own size: Bayonetta 2\r\n"
+";   renders at 1280x720. 1.5 = 1920x1080, 2.0 = 2560x1440, 3.0 = 3840x2160 (4K) (drawn larger, reduced to the window:\r\n"
+";   sharper edges). Measured in the first tutorial fight on an RTX 5070 (2026-10-16/17): GPU time per frame 1.68 ms at\r\n"
+";   1.0, 1.96 ms at 1.5, 2.32 ms at 2.0; 59.3-59.5 fps up to 3.0; 2.0 takes about 300 MB more video memory, 3.0 about\r\n"
+";   640 MB (strong GPUs only). Below 1.0 not tested.\r\n"
 "resolution_scale = 1.0\r\n"
 "\r\n"
 "; anisotropic_filtering = game | 2 | 4 | 8 | 16      (Vulkan)\r\n"
@@ -107,10 +108,24 @@ static const char *const k_default_ini =
 ";   vsync = clock; those three keys of the file are then not used. The log says which profile is active.\r\n"
 "profile = custom\r\n"
 "\r\n"
+"; aspect = keep | stretch      (Vulkan)\r\n"
+";   [Recomps#1] keep: the game's 16:9 picture keeps its shape; a wider or taller window (an ultrawide monitor in\r\n"
+";   borderless or fullscreen mode) gets black bars at the sides or at the top and bottom. stretch: the picture fills\r\n"
+";   the window whatever its shape.\r\n"
+"aspect = keep\r\n"
+"\r\n"
 "; frame_time_overlay = off | on\r\n"
 ";   on: the average frame time of the last second in the window title ('.. fps - 16.67 ms per frame') and as a\r\n"
 ";   'frame-time:' line in the log. (Bars drawn into the picture are not implemented yet.)\r\n"
-"frame_time_overlay = off\r\n";
+"frame_time_overlay = off\r\n"
+"\r\n"
+"; frame_rate = 60      (60 .. 120; EXPERIMENTAL above 60)\r\n"
+";   60: the game as made (60 frames per second, its own 30 fps cinematics). 61 .. 120: the game's frame clock measures\r\n"
+";   real time and the frame rate is capped at this value; its timers that count frames are converted to game time\r\n"
+";   (scripts/fps_patch.py, notes/fps-research.md). Not every frame counter is converted yet: some effects, menus and\r\n"
+";   button-mash prompts may run faster than at 60, and the cinematics run in real time. vsync = clock / display /\r\n"
+";   auto still show each frame at once above 60 (no tearing where the GPU offers mailbox).\r\n"
+"frame_rate = 60\r\n";
 
 #define GFX_LOW_SCALE 0.5f
 #define GFX_LOW_SCALE_TEXT "0.50"
@@ -177,21 +192,33 @@ static BOOL CALLBACK opt_load(PINIT_ONCE once, PVOID arg, PVOID *ctx) {
         else if (!_stricmp(key, "shader_wait")) o->shader_skip = !_stricmp(val, "skip");
         else if (!_stricmp(key, "runahead")) g_gfx_runahead = !_stricmp(val, "on") || !_stricmp(val, "1");      /* track R1 round 5 (r1_state.c) */
         else if (!_stricmp(key, "latency")) g_gfx_latency = !_stricmp(val, "lowest") ? 2 : !_stricmp(val, "low") ? 1 : 0;      /* track L1 (display.c latency_mode) */
+        else if (!_stricmp(key, "aspect")) o->aspect_stretch = !_stricmp(val, "stretch");      /* [Recomps#1] */
         else if (!_stricmp(key, "shader_prepare")) o->shader_prepare = !_stricmp(val, "background") ? 1 : !_stricmp(val, "off") ? 2 : 0;
+        else if (!_stricmp(key, "frame_rate")) { int v = atoi(val); o->frame_rate = v < 60 ? 60 : v > 120 ? 120 : v; }      /* [Recomps#1] */
         else unknown++;
     }
     if (f) fclose(f);
+    if (!o->frame_rate) o->frame_rate = 60;
+    /* [Recomps#1] frame_rate above 60: switch on the lifted code's frame-rate patch (scripts/fps_patch.py), which reads
+     * RECOMPS_UNCAP / RECOMPS_UNCAP_FPS with getenv the first time the game's clock runs (after this, at the first frame).
+     * The UCRT environment is one per process, so game.dll sees what is set here. Set variables (test runs) win. */
+    if (o->frame_rate > 60 && !getenv("RECOMPS_UNCAP")) {
+        char n[16]; snprintf(n, sizeof n, "%d", o->frame_rate);
+        _putenv_s("RECOMPS_UNCAP", "1");
+        if (!getenv("RECOMPS_UNCAP_FPS")) _putenv_s("RECOMPS_UNCAP_FPS", n);
+        printf("graphics options: frame_rate=%d: the game's clock measures real time, capped at %d fps (experimental; notes/fps-research.md)\n", o->frame_rate, o->frame_rate);
+    }
     if (o->profile == 1) {       /* the low-end profile wins over the three keys it sets, wherever they stand in the file (values: O1_options.md, session 9) */
         o->scale = GFX_LOW_SCALE; o->aniso = 0; o->present = 0;
     }
     printf("graphics profile: %s\n", o->profile == 1 ? "low (weak or integrated GPU): resolution_scale=" GFX_LOW_SCALE_TEXT ", anisotropic_filtering=game, vsync=clock; these three keys of the file are not used"
                                                      : "custom (every key of graphics.ini as written; 'profile = low' is the set for a weak or integrated GPU)");
     static const char *const k_win[3] = {"windowed", "borderless", "fullscreen"}, *const k_vs[6] = {"clock", "on", "off", "mailbox", "display", "auto"};
-    printf("graphics options: %s (%s): renderer=%s window=%s %dx%d vsync=%s gpu=%s console_mode=%s resolution_scale=%.2f anisotropic_filtering=%d frame_time_overlay=%s%s\n", o->path,
+    printf("graphics options: %s (%s): renderer=%s window=%s %dx%d vsync=%s gpu=%s console_mode=%s resolution_scale=%.2f anisotropic_filtering=%d frame_time_overlay=%s aspect=%s%s\n", o->path,
            written ? "written with the defaults" : f ? "read" : "NOT readable, defaults used", o->renderer ? "opengl" : "vulkan", k_win[o->window_mode], o->width, o->height, k_vs[o->present],
-           o->gpu[0] ? o->gpu : "auto", o->handheld ? "handheld" : "docked", o->scale, o->aniso, o->overlay ? "on" : "off", unknown ? " (lines with an unknown key were ignored)" : "");
+           o->gpu[0] ? o->gpu : "auto", o->handheld ? "handheld" : "docked", o->scale, o->aniso, o->overlay ? "on" : "off", o->aspect_stretch ? "stretch" : "keep", unknown ? " (lines with an unknown key were ignored)" : "");
     if (o->scale != 1.0f && o->renderer) printf("graphics options: resolution_scale=%.2f is ignored by the OpenGL renderer (Vulkan only)\n", o->scale);
-    if (o->scale != 1.0f && (o->scale < 0.25f || o->scale > 2.0f)) printf("graphics options: resolution_scale=%.2f is outside 0.25 .. 2.0: the nearest of the two is used\n", o->scale);      /* PR #8 (stephenjayakar): above 1.0 allowed (nvn_vk_draw.c RS_MAX = 2.0) */
+    if (o->scale != 1.0f && (o->scale < 0.25f || o->scale > 3.0f)) printf("graphics options: resolution_scale=%.2f is outside 0.25 .. 3.0: the nearest of the two is used\n", o->scale);      /* PR #8 (stephenjayakar): above 1.0 allowed (nvn_vk_draw.c RS_MAX = 2.0) */
     fflush(stdout);
     return TRUE;
 }

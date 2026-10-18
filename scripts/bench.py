@@ -117,6 +117,9 @@ def run_once(exe, run_dir, seq, seconds, wait, extra_env=None):
         'SSBU_GRAPHICS_CONFIG': os.path.join(ROOT, 'config', 'graphics.ini'),
         'SSBU_CONFIG': os.path.join(ROOT, 'config', 'controllers.ini'),
         'SSBU_SHOT_EVERY': str(SHOT_EVERY), 'SSBU_SHOT_DIR': shots,
+        # the player's RomFS mods (mods\, e.g. button prompts) change the pictures the screenshot checks compare: off
+        # (finding 109; --env SSBU_MODS=<folder> tests a mod)
+        'SSBU_MODS': 'none',
     })
     fonts = os.path.join(ROOT, 'targets', 'sysdata', 'fonts')
     if os.path.isdir(fonts):
@@ -402,8 +405,13 @@ def main():
     ap.add_argument('--ab', metavar='EXE_B', help='A/B: run --exe (A) and EXE_B alternately, --runs times each, and '
                     'compare B with A (the way to compare two builds: the machine drifts between batches, finding 95)')
     ap.add_argument('--vs', nargs='*', help='with --analyze <A dirs>: re-score an A/B batch against these B dirs')
+    ap.add_argument('--save', help='the userdata folder copied into each run (default build/saves/after-prologue; '
+                    'another save only for diagnosis routes, not for baselines)')
     a = ap.parse_args()
     a.exe = os.path.abspath(a.exe)
+    if a.save:
+        global SAVE
+        SAVE = os.path.abspath(a.save)
 
     seq, opt = read_route(a.route)
     seconds = a.seconds or opt.get('seconds') or 300

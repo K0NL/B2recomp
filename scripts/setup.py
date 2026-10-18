@@ -4,6 +4,7 @@
     python scripts/setup.py --dump <folder> [--jobs N] [--only <step> | --from <step>] [--status]
                             [--toolchain mingw|msvc] [--llvm-mingw <dir>] [--llvm <dir>] [--sdl3 <dir>]
                             [--vulkan-headers <dir>] [--glslang <dir> | --glslang-dll <file>] [--accept-modified]
+                            [--mods <folder>]
 
 Modelled on ssbu-recomp's scripts/setup.py. <folder> holds what you extracted from your own console and copy of
 Bayonetta 2 with your own tools (this project decrypts nothing and reads no keys):
@@ -20,8 +21,13 @@ ignored by git; never upload them). Steps, resumable (a finished step is skipped
     verify   the dump is the exact version this port handles (SHA-256 / NSO build ID / RomFS manifest); explains a mismatch
     convert  main, sdk (NSO) -> targets/exefs/*.elf (LZ4 only; segment hashes checked); ExeFS copied beside them;
              targets/romfs (and targets/sysdata/fonts) = junctions to the dump's folders, where the game reads them
+    mods     optional: YOUR emulator-style code mods (mods/ and its subfolders: *.pchtxt, *.ips) patched into
+             targets/exefs/main.elf by scripts/pchtxt.py (always runs, cheap; no mods = main.elf untouched; a changed
+             set of patches makes tables, lift, compile, link and check run again). On / off switches: config/mods.ini
+             (the launcher's Mods window). compile then rebuilds only the C files the lift changed (seconds, not minutes)
     tables   runtime/gen/* from YOUR sdk and main (layout, imports, lifted SDK functions, SDK constants, test vectors)
-    lift     lifter/recomp_eh.py: your main.elf -> build/gen_eh (C)
+    lift     lifter/recomp_eh.py: your main.elf -> build/gen_eh (C); then scripts/fps_patch.py --inplace (the frame-rate
+             patch: off at graphics.ini frame_rate = 60, the default)
     compile  scripts/compile_main.py: build/gen_eh -> build/obj (clang -O2; the longest step, ~5 min with 16 threads)
     icon     optional: build/bayonetta2.ico from <folder>/control/icon_AmericanEnglish.dat
     link     scripts/build_runtime.py: build/game.dll, build/game_native.exe (+ SDL3.dll, ssbu_glslang.dll);
@@ -49,8 +55,9 @@ import time
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEPS = os.path.join(REPO, 'deps')
-STEPS = ['deps', 'verify', 'convert', 'tables', 'lift', 'compile', 'icon', 'link', 'check']
-ALWAYS = {'deps'}                        # cheap, and it fills the tool locations every later step passes on
+STEPS = ['deps', 'verify', 'convert', 'mods', 'tables', 'lift', 'compile', 'icon', 'link', 'check']
+ALWAYS = {'deps', 'mods'}                # cheap: deps fills the tool locations every later step passes on, mods notices
+                                         # a changed mods folder
 
 # ---- the one version this port handles (reference: notes/release-audit.md section 6.2, our own dump, 2026-10-16)
 VERSION = 'version 1.2 (update v131072, the second update)'   # display version / update version of the game's own NACP / CNMT
@@ -361,6 +368,65 @@ def step_convert(cx):
         say('  no sysdata\\fonts in the dump: a font of this PC will stand in for the console\'s system fonts (BUILDING.md)')
 
 
+def step_mods(cx):
+    import pchtxt                                            # scripts/pchtxt.py
+    folder = os.path.abspath(cx.a.mods or cx.state.get('mods_dir') or os.path.join(REPO, 'mods'))
+    nso, elf = os.path.join(cx.targets, 'exefs', 'main'), os.path.join(cx.targets, 'exefs', 'main.elf')
+    applied = cx.state.get('mods')               # hash of the patches in main.elf and in what the later steps made from it
+    files = pchtxt.find_mods(folder)
+    if not files and not applied:
+        say('  no mods (no .pchtxt / .ips files in %s): main.elf as converted' % folder)
+        return
+    if not os.path.isfile(nso) or not os.path.isfile(elf):
+        raise Fail('targets\\exefs\\main / main.elf are missing: run convert first')
+    settings = pchtxt.read_settings(pchtxt.DEFAULT_INI)     # config\mods.ini: the launcher's Mods window switches
+    off = [f for f in files if not pchtxt.file_on(os.path.relpath(f, folder), settings)]
+    if off:
+        say('  switched off in config\\mods.ini: %s' % ', '.join(sorted({pchtxt.rel_key(os.path.relpath(f, folder)) for f in off})))
+    try:
+        mods = pchtxt.load_mods(folder, nso, settings)
+    except pchtxt.ModError as e:
+        raise Fail(str(e))
+    want = pchtxt.fingerprint(mods)
+    if want == applied and (not want or sha256(elf) == cx.state.get('mods_elf')):
+        say('  %d mod file(s), %s' % (len(files), 'unchanged since the last build' if want else 'no enabled patches'))
+        return
+    # main.elf again from the NSO, exactly as convert makes it, then the patches on top
+    tmp = elf + '.tmp'
+    r = subprocess.run([sys.executable, os.path.join(REPO, 'tools', 'extract', 'nso2elf.py'), nso, tmp],
+                       capture_output=True, text=True)
+    if r.returncode or 'MISMATCH' in r.stdout:
+        raise Fail('main: NSO conversion error\n%s' % (r.stdout[-800:] + r.stderr[-800:]))
+    with open(tmp, 'rb') as f:
+        img = bytearray(f.read())
+    lines = []
+    try:
+        n = pchtxt.apply(img, mods, log=lines.append)
+    except pchtxt.ModError as e:
+        os.remove(tmp)
+        raise Fail(str(e))
+    with open(tmp, 'wb') as f:
+        f.write(img)
+    os.replace(tmp, elf)
+    os.makedirs(cx.logs, exist_ok=True)
+    with open(os.path.join(cx.logs, 'mods.log'), 'a', encoding='utf-8') as f:
+        f.write('\n%s  %s  %s\n%s\n' % (time.strftime('%Y-%m-%d %H:%M:%S'), folder, want, '\n'.join(lines)))
+    for line in lines:
+        say(line)
+    say('  main.elf: ' + ('%d bytes patched by %d enabled patch(es) from %d file(s)' % (n, len(mods), len(files)) if want
+                          else 'unpatched again (no enabled patches left)'))
+    if want != applied:
+        redo = [s for s in STEPS[STEPS.index('mods') + 1:] if s in cx.state.get('done', {}) and s != 'icon']
+        for s in redo:
+            cx.state['done'].pop(s)
+        if redo:
+            say('  the mods changed: %s run again' % ', '.join(redo))
+    cx.state['mods'] = want
+    cx.state['mods_elf'] = sha256(elf) if want else None
+    if cx.a.mods:
+        cx.state['mods_dir'] = folder
+
+
 def step_tables(cx):
     cx.run('tables', [sys.executable, os.path.join(REPO, 'runtime', 'gen', 'make_gen.py')])
 
@@ -368,6 +434,9 @@ def step_tables(cx):
 def step_lift(cx):
     cx.run('lift', [sys.executable, 'recomp_eh.py', os.path.join(cx.build, 'gen_eh'), str(cx.jobs)],
            cwd=os.path.join(REPO, 'lifter'))
+    # the frame-rate patch (graphics.ini frame_rate above 60; off at 60): the clock, the present and the timers of
+    # lifter/fps_ticks.txt, patched into the lifted C in place (scripts/fps_patch.py)
+    cx.run('lift', [sys.executable, os.path.join(REPO, 'scripts', 'fps_patch.py'), '--gen=' + os.path.join(cx.build, 'gen_eh'), '--inplace'])
 
 
 def step_compile(cx):
@@ -415,6 +484,7 @@ def main():
     ap.add_argument('--from', dest='from_step', choices=STEPS)
     ap.add_argument('--status', action='store_true')
     ap.add_argument('--accept-modified', action='store_true')
+    ap.add_argument('--mods', help='folder of emulator-style code mods (.pchtxt / .ips); default <repo>\\mods (remembered)')
     ap.add_argument('--toolchain', choices=('mingw', 'msvc'))
     ap.add_argument('--llvm-mingw', help='llvm-mingw folder (bin\\x86_64-w64-mingw32-clang.exe)')
     ap.add_argument('--llvm', help='LLVM 9.0.0 folder (bin\\clang.exe), --toolchain msvc only')
