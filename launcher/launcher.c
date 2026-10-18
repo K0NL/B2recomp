@@ -245,7 +245,7 @@ static HFONT g_font, g_bigfont, g_smallfont;
 static HANDLE g_proc;
 static int g_dpi = 96;
 #define S(x) MulDiv((x), g_dpi, 96)
-enum { ID_SET = 100, ID_SIZES = 200, ID_REMAP, ID_TEST, ID_SAVE, ID_PLAY, ID_CLOSE, ID_CONFIG, ID_STATUS, ID_KEYS, ID_MODS, ID_TIMER = 1 };
+enum { ID_SET = 100, ID_SIZES = 200, ID_REMAP, ID_TEST, ID_SAVE, ID_PLAY, ID_CLOSE, ID_CONFIG, ID_STATUS, ID_KEYS, ID_MODS, ID_REPORT, ID_TIMER = 1 };
 static const int k_sizes[][2] = { {1280, 720}, {1600, 900}, {1920, 1080}, {2560, 1440}, {3840, 2160} };
 
 static int file_exists(const wchar_t *p) { return GetFileAttributesW(p) != INVALID_FILE_ATTRIBUTES; }
@@ -630,15 +630,20 @@ static void create_controls(void) {
     g_padnote = mk(L"STATIC", L"", SS_LEFT, lx, y, pw - 32, 64, -1);
     SendMessageW(g_padnote, WM_SETFONT, (WPARAM)g_smallfont, FALSE);
     /* bottom bar: status, small buttons, Play */
-    int by = k_panel[0].bottom + 12, px = WIN_W - 14 - 150, bw = 84;   /* status: two lines beside four buttons */
-    g_status = mk(L"STATIC", L"", SS_LEFT, 16, by + 3, px - 12 - 4 * bw - 3 * 8 - 16 - 16, 36, ID_STATUS);
-    b = mk(L"BUTTON", L"Mods...", BS_PUSHBUTTON | WS_TABSTOP, px - 12 - 4 * bw - 3 * 8, by + 3, bw, 34, ID_MODS);
+    int by = k_panel[0].bottom + 12, px = WIN_W - 14 - 150, bw = 76;   /* status: two lines beside five buttons */
+    int x0 = px - 12 - 5 * bw - 4 * 8;                       /* [Recomps#1] Report..., Mods..., Config folder, Save, Close */
+    g_status = mk(L"STATIC", L"", SS_LEFT, 16, by + 3, x0 - 16 - 16, 36, ID_STATUS);
+    SendMessageW(g_status, WM_SETFONT, (WPARAM)g_smallfont, FALSE);
+    b = mk(L"BUTTON", L"Report...", BS_PUSHBUTTON | WS_TABSTOP, x0, by + 3, bw, 34, ID_REPORT);
+    tip(b, L"Makes b2recomp-report.zip in the B2recomp folder: the logs and this PC's details (Windows version, CPU, "
+           L"graphics card and driver), nothing of the game. Send it to whoever helps you.");
+    b = mk(L"BUTTON", L"Mods...", BS_PUSHBUTTON | WS_TABSTOP, x0 + (bw + 8), by + 3, bw, 34, ID_MODS);
     tip(b, L"Code mods: switch the emulator patches (.pchtxt, .ips) in the mods folder on and off. They are compiled into the game, "
            L"so a change needs a rebuild (about a minute; the window does it).");
-    b = mk(L"BUTTON", L"Config folder", BS_PUSHBUTTON | WS_TABSTOP, px - 12 - 3 * bw - 2 * 8, by + 3, bw, 34, ID_CONFIG);
+    b = mk(L"BUTTON", L"Config folder", BS_PUSHBUTTON | WS_TABSTOP, x0 + 2 * (bw + 8), by + 3, bw, 34, ID_CONFIG);
     tip(b, L"Opens the folder with graphics.ini and controllers.ini (every option is explained there).");
-    g_save = mk(L"BUTTON", L"Save", BS_PUSHBUTTON | WS_TABSTOP, px - 12 - 2 * bw - 8, by + 3, bw, 34, ID_SAVE);
-    mk(L"BUTTON", L"Close", BS_PUSHBUTTON | WS_TABSTOP, px - 12 - bw, by + 3, bw, 34, ID_CLOSE);
+    g_save = mk(L"BUTTON", L"Save", BS_PUSHBUTTON | WS_TABSTOP, x0 + 3 * (bw + 8), by + 3, bw, 34, ID_SAVE);
+    mk(L"BUTTON", L"Close", BS_PUSHBUTTON | WS_TABSTOP, x0 + 4 * (bw + 8), by + 3, bw, 34, ID_CLOSE);
     g_play = mk(L"BUTTON", L"Play", BS_OWNERDRAW | WS_TABSTOP, px, by, 150, 40, ID_PLAY);
     SetWindowSubclass(g_play, play_hover, 1, 0);
 }
@@ -1019,7 +1024,7 @@ static const wchar_t *k_step_name[NSTEP] = { L"Check the bundled tools", L"Check
 static const int k_step_weight[NSTEP] = { 1, 2, 1, 1, 2, 11, 240, 1, 8, 2 };   /* seconds on a 16-thread PC (finding 102) */
 static int g_bstate[NSTEP];                                 /* 0 waiting, 1 running, 2 done, 3 failed */
 static int g_bok, g_bcompile, g_bundled;                    /* dump folder looks right; compile per mille; deps\python */
-static HWND g_bpath, g_bbrowse, g_bcheck, g_blog, g_bprog, g_bstep[NSTEP], g_bbtn, g_blogs, g_bclose, g_bintro, g_blabel;
+static HWND g_bpath, g_bbrowse, g_bcheck, g_blog, g_bprog, g_bstep[NSTEP], g_bbtn, g_blogs, g_bclose, g_bintro, g_blabel, g_breport;
 static HANDLE g_bproc, g_bjob;
 static DWORD g_bt0;
 static wchar_t g_python[MAX_PATH], g_dump[MAX_PATH];
@@ -1248,7 +1253,7 @@ static void build_done(DWORD code) {
     DWORD s = (GetTickCount() - g_bt0) / 1000;
     wchar_t t[256];
     if (code == 0 && game_built()) {                        /* the window becomes the launcher */
-        HWND kids[] = { g_bpath, g_bbrowse, g_bcheck, g_blog, g_bprog, g_bbtn, g_blogs, g_bclose, g_bintro, g_blabel, g_status };
+        HWND kids[] = { g_bpath, g_bbrowse, g_bcheck, g_blog, g_bprog, g_bbtn, g_blogs, g_bclose, g_bintro, g_blabel, g_status, g_breport };
         for (int i = 0; i < (int)(sizeof kids / sizeof kids[0]); i++) DestroyWindow(kids[i]);
         for (int i = 0; i < NSTEP; i++) DestroyWindow(g_bstep[i]);
         DragAcceptFiles(g_main, FALSE);
@@ -1309,7 +1314,10 @@ static void create_build_controls(void) {
     SendMessageW(g_bprog, PBM_SETBARCOLOR, 0, (LPARAM)C_GOLD);
     SendMessageW(g_bprog, PBM_SETBKCOLOR, 0, (LPARAM)C_FIELD);
     int by = p->bottom + 12, px = WIN_W - 14 - 150;
-    g_status = mk(L"STATIC", L"", SS_LEFT | SS_ENDELLIPSIS, 16, by + 11, px - 12 - 2 * 90 - 8 - 16 - 16, 20, ID_STATUS);
+    g_status = mk(L"STATIC", L"", SS_LEFT | SS_ENDELLIPSIS, 16, by + 11, px - 12 - 3 * 90 - 2 * 8 - 16 - 16, 20, ID_STATUS);
+    g_breport = mk(L"BUTTON", L"Report...", BS_PUSHBUTTON | WS_TABSTOP, px - 12 - 3 * 90 - 2 * 8, by + 3, 90, 34, ID_REPORT);
+    tip(g_breport, L"Makes b2recomp-report.zip in the B2recomp folder: the build logs and this PC's details, nothing of "
+                   L"the game. Send it to whoever helps you.");
     g_blogs = mk(L"BUTTON", L"Logs folder", BS_PUSHBUTTON | WS_TABSTOP, px - 12 - 2 * 90 - 8, by + 3, 90, 34, ID_BLOGS);
     tip(g_blogs, L"Opens build\\logs: one log per step (setup.py).");
     g_bclose = mk(L"BUTTON", L"Close", BS_PUSHBUTTON | WS_TABSTOP, px - 12 - 90, by + 3, 90, 34, ID_CLOSE);
@@ -1383,6 +1391,36 @@ static char *run_capture(const wchar_t *cmd) {
     if (b) b[n] = 0;
     if (b && code) { free(b); b = NULL; }
     return b;
+}
+/* [Recomps#1] Report...: python scripts\report.py makes b2recomp-report.zip in the B2recomp folder (the logs and this PC's
+ * details, nothing of the game; the Linux launcher has the same button, with scripts/report.sh). Asked from the main
+ * window and the build screen (notes/roadmap.md "Later ideas", 2026-10-18). */
+static void make_report(HWND owner) {
+    if (!*g_python) {
+        MessageBoxW(owner, L"Python was not found: the builder package brings its own (deps\\python).", L"B2recomp", MB_ICONERROR);
+        return;
+    }
+    wchar_t cmd[4 * MAX_PATH], zip[MAX_PATH];
+    swprintf(cmd, 4 * MAX_PATH, L"\"%s\" -I \"%s\\scripts\\report.py\"", g_python, g_root);
+    swprintf(zip, MAX_PATH, L"%s\\b2recomp-report.zip", g_root);
+    HCURSOR old = SetCursor(LoadCursorW(NULL, IDC_WAIT));
+    char *out = run_capture(cmd);
+    SetCursor(old);
+    if (!out || !file_exists(zip)) {
+        MessageBoxW(owner, L"The report could not be made (scripts\\report.py did not finish).", L"B2recomp", MB_ICONERROR);
+        free(out);
+        return;
+    }
+    free(out);
+    if (!g_proc && g_status) SetWindowTextW(g_status, L"Report made: b2recomp-report.zip in the B2recomp folder.");
+    wchar_t m[MAX_PATH + 320];
+    swprintf(m, MAX_PATH + 320, L"Report made:\n%s\n\nIt holds the logs and this PC's details, nothing of the game. Send that file "
+             L"to whoever helps you, and say what happened.\n\nOpen its folder?", zip);
+    if (MessageBoxW(owner, m, L"B2recomp", MB_YESNO | MB_ICONINFORMATION) == IDYES) {
+        wchar_t args[MAX_PATH + 16];
+        swprintf(args, MAX_PATH + 16, L"/select,\"%s\"", zip);
+        ShellExecuteW(owner, L"open", L"explorer.exe", args, NULL, SW_SHOWNORMAL);
+    }
 }
 static void read_built(void) {                              /* setup_state.json "mods": the fingerprint the game was built with */
     wchar_t p[MAX_PATH];
@@ -1825,6 +1863,7 @@ static LRESULT CALLBACK wndproc(HWND w, UINT m, WPARAM wp, LPARAM lp) {
             if (id == ID_BPATH && code == EN_CHANGE) dump_check();
             else if (id == ID_BBROWSE) browse();
             else if (id == ID_BUILD) build_start();
+            else if (id == ID_REPORT) make_report(w);
             else if (id == ID_BLOGS) { wchar_t d[MAX_PATH]; swprintf(d, MAX_PATH, L"%s\\logs", g_buildd); CreateDirectoryW(g_buildd, NULL); CreateDirectoryW(d, NULL); ShellExecuteW(w, L"open", d, NULL, NULL, SW_SHOWNORMAL); }
             else if (id == ID_CLOSE || id == IDCANCEL) SendMessageW(w, WM_CLOSE, 0, 0);
             return 0;
@@ -1844,6 +1883,7 @@ static LRESULT CALLBACK wndproc(HWND w, UINT m, WPARAM wp, LPARAM lp) {
         else if (id == ID_TEST) run_tool(L"--pad-test", L"Test controller");
         else if (id == ID_KEYS) keys_window();
         else if (id == ID_MODS) mods_window();
+        else if (id == ID_REPORT) make_report(w);
         else if (id == ID_SAVE) save_all();
         else if (id == ID_PLAY) play();
         else if (id == ID_CONFIG) { wchar_t d[MAX_PATH]; swprintf(d, MAX_PATH, L"%s\\config", g_root); ShellExecuteW(w, L"open", d, NULL, NULL, SW_SHOWNORMAL); }
@@ -1897,13 +1937,36 @@ static LRESULT CALLBACK wndproc(HWND w, UINT m, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(w, m, wp, lp);
 }
 
+/* [Recomps#1] finding 123: the window is S(WIN_W) x S(WIN_H) plus its frame, and at a high display scaling that can be
+ * larger than the screen (a player's 4K screen: the bottom row with Play was below it; a 1080p screen at 150 % too). Then
+ * everything is laid out at a smaller scale (g_dpi), so the whole window fits the work area; g_dpi_sys stays the system's,
+ * for the system's message font. TEST: B2RECOMP_LAUNCHER_DPI=<dpi> lays out as at that display scaling (144 = 150 %). */
+static int g_dpi_sys = 96;
+static void fit_dpi(void) {
+    wchar_t e[16];
+    int want = g_dpi_sys;
+    if (GetEnvironmentVariableW(L"B2RECOMP_LAUNCHER_DPI", e, 16) && _wtoi(e) >= 48 && _wtoi(e) <= 960) want = _wtoi(e);
+    g_dpi = want;
+    static const int k_win[3][2] = { {WIN_W, WIN_H}, {KW_W, KW_H}, {MW_W, MW_H} };     /* the main window, Keyboard and mouse, Mods */
+    RECT wa, r = { 0, 0, S(WIN_W), S(WIN_H) };
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
+    AdjustWindowRectEx(&r, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN, FALSE, WS_EX_CONTROLPARENT);
+    int ncw = (r.right - r.left) - S(WIN_W), nch = (r.bottom - r.top) - S(WIN_H);   /* frame and title bar: drawn by the system at its scale */
+    int aw = wa.right - wa.left - 16 - ncw, ah = wa.bottom - wa.top - 16 - nch;      /* room for a client area, 8 px margin each side */
+    for (int i = 0; i < 3; i++) {
+        int dw = MulDiv(aw, 96, k_win[i][0]), dh = MulDiv(ah, 96, k_win[i][1]), d = dw < dh ? dw : dh;
+        if (d < g_dpi) g_dpi = d < 48 ? 48 : d;
+    }
+}
+
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmdline, int show) {
     (void)prev;
     SetProcessDPIAware();
     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);   /* the folder dialog of the build screen */
     INITCOMMONCONTROLSEX icc = { sizeof icc, ICC_STANDARD_CLASSES | ICC_BAR_CLASSES | ICC_TAB_CLASSES | ICC_TREEVIEW_CLASSES };
     InitCommonControlsEx(&icc);
-    {   HDC dc = GetDC(NULL); g_dpi = GetDeviceCaps(dc, LOGPIXELSY); ReleaseDC(NULL, dc); }
+    {   HDC dc = GetDC(NULL); g_dpi = g_dpi_sys = GetDeviceCaps(dc, LOGPIXELSY); ReleaseDC(NULL, dc); }
+    fit_dpi();                                              /* finding 123: smaller than the system's scale when the window would not fit */
     {   /* dark controls: uxtheme's unnamed exports SetPreferredAppMode (135; 2 = force dark) and AllowDarkModeForWindow (133),
            as used by Explorer and Notepad; without them (older Windows) the controls stay light and everything still works */
         HMODULE ux = LoadLibraryExW(L"uxtheme.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
@@ -1936,6 +1999,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmdline, int show) {
 
     NONCLIENTMETRICSW ncm = { sizeof ncm };
     SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof ncm, &ncm, 0);
+    ncm.lfMessageFont.lfHeight = MulDiv(ncm.lfMessageFont.lfHeight, g_dpi, g_dpi_sys);      /* finding 123: the system's font, at our scale */
     g_font = CreateFontIndirectW(&ncm.lfMessageFont);
     LOGFONTW lf = ncm.lfMessageFont;
     lf.lfWeight = FW_BOLD; lf.lfHeight = -MulDiv(12, g_dpi, 72);

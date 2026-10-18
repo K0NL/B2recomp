@@ -67,6 +67,7 @@
 !/scripts/p15_summary.py
 !/scripts/pgdat.py
 !/scripts/play.ps1
+!/scripts/report.py
 !/scripts/rt_stubs.c
 !/scripts/run_boot.ps1
 !/scripts/runtime_coverage.py
