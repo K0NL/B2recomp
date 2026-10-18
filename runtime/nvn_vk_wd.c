@@ -36,7 +36,7 @@ static void wd_map_load(void) {                    /* the linker's map of this e
     g_wd_map_tried = 1;
     DWORD n = GetModuleFileNameA(NULL, path, MAX_PATH);
     if (n < 5) return;
-    strcpy(path + n - 4, ".map");
+    strcpy(path + n - EXE_EXT_LEN, ".map");
     FILE *fp = fopen(path, "rb");
     if (!fp) return;
     int cap = 0;
@@ -55,6 +55,10 @@ static void wd_map_load(void) {                    /* the linker's map of this e
     if (g_wd_nsym) qsort(g_wd_sym, (size_t)g_wd_nsym, sizeof *g_wd_sym, wd_sym_cmp);
 }
 static void wd_export(HMODULE m, uint32_t rva, char *out, size_t n) {      /* the nearest exported name at or below rva */
+#ifndef _WIN32
+    (void)m; (void)rva; out[0] = 0; (void)n;                  /* [Recomps#1] Linux: no PE export table (a module handle is not its base) */
+    return;
+#else
     const uint8_t *b = (const uint8_t *)m;
     const IMAGE_DOS_HEADER *dh = (const IMAGE_DOS_HEADER *)b;
     out[0] = 0;
@@ -74,6 +78,7 @@ static void wd_export(HMODULE m, uint32_t rva, char *out, size_t n) {      /* th
         best = f; bn = (const char *)(b + nm[i]);
     }
     if (bn) snprintf(out, n, "%.60s+0x%x", bn, (unsigned)(rva - best));
+#endif
 }
 static void wd_addr(uint64_t pc, char *out, size_t n) {
     HMODULE m = NULL, exe = GetModuleHandleA(NULL), game = NULL;
@@ -149,7 +154,7 @@ static void wd_dump(double stall_s, LONG64 tries_since) {
     SYSTEMTIME st; GetLocalTime(&st);
     DWORD me = GetCurrentThreadId(), pid = GetCurrentProcessId(), n = GetModuleFileNameA(NULL, path, MAX_PATH);
     int nt = 0;
-    if (n > 4) { strcpy(path + n - 4, "_freeze.txt"); g_wd_fp = fopen(path, "ab"); }
+    if (n > EXE_EXT_LEN) { strcpy(path + n - EXE_EXT_LEN, "_freeze.txt"); g_wd_fp = fopen(path, "ab"); }
     wdp("\nnvn_vk_watchdog: ======== NO FRAME PRESENTED FOR %.1f s ======== %04d-%02d-%02d %02d:%02d:%02d, process %lu, game frame %lld\n", stall_s, st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, (unsigned long)pid, (long long)nvn_front_frame_next());
     wdp("  presents: %lld frames reached the window so far; present attempts since the last one that did: %lld (%s); frames not presented %lld, failed Vulkan calls %lld, swapchain made again %lld times; window %s\n",
         (long long)g_vk_frames, (long long)tries_since, tries_since ? "the game still presents but nothing reaches the window: see the failures" : "none: the game's present never came, or the render thread is held",
@@ -270,8 +275,8 @@ static void wd_stall_write(double ms, LONG64 frame, const char *sample, int wher
     char path[MAX_PATH + 16];
     DWORD n = GetModuleFileNameA(NULL, path, MAX_PATH);
     SYSTEMTIME st; GetLocalTime(&st);
-    if (lines >= 300 || n <= 4) return;
-    strcpy(path + n - 4, "_stalls.txt");
+    if (lines >= 300 || n <= EXE_EXT_LEN) return;
+    strcpy(path + n - EXE_EXT_LEN, "_stalls.txt");
     { WIN32_FILE_ATTRIBUTE_DATA fa; if (GetFileAttributesExA(path, GetFileExInfoStandard, &fa) && (fa.nFileSizeHigh || fa.nFileSizeLow > 2u * 1024 * 1024)) return; }
     FILE *fp = fopen(path, "ab");
     if (!fp) return;

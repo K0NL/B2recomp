@@ -36,6 +36,48 @@ static const char *const k_standin[FONT_TYPES][5] = {
     {"segoeui.ttf", "arial.ttf"},
 };
 static struct { void *data; size_t size; int tried; char path[MAX_PATH]; } g_fonts[FONT_TYPES];
+#ifndef _WIN32
+/* [Recomps#1] Linux: the stand-in is the first of these TrueType fonts (glyf outlines, which nnfontll.c draws; not CFF)
+ * found in the usual font folders, up to three levels down (distributions keep them in different subfolders):
+ * Noto Sans (KDE, SteamOS, Fedora: its variable file), DejaVu Sans, Liberation Sans, Ubuntu ... */
+#include <dirent.h>
+#include <sys/stat.h>
+static const char *const k_linux_fonts[] = { "NotoSans-Regular.ttf", "NotoSans[wght].ttf", "DejaVuSans.ttf",
+    "LiberationSans-Regular.ttf", "Ubuntu-R.ttf", "OpenSans-Regular.ttf", "Arimo-Regular.ttf", "FreeSans.ttf", "arial.ttf",
+    "Arial.ttf" };
+static int font_find(const char *dir, const char *name, int depth, char *out, size_t n) {
+    char p[PATH_MAX];
+    struct stat st;
+    snprintf(p, sizeof p, "%s/%s", dir, name);
+    if (!stat(p, &st) && S_ISREG(st.st_mode)) { snprintf(out, n, "%s", p); return 1; }
+    DIR *d = depth > 0 ? opendir(dir) : NULL;
+    if (!d) return 0;
+    int found = 0;
+    for (struct dirent *e; !found && (e = readdir(d)); ) {
+        if (e->d_name[0] == '.' || (e->d_type != DT_DIR && e->d_type != DT_UNKNOWN)) continue;
+        snprintf(p, sizeof p, "%s/%s", dir, e->d_name);
+        if (e->d_type == DT_DIR || (!stat(p, &st) && S_ISDIR(st.st_mode))) found = font_find(p, name, depth - 1, out, n);
+    }
+    closedir(d);
+    return found;
+}
+static int linux_font(char *out, size_t n) {              /* once: every font type gets the same file (one copy) */
+    static char found[PATH_MAX];
+    static int done;
+    if (!done) {
+        char a[PATH_MAX] = "", b[PATH_MAX] = "";
+        const char *home = getenv("HOME");
+        if (home) { snprintf(a, sizeof a, "%s/.local/share/fonts", home); snprintf(b, sizeof b, "%s/.fonts", home); }
+        const char *roots[] = { "/usr/share/fonts", "/usr/local/share/fonts", a, b };
+        done = 1;
+        for (size_t f = 0; f < sizeof k_linux_fonts / sizeof k_linux_fonts[0] && !found[0]; f++)
+            for (size_t r = 0; r < sizeof roots / sizeof roots[0] && !found[0]; r++)
+                if (roots[r][0]) font_find(roots[r], k_linux_fonts[f], 3, found, sizeof found);
+    }
+    if (found[0]) snprintf(out, n, "%s", found);
+    return found[0] != 0;
+}
+#endif
 static CRITICAL_SECTION g_lock;
 
 static uint32_t be32(const uint8_t *p) { return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3]; }
@@ -96,6 +138,14 @@ static void load_font(unsigned type) {
                     if (t != type && g_fonts[t].data && !_stricmp(g_fonts[t].path, path)) data = g_fonts[t].data, size = g_fonts[t].size;
                 if (!data) data = read_file(path, &size);
             }
+#ifndef _WIN32
+            if (!data && linux_font(path, MAX_PATH)) {        /* [Recomps#1] Linux: a TrueType font of the system */
+                for (unsigned t = 0; t < FONT_TYPES && !data; t++)
+                    if (t != type && g_fonts[t].data && !strcmp(g_fonts[t].path, path)) data = g_fonts[t].data, size = g_fonts[t].size;
+                if (!data) data = read_file(path, &size);
+                if (data && !is_sfnt(data)) { _aligned_free(data); data = NULL; }
+            }
+#endif
             if (data)
                 printf("nn::pl: shared font %u (%s.ttf or .bfttf) NOT FOUND in %s: STAND-IN %s (%zu bytes), a font of this PC: "
                        "the game's system text looks different from the console's\n", type, font_files[type], dir, path, size);

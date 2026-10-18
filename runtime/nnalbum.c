@@ -1,3 +1,4 @@
+#ifdef _WIN32
 /* nn::album: the console's screenshot / video album, kept in <userdata>\album (<userdata> = %SSBU_USERDATA% or ..\userdata).
  *
  * LIFTED from the SDK (sdklift_gen.c), not here: MovieMakerMovieParameter (constructor, setters, GetAudioBitRate),
@@ -888,3 +889,15 @@ int nnalbum_selftest(Ctx *c) {
     bad += album_selftest_files(c);
     return bad;
 }
+#else
+/* [Recomps#1] Linux (notes/linux-port-plan.md step 8): no Media Foundation. Bayonetta 2 imports nothing of nn::album, so
+ * the album and its movie maker are not offered on Linux; the renderer's movie-maker hooks get "no movie window". */
+#include <stdio.h>
+#include <stdint.h>
+#include "runtime.h"
+uint64_t album_movie_native_window(void) { return 0; }
+void album_movie_frame_source_attach(void) {}
+int album_movie_push_frame(const uint8_t *rgba, int w, int h, int stride, int bottom_up) { (void)rgba; (void)w; (void)h; (void)stride; (void)bottom_up; return 0; }
+void register_nnalbum_imports(void) {}
+int nnalbum_selftest(Ctx *c) { (void)c; printf("  album: not on Linux (Bayonetta 2 does not use it): skipped%c", 10); return 0; }
+#endif

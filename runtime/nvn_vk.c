@@ -24,9 +24,23 @@
 #include <string.h>
 #include <windows.h>
 /* Session 2: the Khronos headers (reference\upstream\Vulkan-Headers\include, -I in build.py) replace our own vk_min.h subset. */
+#ifdef _WIN32
 #define VK_USE_PLATFORM_WIN32_KHR
+#endif
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
+#ifdef _WIN32
+#define EXE_EXT_LEN 4                                     /* the ".exe" a report beside the program replaces (nvn_vk_wd.c ...) */
+#else
+#define EXE_EXT_LEN 0                                     /* [Recomps#1] Linux: the program has no extension */
+#endif
+#ifndef _WIN32
+/* [Recomps#1] Linux (notes/linux-port-plan.md step 6): the surface comes from SDL (X11 or Wayland), not from a Win32
+ * window; the Win32 entry stays in the list below, declared only, and is not required from the loader (vk_sym). */
+#include <SDL3/SDL.h>
+#include <SDL3/SDL_vulkan.h>
+typedef struct VkWin32SurfaceCreateInfoKHR VkWin32SurfaceCreateInfoKHR;
+#endif
 #include "nvn_front.h"
 #include "gfx_options.h"
 #define P(a) ((void *)(uintptr_t)(a))                     /* guest addresses are host addresses (as in nvn_gl.c) */
@@ -225,6 +239,9 @@ static int swapchain_create(void) {
 /* ---------------------------------------------------------------- start */
 static void *vk_sym(const char *name) {
     void *p = (void *)GetProcAddress(V.loader, name);
+#ifndef _WIN32
+    if (!p && !strcmp(name, "vkCreateWin32SurfaceKHR")) return NULL;
+#endif
     if (!p) { printf("nvn_vk: vulkan-1.dll does not export %s\n", name); fflush(stdout); ExitProcess(5); }
     return p;
 }
@@ -252,8 +269,20 @@ int nvn_vk_init(void *hwnd) {
     if (r != VK_SUCCESS && r != VK_INCOMPLETE) vk_fatal("vkEnumerateInstanceExtensionProperties", r);
     const char *exts[4], *layers[1];
     uint32_t next = 0, nlayers = 0;
+#ifdef _WIN32
     exts[next++] = "VK_KHR_surface"; exts[next++] = "VK_KHR_win32_surface";
     if (!has_name(iext, niext, "VK_KHR_surface") || !has_name(iext, niext, "VK_KHR_win32_surface")) { printf("nvn_vk: the Vulkan loader has no VK_KHR_surface / VK_KHR_win32_surface\n"); fflush(stdout); ExitProcess(5); }
+#else
+    {   /* [Recomps#1] Linux: the surface extensions SDL needs for its window (VK_KHR_surface + xlib / xcb / wayland) */
+        Uint32 n = 0;
+        const char *const *se = SDL_Vulkan_GetInstanceExtensions(&n);
+        if (!se || !n) { printf("nvn_vk: SDL names no Vulkan surface extensions (%s)\n", SDL_GetError()); fflush(stdout); ExitProcess(5); }
+        for (Uint32 i = 0; i < n && next < 3; i++) {
+            if (!has_name(iext, niext, se[i])) { printf("nvn_vk: the Vulkan loader has no %s (SDL video driver %s)\n", se[i], SDL_GetCurrentVideoDriver()); fflush(stdout); ExitProcess(5); }
+            exts[next++] = se[i];
+        }
+    }
+#endif
     { const char *e = getenv("SSBU_VK_VALIDATE"); V.validate = e && atoi(e) != 0; }
     if (V.validate) {
         static VkLayerProperties lp[64];
@@ -286,11 +315,16 @@ int nvn_vk_init(void *hwnd) {
         printf("nvn_vk: validation layer on (VK_LAYER_KHRONOS_validation); messages are printed as vk-validation:\n");
     }
 
+#ifdef _WIN32
     VkWin32SurfaceCreateInfoKHR si;
     memset(&si, 0, sizeof si);
     si.sType = VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR; si.hinstance = GetModuleHandleA(NULL); si.hwnd = hwnd;
     r = vkCreateWin32SurfaceKHR(V.instance, &si, NULL, &V.surface);
     if (r != VK_SUCCESS) vk_fatal("vkCreateWin32SurfaceKHR", r);
+#else
+    if (!SDL_Vulkan_CreateSurface((SDL_Window *)hwnd, V.instance, NULL, &V.surface)) { printf("nvn_vk: SDL_Vulkan_CreateSurface failed: %s\n", SDL_GetError()); fflush(stdout); ExitProcess(5); }
+    printf("nvn_vk: surface from SDL (video driver %s)\n", SDL_GetCurrentVideoDriver());
+#endif
 
     /* device: discrete > integrated > virtual > other; needs one queue family with graphics + compute that can present to the window */
     VkPhysicalDevice gpus[16];

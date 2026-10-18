@@ -7,7 +7,9 @@
 #include <string.h>
 #include <time.h>
 #include <windows.h>
+#ifdef _WIN32
 #include <shlwapi.h>
+#endif
 #include "runtime.h"
 #include "hostrt.h"
 
@@ -134,6 +136,7 @@ static int tz_validate(const TzRule *r) {                                   /* s
     return 0;
 }
 
+#ifdef _WIN32
 static int winzone_load(const wchar_t *key, WinZone *z) {
     wchar_t path[256];
     DWORD size = sizeof z->base, type = 0, v = 0;
@@ -156,6 +159,7 @@ static int winzone_load(const wchar_t *key, WinZone *z) {
     }
     return 0;
 }
+#endif
 static const RegTzi *winzone_year(const WinZone *z, int year) {             /* a year outside the entries uses the nearest one */
     if (!z->first) return &z->base;
     int y = year < z->first ? z->first : year > z->last ? z->last : year;
@@ -199,17 +203,28 @@ static void tzrule_at(TzRule *r, int64_t at, int type, int *cur) {
 /* A zone file (TZif) of the public tz database: version 2+ body into the rule, exactly as stored (64-bit transition times,
  * type indices, {offset, isdst, name index} records, names), and the footer's names: std name, offset, optional dst name
  * and offset. Returns 0 when the file was found and read. */
+#ifndef _WIN32
+static char g_tz_footer[128];                                              /* [Recomps#1] Linux: the last zone file's footer (tz_footer_extend) */
+#endif
 static uint32_t be32(const uint8_t *p) { return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3]; }
 static int tzdb_load(const char *iana, TzRule *r, char *std_name, int32_t *std_off, char *dst_name, int32_t *dst_off) {
+#ifdef _WIN32
     const char *dirs[3] = {getenv("SSBU_TZDIR"), "..\\sysdata\\zoneinfo", "C:\\msys64\\usr\\share\\zoneinfo"};
+#else
+    const char *dirs[3] = {getenv("SSBU_TZDIR"), "../sysdata/zoneinfo", "/usr/share/zoneinfo"};
+#endif
     std_name[0] = dst_name[0] = 0;
     if (!iana || !iana[0] || strstr(iana, "..") || strchr(iana, ':') || iana[0] == '/' || iana[0] == '\\') return -1;
     for (int k = 0; k < 3; k++) {
         char path[MAX_PATH];
         static uint8_t buf[256 * 1024];
         if (!dirs[k] || !dirs[k][0]) continue;
+#ifdef _WIN32
         snprintf(path, sizeof path, "%s\\%s", dirs[k], iana);
         for (char *p = path; *p; p++) if (*p == '/') *p = '\\';
+#else
+        snprintf(path, sizeof path, "%s/%s", dirs[k], iana);
+#endif
         FILE *f = fopen(path, "rb");
         if (!f) continue;
         size_t n = fread(buf, 1, sizeof buf - 1, f);
@@ -252,6 +267,9 @@ static int tzdb_load(const char *iana, TzRule *r, char *std_name, int32_t *std_o
         while (s > 0 && buf[s - 1] != '\n') s--;
         buf[e] = 0;
         const char *p = (const char *)buf + s;
+#ifndef _WIN32
+        snprintf(g_tz_footer, sizeof g_tz_footer, "%s", p);
+#endif
         for (int which = 0; which < 2; which++) {
             char *name = which ? dst_name : std_name;
             int len = 0, sign = 1, v[3] = {0, 0, 0}, got = 0;
@@ -345,6 +363,7 @@ static void tzrule_build(TzRule *r, const WinZone *z, const char *iana, int fixe
     ReleaseSRWLockExclusive(&lock);
 }
 static void location_name(char out[0x24]);
+#ifdef _WIN32
 static TzRule *my_rule(void) {                                              /* the rule of the Windows time zone, built once */
     static TzRule rule;
     static volatile LONG ready;
@@ -389,6 +408,123 @@ static int tzrule_for_location(TzRule *out, const char *iana) {            /* Lo
     ReleaseSRWLockExclusive(&lock);
     return bad;
 }
+#else
+/* [Recomps#1] Linux (notes/linux-port-plan.md step 4): the device's rule is the zone file of the PC's own zone, the same
+ * format the console's TimeZoneBinary holds. A "slim" file (zic's default since 2020) lists the past only and describes
+ * the future in its footer ("CET-1CEST,M3.5.0,M10.5.0/3"); the console's rule needs those transitions spelled out, so
+ * they are generated from the footer for every year after the file's last transition, up to 2037 (as a "fat" file has). */
+static const char *tzp_name(const char *p, char *out) {
+    int n = 0;
+    if (*p == '<') { for (p++; *p && *p != '>'; p++) if (n < 15) out[n++] = *p; if (*p == '>') p++; }
+    else while ((*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z')) { if (n < 15) out[n] = *p; n++; p++; }
+    out[n < 15 ? n : 15] = 0;
+    return p;
+}
+static const char *tzp_time(const char *p, int32_t *secs, int *got) {
+    int sign = 1, v[3] = {0, 0, 0};
+    *got = 0;
+    if (*p == '-') { sign = -1; p++; } else if (*p == '+') p++;
+    for (int part = 0; part < 3 && *p >= '0' && *p <= '9'; part++) {
+        while (*p >= '0' && *p <= '9') v[part] = v[part] * 10 + (*p++ - '0');
+        *got = 1;
+        if (*p != ':') break;
+        p++;
+    }
+    *secs = sign * (v[0] * 3600 + v[1] * 60 + v[2]);
+    return p;
+}
+typedef struct { char kind; int a, b, d; int32_t time; } TzpDate;          /* Mm.w.d, Jn (1..365, no 29 Feb) or n (0..365) */
+static const char *tzp_date(const char *p, TzpDate *d) {
+    char *e;
+    int got;
+    d->time = 7200; d->a = d->b = d->d = 0;
+    if (*p == 'M') {
+        d->kind = 'M';
+        d->a = (int)strtol(p + 1, &e, 10); p = e; if (*p == '.') p++;
+        d->b = (int)strtol(p, &e, 10); p = e; if (*p == '.') p++;
+        d->d = (int)strtol(p, &e, 10); p = e;
+    } else if (*p == 'J') { d->kind = 'J'; d->a = (int)strtol(p + 1, &e, 10); p = e; }
+    else { d->kind = 'n'; d->a = (int)strtol(p, &e, 10); p = e; }
+    if (*p == '/') p = tzp_time(p + 1, &d->time, &got);
+    return p;
+}
+static int64_t tzp_local(const TzpDate *d, int year) {                      /* local wall-clock second of the date in that year */
+    static const int mdays[12] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    int leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    int64_t day;
+    if (d->kind == 'M' && d->a >= 1 && d->a <= 12) {
+        int len = mdays[d->a - 1] + (d->a == 2 && leap);
+        int64_t first = days_from_civil(year, d->a, 1);
+        int wd = (int)(((first % 7) + 11) % 7), dd = 1 + (d->d - wd + 7) % 7 + 7 * (d->b - 1);
+        while (dd > len) dd -= 7;
+        day = first + dd - 1;
+    } else if (d->kind == 'J') day = days_from_civil(year, 1, 1) + d->a - 1 + (leap && d->a >= 60);
+    else day = days_from_civil(year, 1, 1) + d->a;
+    return day * 86400 + d->time;
+}
+static int tz_type_named(TzRule *r, int32_t off, int isdst, const char *name) {
+    for (int i = 0; i < r->typecnt; i++) if (r->ttis[i].utoff == off && r->ttis[i].isdst == isdst) return i;
+    int t = tzrule_type(r, off, isdst);
+    if (t == r->typecnt - 1) r->ttis[t].desigidx = tzrule_name(r, name);
+    return t;
+}
+static void tz_footer_extend(TzRule *r, const char *footer) {
+    char sn[16], dn[16];
+    int32_t so, dof;
+    int got;
+    TzpDate start, end;
+    const char *p = tzp_name(footer, sn);
+    if (!sn[0]) return;
+    p = tzp_time(p, &so, &got);
+    if (!got) return;
+    so = -so;                                                                  /* POSIX counts west of Greenwich as positive */
+    p = tzp_name(p, dn);
+    if (!dn[0]) return;                                                        /* no daylight time: the file's types cover it */
+    if (*p && *p != ',') { p = tzp_time(p, &dof, &got); dof = -dof; } else dof = so + 3600;
+    if (*p != ',') return;
+    p = tzp_date(p + 1, &start);
+    if (*p != ',') return;
+    tzp_date(p + 1, &end);
+    int std_t = tz_type_named(r, so, 0, sn), dst_t = tz_type_named(r, dof, 1, dn);
+    int64_t last = r->timecnt ? r->ats[r->timecnt - 1] : INT64_MIN;
+    int cur = r->timecnt ? r->types[r->timecnt - 1] : r->defaulttype;
+    int64_t y0 = 1970;
+    if (r->timecnt) { int m, d; civil_from_days(last / 86400 - (last % 86400 < 0), &y0, &m, &d); }
+    for (int year = (int)y0; year <= 2037; year++) {
+        int64_t to_dst = tzp_local(&start, year) - so, to_std = tzp_local(&end, year) - dof;
+        int64_t first = to_dst < to_std ? to_dst : to_std, second = to_dst < to_std ? to_std : to_dst;
+        int ft = to_dst < to_std ? dst_t : std_t, st = to_dst < to_std ? std_t : dst_t;
+        if (first > last) tzrule_at(r, first, ft, &cur);
+        if (second > last) tzrule_at(r, second, st, &cur);
+    }
+}
+static SRWLOCK g_tzdb_lock = SRWLOCK_INIT;                                  /* tzdb_load's buffer and g_tz_footer are shared */
+static int tz_load_full(const char *iana, TzRule *r) {
+    char sn[16], dn[16];
+    int32_t so, dof;
+    AcquireSRWLockExclusive(&g_tzdb_lock);
+    int bad = tzdb_load(iana, r, sn, &so, dn, &dof);
+    if (!bad) tz_footer_extend(r, g_tz_footer);
+    ReleaseSRWLockExclusive(&g_tzdb_lock);
+    return bad;
+}
+static TzRule *my_rule(void) {                                              /* the rule of the PC's zone, built once */
+    static TzRule rule;
+    static volatile LONG ready;
+    if (InterlockedCompareExchange(&ready, 1, 0) == 0) {
+        char iana[0x24];
+        location_name(iana);
+        if (tz_load_full(iana, &rule)) {                                    /* no zone file: UTC */
+            memset(&rule, 0, sizeof rule);
+            rule.typecnt = 1; rule.ttis[0].desigidx = tzrule_name(&rule, "UTC");
+        }
+        ready = 2;
+    }
+    while (ready != 2) SwitchToThread();
+    return &rule;
+}
+static int tzrule_for_location(TzRule *out, const char *iana) { return tz_load_full(iana, out); }   /* any zone in the tz database */
+#endif
 static void calendar_out(Ctx *c, const TzRule *r) {
     TzTm t;
     if (tz_validate(r)) { RET(TZ_OUT_OF_RANGE); return; }
@@ -509,6 +645,7 @@ static void steady_now(int64_t *seconds, uint8_t id[16]) {
     *seconds = (int64_t)(GetTickCount64() / 1000);
     memcpy(id, source, 16);
 }
+#ifdef _WIN32
 static void location_name(char out[0x24]) {
     static char name[0x24];
     static volatile LONG ready;
@@ -534,6 +671,39 @@ static int auto_correction(void) {
     if (SHGetValueA(HKEY_LOCAL_MACHINE, "SYSTEM\\CurrentControlSet\\Services\\W32Time\\Parameters", "Type", NULL, type, &size) != ERROR_SUCCESS) return 1;
     return _stricmp(type, "NoSync") != 0;
 }
+#else
+/* [Recomps#1] Linux: the IANA name of the PC's zone: $TZ (a name, or a path into a zoneinfo folder), else the target of
+ * /etc/localtime (".../zoneinfo/Europe/Berlin"), else /etc/timezone; "UTC" when none says */
+static void location_name(char out[0x24]) {
+    static char name[0x24];
+    static volatile LONG ready;
+    if (InterlockedCompareExchange(&ready, 1, 0) == 0) {
+        const char *tz = getenv("TZ"), *z;
+        char buf[512];
+        ssize_t k;
+        strcpy(name, "UTC");
+        if (tz && *tz) {
+            if (*tz == ':') tz++;
+            if ((z = strstr(tz, "zoneinfo/"))) snprintf(name, sizeof name, "%s", z + 9);
+            else if (tz[0] != '/' && !strpbrk(tz, "0123456789,")) snprintf(name, sizeof name, "%s", tz);
+        } else if ((k = readlink("/etc/localtime", buf, sizeof buf - 1)) > 0) {
+            buf[k] = 0;
+            if ((z = strstr(buf, "zoneinfo/"))) snprintf(name, sizeof name, "%s", z + 9);
+        } else {
+            FILE *f = fopen("/etc/timezone", "r");
+            if (f) {
+                if (fgets(buf, sizeof buf, f)) { buf[strcspn(buf, "\r\n")] = 0; if (buf[0]) snprintf(name, sizeof name, "%s", buf); }
+                fclose(f);
+            }
+        }
+        ready = 2;
+    }
+    while (ready != 2) SwitchToThread();
+    memset(out, 0, 0x24);
+    strcpy(out, name);
+}
+static int auto_correction(void) { return 1; }                             /* Linux: assume a synchronised clock (timesyncd / chrony) */
+#endif
 static void time_ToCalendarTime(Ctx *c);
 static void time_Snapshot_create(Ctx *c) {                /* (ClockSnapshot *out) */
     uint64_t s = A0;
@@ -595,6 +765,31 @@ void register_time_imports(void) {
  * (SystemTimeToTzSpecificLocalTimeEx with the zone's dynamic information) for EVERY Windows time zone: every half hour of
  * the current year, every 2 h 59 min of 1990..2037; then the handlers on the PC's own zone. */
 #define GP(p) ((uint64_t)(uintptr_t)(p))
+#ifndef _WIN32
+/* [Recomps#1] Linux self-test (SSBU_SDK_SELFTEST): the rule of the PC's zone against the C library's localtime_r, every
+ * 6 h 7 s of 1990..2037 (offset and daylight flag) */
+int nntime_selftest(Ctx *c) {
+    (void)c;
+    TzRule *r = my_rule();
+    char loc[0x24];
+    long long cases = 0, bad = 0;
+    location_name(loc);
+    for (int64_t t = 631152000; t < 2145916800; t += 6 * 3600 + 7) {
+        TzTm o;
+        struct tm lt;
+        time_t tt = (time_t)t;
+        if (tz_local(r, t, &o) || !localtime_r(&tt, &lt)) { bad++; continue; }
+        cases++;
+        if (o.utoff != lt.tm_gmtoff || o.isdst != (lt.tm_isdst > 0)) {
+            if (bad < 5) printf("  time zone: %s at posix %lld: rule %+d dst %d, localtime_r %+ld dst %d\n", loc, (long long)t, o.utoff, o.isdst, lt.tm_gmtoff, lt.tm_isdst);
+            bad++;
+        }
+    }
+    printf("  time zone (Linux): %s: %lld cases 1990..2037 against localtime_r, %lld different; %d transitions, %d types\n",
+           loc, cases, bad, r->timecnt, r->typecnt);
+    return bad != 0;
+}
+#else
 int nntime_selftest(Ctx *c) {
     typedef BOOL (WINAPI *ToLocal)(const DYNAMIC_TIME_ZONE_INFORMATION *, const SYSTEMTIME *, SYSTEMTIME *);
     typedef DWORD (WINAPI *EnumTz)(DWORD, DYNAMIC_TIME_ZONE_INFORMATION *);
@@ -720,3 +915,4 @@ int nntime_selftest(Ctx *c) {
     #undef TCHECK
     return bad;
 }
+#endif

@@ -271,8 +271,13 @@ static void audio_OpenDefaultAudioOut(Ctx *c) {       /* (AudioOut *, nn::os::Sy
              * SSBU_VOLUME=<0..100> overrides either way. */
             char exe[MAX_PATH] = "";
             GetModuleFileNameA(NULL, exe, sizeof exe);
+#ifdef _WIN32
             const char *base = strrchr(exe, '\\') ? strrchr(exe, '\\') + 1 : exe, *vol = getenv("SSBU_VOLUME");
             int percent = vol ? atoi(vol) : (!_stricmp(base, "ssbu_native.exe") || !_stricmp(base, "ssbu_user.exe") || !_stricmp(base, "game_native.exe")) ? 100 : 0;   /* [Recomps#1] our exe is audible */
+#else
+            const char *base = strrchr(exe, '\\') ? strrchr(exe, '\\') + 1 : exe, *vol = getenv("SSBU_VOLUME");   /* [Recomps#1] Linux: no .exe */
+            int percent = vol ? atoi(vol) : (!strcmp(base, "ssbu_native") || !strcmp(base, "ssbu_user") || !strcmp(base, "game_native")) ? 100 : 0;
+#endif
             if (percent < 0) percent = 0;
             if (percent > 100) percent = 100;
             DWORD level = (DWORD)(0xffff * percent / 100);
@@ -458,6 +463,7 @@ static void audio_CloseAudioOut(Ctx *c) {             /* (AudioOut *) */
  * service object is created, i.e. it arrives signalled, and again whenever the output device changes.
  * Here: the output device is the Windows default render endpoint; IMMNotificationClient::OnDefaultDeviceChanged
  * (render, console role) signals the event. */
+#ifdef _WIN32
 typedef struct NotifyClient { const void *const *vtbl; } NotifyClient;
 typedef struct { const void *const *vtbl; } ComObj;
 static const GUID k_clsid_enumerator = {0xbcde0395, 0xe52f, 0x467c, {0x8e, 0x3d, 0xc4, 0x57, 0x92, 0x91, 0x69, 0x2e}};
@@ -497,6 +503,11 @@ static DWORD WINAPI device_watch_thread(void *arg) {
     Sleep(INFINITE);                                          /* keeps the apartment and the registration alive */
     return 0;
 }
+#else
+/* [Recomps#1] Linux: SDL3 follows the system's default output device by itself; no change is reported to the game */
+static volatile LONG g_device_acquired;
+static DWORD WINAPI device_watch_thread(void *arg) { (void)arg; return 0; }
+#endif
 #define AUDIO_DEVICE_NOTIFICATION_ALREADY_ACQUIRED 0x499u
 static void audio_AcquireAudioDeviceNotificationForOutput(Ctx *c) {   /* (nn::os::SystemEvent *) -> Result */
     if (InterlockedCompareExchange(&g_device_acquired, 1, 0) != 0) { RET(AUDIO_DEVICE_NOTIFICATION_ALREADY_ACQUIRED); return; }

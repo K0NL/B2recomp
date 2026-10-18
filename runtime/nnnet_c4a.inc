@@ -284,7 +284,7 @@ static int so_addr_in(uint64_t p, struct sockaddr_in *out) {                    
     if (M8(p + 1) != 2) return 0;
     out->sin_family = AF_INET;
     out->sin_port = M16(p + 2);
-    out->sin_addr.S_un.S_addr = M32(p + 4);
+    out->sin_addr.s_addr = M32(p + 4);
     return 1;
 }
 static uint32_t so_addr_out(uint64_t p, uint32_t cap, const struct sockaddr_in *in) { /* returns the length the module reports */
@@ -340,10 +340,10 @@ static void so_bind(Ctx *c, int len_check) {              /* (fd, const sockaddr
     struct sockaddr_in a;
     int e = 0;
     if (!so_addr_in(A1, &a)) e = 97;
-    else if (a.sin_addr.S_un.S_addr != 0 && !so_is_loopback(a.sin_addr.S_un.S_addr)) e = 99;
+    else if (a.sin_addr.s_addr != 0 && !so_is_loopback(a.sin_addr.s_addr)) e = 99;
     else {
-        int any = a.sin_addr.S_un.S_addr == 0;
-        if (any) a.sin_addr.S_un.S_addr = htonl(INADDR_LOOPBACK);
+        int any = a.sin_addr.s_addr == 0;
+        if (any) a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
         if (bind(o->s, (struct sockaddr *)&a, sizeof a) != 0) e = so_wsa_errno(WSAGetLastError(), 0);
         else o->bound_any = any;
     }
@@ -360,7 +360,7 @@ static void socket_Connect(Ctx *c) {                      /* (fd, const sockaddr
     if (!o) { so_fail(c, 9); return; }
     struct sockaddr_in a;
     if (!so_addr_in(A1, &a)) e = 97;
-    else if (!so_is_loopback(a.sin_addr.S_un.S_addr)) e = 101;                        /* no network: nothing but loopback is reachable */
+    else if (!so_is_loopback(a.sin_addr.s_addr)) e = 101;                        /* no network: nothing but loopback is reachable */
     else if (connect(o->s, (struct sockaddr *)&a, sizeof a) != 0) {
         int w = WSAGetLastError();
         e = w == WSAEWOULDBLOCK ? 115 : w == WSAEISCONN ? 0 : so_wsa_errno(w, 0);     /* [suyu] ConnectImpl: "already connected" is success */
@@ -419,7 +419,7 @@ static void so_name(Ctx *c, int peer) {                   /* (fd, sockaddr *, so
     int alen = sizeof a;
     memset(&a, 0, sizeof a);
     int e = (peer ? getpeername(o->s, (struct sockaddr *)&a, &alen) : getsockname(o->s, (struct sockaddr *)&a, &alen)) != 0 ? so_wsa_errno(WSAGetLastError(), 0) : 0;
-    if (!e && !peer && o->bound_any) a.sin_addr.S_un.S_addr = 0;
+    if (!e && !peer && o->bound_any) a.sin_addr.s_addr = 0;
     if (e == 22 && !peer) { e = 0; a.sin_family = AF_INET; }                         /* Winsock refuses an unbound socket; BSD reports 0.0.0.0:0 */
     so_put(o);
     if (e) { so_fail(c, e); return; }
@@ -471,7 +471,7 @@ static void so_send(Ctx *c, uint64_t addr) {              /* (fd, buf, size, fla
     int temp = (gf & 0x80) && !(flags & SO_O_NONBLOCK), n = -1, e = 0;
     struct sockaddr_in a;
     if (addr && !so_addr_in(addr, &a)) e = 97;
-    else if (addr && !so_is_loopback(a.sin_addr.S_un.S_addr)) e = 101;                 /* no network */
+    else if (addr && !so_is_loopback(a.sin_addr.s_addr)) e = 101;                 /* no network */
     else {
         if (temp) so_nonblock(o, 1);
         if (addr) n = sendto(o->s, (const char *)(uintptr_t)buf, (int)(size > 0x7fffffff ? 0x7fffffff : size), so_host_flags(gf) & MSG_OOB, (struct sockaddr *)&a, sizeof a);
@@ -695,7 +695,7 @@ static void socket_GetHostByNameWithOptions(Ctx *c) {     /* (const char *name, 
     strcpy(t_he.text, name);
     t_he.name = P(t_he.text); t_he.alias0 = 0; t_he.aliases = P(&t_he.alias0);
     t_he.type = 2; t_he.length = 4;
-    t_he.addr = a.S_un.S_addr; t_he.addrs[0] = P(&t_he.addr); t_he.addrs[1] = 0; t_he.list = P(t_he.addrs);
+    t_he.addr = a.s_addr; t_he.addrs[0] = P(&t_he.addr); t_he.addrs[1] = 0; t_he.list = P(t_he.addrs);
     t_so_herrno = 0; so_set_errno(c, 0);
     RET(P(&t_he));
 }

@@ -117,7 +117,9 @@ static FontData g_fontdata[MAX_FONTDATA];
 static int g_fontdata_count;
 static CRITICAL_SECTION g_lock;                   /* GDI, the font list and the engine table */
 static HDC g_dc;
+#ifdef _WIN32
 static const MAT2 identity = {{0, 1}, {0, 0}, {0, 0}, {0, 1}};
+#endif
 
 static uint32_t be16(const uint8_t *p) { return (uint32_t)p[0] << 8 | p[1]; }
 static uint32_t be32(const uint8_t *p) { return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3]; }
@@ -305,6 +307,7 @@ static void path_close(Path *path) {
     if (path->contours == path->ccap) { path->ccap = path->ccap ? path->ccap * 2 : 16; path->end = realloc(path->end, (size_t)path->ccap * sizeof(int)); }
     path->end[path->contours++] = path->n;
 }
+#ifdef _WIN32
 static double fx(FIXED v) { return v.value + v.fract / 65536.0; }
 
 /* Makes GDI able to draw from this font file; verifies that the face GDI selects really is this file. */
@@ -396,6 +399,117 @@ static void glyph_path(FontData *f, uint32_t glyph, const int32_t *m, Path *path
     }
     LeaveCriticalSection(&g_lock);
 }
+#else
+/* [Recomps#1] Linux (notes/linux-port-plan.md step 8): no GDI. The outline comes from the font's own glyf / loca tables
+ * (TrueType quadratic contours, composite glyphs with their offsets and scales), unhinted and in font units like GDI's
+ * GGO_UNHINTED outline, and is flattened with the same step rule as the GDI path above. CFF (PostScript) outlines are not
+ * read here: such a font's glyphs stay blank (logged once). */
+typedef struct { double x, y; int on; } GlyfPt;
+static void q_emit(Path *path, double *x0, double *y0, double x1, double y1, double x2, double y2, const double *pm, double pixels) {
+    double len = (fabs(x1 - *x0) + fabs(y1 - *y0) + fabs(x2 - x1) + fabs(y2 - y1)) * pixels;
+    int steps = 2 + (int)(len / 3.0);
+    if (steps > 32) steps = 32;
+    for (int k = 1; k <= steps; k++) {
+        double t = (double)k / steps, u = 1 - t, px = u * u * *x0 + 2 * u * t * x1 + t * t * x2, py = u * u * *y0 + 2 * u * t * y1 + t * t * y2;
+        path_point(path, px * pm[0] + py * pm[1], px * pm[2] + py * pm[3]);
+    }
+    *x0 = x2; *y0 = y2;
+}
+static void glyf_contour(Path *path, const GlyfPt *p, int n, const double *pm, double pixels) {
+    if (n < 2) return;
+    int s = p[0].on ? 0 : p[n - 1].on ? n - 1 : -1;      /* start on an on-curve point, else between the last and the first */
+    double sx = s >= 0 ? p[s].x : (p[0].x + p[n - 1].x) / 2, sy = s >= 0 ? p[s].y : (p[0].y + p[n - 1].y) / 2;
+    double x0 = sx, y0 = sy, cx = 0, cy = 0;
+    int ctrl = 0;
+    path_point(path, sx * pm[0] + sy * pm[1], sx * pm[2] + sy * pm[3]);
+    for (int k = 1; k <= n; k++) {
+        const GlyfPt *q = s >= 0 ? &p[(s + k) % n] : &p[k - 1];
+        if (q->on) {
+            if (ctrl) { q_emit(path, &x0, &y0, cx, cy, q->x, q->y, pm, pixels); ctrl = 0; }
+            else { x0 = q->x; y0 = q->y; path_point(path, x0 * pm[0] + y0 * pm[1], x0 * pm[2] + y0 * pm[3]); }
+        } else {
+            if (ctrl) q_emit(path, &x0, &y0, cx, cy, (cx + q->x) / 2, (cy + q->y) / 2, pm, pixels);
+            cx = q->x; cy = q->y; ctrl = 1;
+        }
+    }
+    if (ctrl) q_emit(path, &x0, &y0, cx, cy, sx, sy, pm, pixels);      /* back to the start through the last control point */
+    path_close(path);
+}
+/* t: the component transform (x' = t0 x + t2 y + dx, y' = t1 x + t3 y + dy, font units); pm: font units -> pixels */
+static void glyf_outline(const FontData *f, uint32_t glyph, const double *t, double dx, double dy, Path *path, const double *pm, double pixels, int depth) {
+    uint32_t glen = 0;
+    const uint8_t *loca = table(f, "loca", NULL), *glyf = table(f, "glyf", &glen);
+    if (!loca || !glyf || glyph >= (uint32_t)f->glyphs) return;
+    int longfmt = s16(f->head + 50);
+    uint32_t o0 = longfmt ? be32(loca + 4 * glyph) : be16(loca + 2 * glyph) * 2, o1 = longfmt ? be32(loca + 4 * glyph + 4) : be16(loca + 2 * glyph + 2) * 2;
+    if (o1 <= o0 || o1 > glen || o1 - o0 < 10) return;
+    const uint8_t *gp = glyf + o0, *end = glyf + o1, *q = gp + 10;
+    int nc = s16(gp);
+    if (nc >= 0) {
+        if (q + 2 * nc + 2 > end) return;
+        int npts = nc ? (int)be16(q + 2 * (nc - 1)) + 1 : 0;
+        const uint8_t *eps = q;
+        q += 2 * nc;
+        q += 2 + be16(q);                                 /* instructions: not used (unhinted) */
+        if (!npts || q > end) return;
+        uint8_t *fl = malloc((size_t)npts);
+        GlyfPt *pt = malloc((size_t)npts * sizeof *pt);
+        for (int i = 0; i < npts && q < end;) {
+            uint8_t v = *q++;
+            fl[i++] = v;
+            if (v & 8) { int r = q < end ? *q++ : 0; while (r-- > 0 && i < npts) fl[i++] = v; }
+        }
+        int v = 0;
+        for (int i = 0; i < npts; i++) {                  /* x: short (2) with sign (0x10), or long unless "same" (0x10) */
+            if (fl[i] & 2) { int d = q < end ? *q++ : 0; v += (fl[i] & 0x10) ? d : -d; }
+            else if (!(fl[i] & 0x10)) { if (q + 2 <= end) v += s16(q); q += 2; }
+            pt[i].x = v;
+        }
+        v = 0;
+        for (int i = 0; i < npts; i++) {                  /* y: 4 / 0x20 */
+            if (fl[i] & 4) { int d = q < end ? *q++ : 0; v += (fl[i] & 0x20) ? d : -d; }
+            else if (!(fl[i] & 0x20)) { if (q + 2 <= end) v += s16(q); q += 2; }
+            pt[i].y = v;
+        }
+        for (int i = 0; i < npts; i++) {
+            double x = pt[i].x, y = pt[i].y;
+            pt[i].x = t[0] * x + t[2] * y + dx; pt[i].y = t[1] * x + t[3] * y + dy; pt[i].on = fl[i] & 1;
+        }
+        for (int c = 0, first = 0; c < nc; c++) {
+            int last = (int)be16(eps + 2 * c);
+            if (last >= npts || last < first) break;
+            glyf_contour(path, pt + first, last - first + 1, pm, pixels);
+            first = last + 1;
+        }
+        free(fl); free(pt);
+        return;
+    }
+    uint16_t cf;
+    do {                                                  /* composite: each component with its offset and 2x2 scale */
+        if (q + 4 > end) return;
+        cf = (uint16_t)be16(q);
+        uint32_t gi = be16(q + 2);
+        q += 4;
+        double ax, ay, m0 = 1, m1 = 0, m2 = 0, m3 = 1;
+        if (cf & 1) { ax = s16(q); ay = s16(q + 2); q += 4; } else { ax = (int8_t)q[0]; ay = (int8_t)q[1]; q += 2; }
+        if (!(cf & 2)) ax = ay = 0;                       /* matched points instead of offsets: not used by these fonts */
+        if (cf & 8) { m0 = m3 = s16(q) / 16384.0; q += 2; }
+        else if (cf & 0x40) { m0 = s16(q) / 16384.0; m3 = s16(q + 2) / 16384.0; q += 4; }
+        else if (cf & 0x80) { m0 = s16(q) / 16384.0; m1 = s16(q + 2) / 16384.0; m2 = s16(q + 4) / 16384.0; m3 = s16(q + 6) / 16384.0; q += 8; }
+        double nt[4] = {t[0] * m0 + t[2] * m1, t[1] * m0 + t[3] * m1, t[0] * m2 + t[2] * m3, t[1] * m2 + t[3] * m3};
+        if (depth < 8) glyf_outline(f, gi, nt, t[0] * ax + t[2] * ay + dx, t[1] * ax + t[3] * ay + dy, path, pm, pixels, depth + 1);
+    } while ((cf & 0x20) && q < end);
+}
+static void glyph_path(FontData *f, uint32_t glyph, const int32_t *m, Path *path) {
+    static int cff_said;
+    double pm[4] = {m[0] / 65536.0 / f->upem, m[1] / 65536.0 / f->upem, m[2] / 65536.0 / f->upem, m[3] / 65536.0 / f->upem};
+    double pixels = fabs(pm[0]) > fabs(pm[3]) ? fabs(pm[0]) : fabs(pm[3]), id[4] = {1, 0, 0, 1};
+    if (f->cff) { if (!cff_said++) printf("nn::fontll: font \"%s\" has CFF outlines: not read on Linux, its glyphs are blank\n", f->name); return; }
+    EnterCriticalSection(&g_lock);
+    glyf_outline(f, glyph, id, 0, 0, path, pm, pixels, 0);
+    LeaveCriticalSection(&g_lock);
+}
+#endif
 
 /* ---------------------------------------------------------------- scan conversion (exact area coverage) */
 static void cover_line(float *acc, int w, int h, double x0, double y0, double x1, double y1) {

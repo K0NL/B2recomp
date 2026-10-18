@@ -24,7 +24,8 @@ up to date without compiling (only when you know they were made from these sourc
 
 Outputs build/obj/*.obj, build/obj/_report.txt, and with --link build/main_test.dll (stand-ins: scripts/rt_stubs.c).
 Compiler: scripts/toolchain.py (TOOLCHAIN=mingw, the default: llvm-mingw clang 23, build/obj, OPTNONE 5000, ~5 min;
-TOOLCHAIN=msvc: clang 9, build/obj_msvc, OPTNONE 20000, ~10 min).
+TOOLCHAIN=msvc: clang 9, build/obj_msvc, OPTNONE 20000, ~10 min; TOOLCHAIN=linux [Recomps#1]: build-linux/obj/*.o and
+build-linux/main_test.so, notes/linux-port-plan.md step 3).
 """
 import concurrent.futures
 import hashlib
@@ -43,6 +44,8 @@ GEN = os.path.join(ROOT, 'build', 'gen_eh')
 OBJ = toolchain.OBJ
 INC = os.path.join(ROOT, 'runtime')                      # shared with the host runtime (same Ctx layout)
 CLANG = toolchain.CLANG
+CC = toolchain.CC                                        # [Recomps#1] the command's first words: [clang], or zig cc -target ... (linux)
+EXT = toolchain.OBJEXT                                   # .obj; .o for linux
 # clang 9 runs only the always-inliner at -O1: without this every rd64 / wr64 / cond / adds32 of runtime.h, neon.h and
 # rt_ext.h stays a call there (finding 91). Harmless at -O2, which inlines them anyway.
 FORCE_INLINE = '-Dinline=inline __attribute__((always_inline))'
@@ -68,7 +71,8 @@ def config_hash(names):
     """Everything an object depends on besides its C file and funcs.h: compiler, level, flags, rules, included headers."""
     h = hashlib.sha256()
     st = os.stat(CLANG)
-    h.update(json.dumps([RULES, CLANG, st.st_size, st.st_mtime_ns, OPT, FLAGS, OPTNONE, toolchain.NAME]).encode())
+    h.update(json.dumps([RULES, CLANG, st.st_size, st.st_mtime_ns, OPT, FLAGS, OPTNONE, toolchain.NAME] +
+                        ([CC, toolchain.EXTRA, toolchain.LIFTED_EXTRA] if toolchain.LINUX else [])).encode())   # Windows stamps stay valid
     todo, seen = set(), {}
     for n in names:                                      # the lifted files' own includes are in their first lines
         with open(os.path.join(GEN, n), encoding='latin-1') as f:
@@ -104,7 +108,7 @@ def removed_prototypes():
 def up_to_date(name, stamps, cfg, gone):
     """The stamp of name when its object needs no compile, else None (stamps[name] gets the new times on a match)."""
     s = stamps.get(name)
-    src, obj = os.path.join(GEN, name), os.path.join(OBJ, name[:-2] + '.obj')
+    src, obj = os.path.join(GEN, name), os.path.join(OBJ, name[:-2] + EXT)
     if not s or s.get('cfg') != cfg or not os.path.isfile(obj) or os.stat(obj).st_mtime_ns != s.get('obj'):
         return None
     st = os.stat(src)
@@ -120,7 +124,7 @@ def up_to_date(name, stamps, cfg, gone):
 
 
 def stamp(name, cfg):
-    src, obj = os.path.join(GEN, name), os.path.join(OBJ, name[:-2] + '.obj')
+    src, obj = os.path.join(GEN, name), os.path.join(OBJ, name[:-2] + EXT)
     st = os.stat(src)
     return {'src': sha256_file(src), 'size': st.st_size, 'mtime': st.st_mtime_ns, 'obj': os.stat(obj).st_mtime_ns, 'cfg': cfg}
 
@@ -156,17 +160,20 @@ def run(cmd, limit):
         out, _ = p.communicate(timeout=limit)
         return p.returncode, out.decode('latin-1'), time.time() - t
     except subprocess.TimeoutExpired:
-        subprocess.run(['taskkill', '/PID', str(p.pid), '/T', '/F'], capture_output=True)
+        if os.name == 'nt':
+            subprocess.run(['taskkill', '/PID', str(p.pid), '/T', '/F'], capture_output=True)
+        else:
+            p.kill()
         p.communicate()
         return None, '', time.time() - t
 
 
 def compile_one(name):
-    src, obj = os.path.join(GEN, name), os.path.join(OBJ, name[:-2] + '.obj')
+    src, obj = os.path.join(GEN, name), os.path.join(OBJ, name[:-2] + EXT)
     total = 0.0
     for limit in (OPTNONE, OPTNONE // 4, OPTNONE // 16):
         big = big_functions(src, limit)
-        hdr = obj[:-4] + '.optnone.h'
+        hdr = os.path.splitext(obj)[0] + '.optnone.h'
         extra = []
         if big:
             with open(hdr, 'w') as f:
@@ -175,24 +182,26 @@ def compile_one(name):
             extra = ['-include', hdr]
         elif limit != OPTNONE:
             continue
-        code, out, secs = run([CLANG, '-c', OPT] + FLAGS + extra + [src, '-o', obj], TIME_LIMIT)
+        code, out, secs = run(CC + ['-c', OPT] + FLAGS + toolchain.EXTRA + toolchain.LIFTED_EXTRA + extra + [src, '-o', obj], TIME_LIMIT)
         total += secs
         if code is not None:
             note = '%d fn(s) > %d stmts optnone' % (len(big), limit) if big else ''
             return name, code, out, total, note
-    code, out, secs = run([CLANG, '-c', '-O0'] + FLAGS + [src, '-o', obj], None)
+    code, out, secs = run(CC + ['-c', '-O0'] + FLAGS + toolchain.EXTRA + toolchain.LIFTED_EXTRA + [src, '-o', obj], None)
     return name, code, out, total + secs, 'WHOLE FILE -O0 (time limit hit 3x)'
 
 
 def link():
-    objs = sorted(os.path.join(OBJ, n) for n in os.listdir(OBJ) if n.endswith('.obj'))
+    objs = sorted(os.path.join(OBJ, n) for n in os.listdir(OBJ) if n.endswith(EXT))
     rsp = os.path.join(OBJ, '_objs.rsp')
     with open(rsp, 'w') as f:
         f.writelines('"%s"\n' % o.replace('\\', '/') for o in objs)
     dll = os.path.join(ROOT, 'build', 'main_test.dll' if toolchain.NAME == toolchain.DEFAULT else 'main_test_%s.dll' % toolchain.NAME)
+    if toolchain.LINUX:
+        dll = os.path.join(toolchain.OUT, 'main_test.so')
     stubs = os.path.join(ROOT, 'scripts', 'rt_stubs.c')
     t = time.time()
-    r = subprocess.run([CLANG, '-shared', '-O1', '-w', '-mcx16', '-I', INC, '-I', GEN, stubs, '@' + rsp, '-o', dll],
+    r = subprocess.run(CC + ['-shared', '-O1', '-w', '-mcx16'] + toolchain.EXTRA + ['-I', INC, '-I', GEN, stubs, '@' + rsp, '-o', dll],
                        capture_output=True, text=True)
     print('link: exit %d in %.0fs' % (r.returncode, time.time() - t))
     print((r.stdout + r.stderr)[-6000:])
@@ -220,7 +229,7 @@ def main():
     keep = {n[:-2] for n in names}
     for n in os.listdir(OBJ):                            # objects of C files the lifter no longer writes
         base = n.split('.')[0]
-        if (n.endswith('.obj') or n.endswith('.optnone.h')) and base not in keep:
+        if (n.endswith(EXT) or n.endswith('.optnone.h')) and base not in keep:
             os.remove(os.path.join(OBJ, n))
             print('removed %s (its C file is gone)' % n)
     cfg, headers = config_hash(names)
@@ -235,7 +244,7 @@ def main():
         stamps = {}
     gone_re = re.compile(r'\b(?:%s)\b' % '|'.join(map(re.escape, sorted(gone)))) if gone else None
     if '--adopt' in sys.argv:
-        missing = [n for n in names if not os.path.isfile(os.path.join(OBJ, n[:-2] + '.obj'))]
+        missing = [n for n in names if not os.path.isfile(os.path.join(OBJ, n[:-2] + EXT))]
         if missing:
             raise SystemExit('--adopt: %d C file(s) have no object (%s ...)' % (len(missing), missing[0]))
         stamps = {n: stamp(n, cfg) for n in names}

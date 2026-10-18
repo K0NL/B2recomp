@@ -189,6 +189,7 @@ typedef struct {
 
 #define IDC_EDIT 1001
 #define IDC_INFO 1002
+#ifdef _WIN32
 static INT_PTR CALLBACK kbd_proc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp) {
     KbdDialog *k = (KbdDialog *)GetWindowLongPtrW(dlg, GWLP_USERDATA);
     switch (msg) {
@@ -250,6 +251,18 @@ static int kbd_run_dialog(KbdDialog *k) {
     if (r == -1) { printf("nn::swkbd: the text dialog could not be created (error %lu); answered as cancelled\n", GetLastError()); return 0; }
     return (int)r;
 }
+#else
+/* [Recomps#1] Linux (notes/linux-port-plan.md step 8): no text dialog yet (SDL3 has none); the game's initial text is
+ * answered as if OK was pressed, "cancelled" when it is shorter than the minimum. SSBU_SWKBD=text:<...> picks the text. */
+static int kbd_run_dialog(KbdDialog *k) {
+    wcsncpy(k->text, k->initial, SWKBD_MAX_CHARS);
+    k->text[SWKBD_MAX_CHARS] = 0;
+    int ok = (int)wcslen(k->text) >= k->min_len;
+    printf("nn::swkbd: no text dialog on Linux: answered %s with the initial text (%d characters; SSBU_SWKBD=text:<...> to choose)\n",
+           ok ? "OK" : "cancelled", (int)wcslen(k->text));
+    return ok;
+}
+#endif
 static void copy_w(wchar_t *dst, uint64_t src, int max) {
     int i = 0;
     for (; i < max; i++) { uint16_t ch = rd16(src + (uint64_t)i * 2); if (!ch) break; dst[i] = ch; }
@@ -445,6 +458,7 @@ static ImportFn h(const char *name) {
     return f;
 }
 static int guard_ok(const uint8_t *p, size_t from, size_t to, uint8_t v) { for (size_t i = from; i < to; i++) if (p[i] != v) return 0; return 1; }
+#ifdef _WIN32
 static volatile int g_kbd_test_initial_seen;
 static DWORD WINAPI kbd_test_driver(LPVOID arg) {
     (void)arg;
@@ -465,6 +479,7 @@ static DWORD WINAPI kbd_test_driver(LPVOID arg) {
     }
     return 0;
 }
+#endif
 int nnapplet_selftest(Ctx *c) {
     int bad = 0, ok;
     uint8_t *buf = malloc(0x8000), *buf2 = malloc(0x8000);
@@ -530,6 +545,7 @@ int nnapplet_selftest(Ctx *c) {
     _putenv("SSBU_SWKBD=cancel");
     c->x[0] = P(string); c->x[1] = P(buf); swkbd_ShowKeyboard(c);
     ok = ok && c->x[0] == SWKBD_RESULT_CANCELED;
+#ifdef _WIN32
     /* the real dialog: a helper thread types into it and presses OK, then a second run is cancelled */
     _putenv("SSBU_SWKBD=dialog");
     HANDLE helper = CreateThread(NULL, 0, kbd_test_driver, NULL, 0, NULL);
@@ -542,6 +558,9 @@ int nnapplet_selftest(Ctx *c) {
     CloseHandle(helper);
     printf("  swkbd: Win32 dialog shows the initial text \"Mario\", returns typed text \"Z\" + U+30BC on OK and 0x29f on Cancel: %s\n", dialog_ok ? "ok" : "FAILED");
     bad += !dialog_ok;
+#else
+    printf("  swkbd: no text dialog on Linux (the initial text is answered): skipped\n");
+#endif
     _putenv("SSBU_SWKBD=");
     printf("  swkbd: sizes work 0x%llx string 0x%llx; SetInitialText in the work buffer; scripted answer \"Kirby\" (UTF-16) and cancel (0x29f): %s\n",
            (unsigned long long)work_size, (unsigned long long)string_size, ok ? "ok" : "FAILED");

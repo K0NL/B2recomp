@@ -51,7 +51,9 @@
 #include "nvn_sdk.h"
 #include "nvn_c4.h"
 
+#ifdef _WIN32                     /* [Recomps#1] Linux: no .lib notes (zig's lld would look for them) */
 #pragma comment(lib, "opengl32.lib")
+#endif
 
 /* ask laptop drivers for the discrete GPU */
 __declspec(dllexport) DWORD NvOptimusEnablement = 1;
@@ -4297,7 +4299,7 @@ static void cmd_get_control_size(Ctx *c) { RET(cb_get(A0)->ctrl_size); }
 static void cmd_is_recording(Ctx *c) { RET(cb_get(A0)->recording); }
 /* L1 round 2, TEST ONLY (SSBU_L1_TRACE=1 with SSBU_L1=1): for the 5 presents after the first press, every command-buffer
  * recording, submission, fence, sync wait, window acquire and present, with the guest thread name and the guest return address. */
-int display_l1_trace(void); double display_l1_ms(void); const char *guest_thread_name_of(unsigned long tid);
+int display_l1_trace(void); double display_l1_ms(void); const char *guest_thread_name_of(DWORD tid);
 #define L1T(...) do { if (display_l1_trace()) { char l1b_[240]; snprintf(l1b_, sizeof l1b_, __VA_ARGS__); printf("l1-trace: %+8.2f %-26s lr %09llx %s%c", display_l1_ms(), guest_thread_name_of(GetCurrentThreadId()) ? guest_thread_name_of(GetCurrentThreadId()) : "?", (unsigned long long)c->x[30], l1b_, 10); } } while (0)
 static void cmd_begin(Ctx *c) { L1T("begin recording cb %llx", (unsigned long long)A0); CmdBuf *cb = cb_get(A0); cb->len = 0; cb->recording = 1; cb->rec_cmd = cb->rec_ctrl = 0; cb->dispatches = 0; }
 static void cmd_end(Ctx *c) {

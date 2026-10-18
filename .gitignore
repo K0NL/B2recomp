@@ -42,9 +42,15 @@
 # runtime/gen/* other than make_gen.py is generated from the user's dump (sdk.elf, sdklift_gen.c, sdkdata.c,
 # image_layout.h, imports_all.txt, sdklift_report.txt, ...): stays ignored by rule 1.
 
+# ---- 4b. the Linux version (notes/linux-port-plan.md): the Win32-on-POSIX layer of the runtime (our code)
+!/runtime/linux/*.h
+!/runtime/linux/*.c
+!/runtime/linux/GL/gl.h
+
 # ---- 5. launcher (source only; art and icon come from the user's own files at build time)
 !/launcher/launcher.c
 !/launcher/launcher.manifest
+!/launcher/launcher_linux.py
 
 # ---- 6. scripts (only the keyless versions; see the audit for the ones that must change first)
 !/scripts/build_launcher.py
@@ -60,6 +66,13 @@
 !/scripts/make_package.py
 !/scripts/package/build.bat
 !/scripts/package/licenses/*.txt
+!/scripts/package/B2recomp.sh
+!/scripts/package/linux_deps.sh
+!/scripts/package/linux_tk.sh
+!/scripts/package/README-linux.txt
+!/scripts/build_runtime_linux.py
+!/scripts/play.sh
+!/scripts/report.sh
 !/scripts/toolchain.py
 !/scripts/lift.py
 !/scripts/lift_gaps.py

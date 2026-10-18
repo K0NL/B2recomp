@@ -43,6 +43,13 @@ Tools and libraries: the option, else the environment variable, else <repo>/deps
     glslang         --glslang     GLSLANG_ROOT    deps/glslang      glslang 16.6.0 windows release + MSVC Build Tools, to build
                                                                     ssbu_glslang.dll; or a built one:
     ssbu_glslang.dll --glslang-dll GLSLANG_DLL    deps/ssbu_glslang.dll
+
+On Linux (the Linux builder package; notes/linux-port-plan.md step 10) the same steps make the Linux version: TOOLCHAIN=
+linux, zig 0.17.0 (--zig / ZIG / deps/zig; else the system's clang) for glibc 2.35, SDL3 from deps/SDL3 (include/ +
+lib/libSDL3.so, built by scripts/package/linux_deps.sh) or the system's, Vulkan-Headers from deps/ or /usr/include, the
+shader shim deps/libssbu_glslang.so (or GLSLANG_SO, or built from the system's glslang); convert makes symlinks instead of
+junctions; compile writes build-linux/obj and link scripts/build_runtime_linux.py's build-linux/game_native, game.so,
+libSDL3.so.0, libssbu_glslang.so (the launcher is launcher/launcher_linux.py, nothing to build).
 """
 import argparse
 import hashlib
@@ -79,6 +86,7 @@ ROMFS_FILES = {   # small enough to hash on every verify
 }
 ROMFS_MANIFEST = (1643, 13480389777, '4d5e288d43f669353e483f279e325984544906c253d932863b649f8f681c340d')
 ENCRYPTED = ('.nsp', '.xci', '.nca', '.nsz', '.xcz')
+LINUX_HOST = sys.platform.startswith('linux')                # [Recomps#1] the Linux version (TOOLCHAIN=linux, build-linux/)
 
 
 class Fail(Exception):
@@ -86,7 +94,7 @@ class Fail(Exception):
 
 
 def say(msg=''):
-    print(msg, flush=True)
+    print(msg.replace('\\', '/') if LINUX_HOST else msg, flush=True)   # the messages spell paths the Windows way
 
 
 def fmt(secs):
@@ -140,10 +148,16 @@ def link_folder(link, target):
         if is_junction(link) or os.path.islink(link):
             if os.path.normcase(os.path.realpath(link)) == os.path.normcase(os.path.realpath(target)):
                 return 'kept'
-            os.rmdir(link)                                   # removes the junction only, never what it points to
+            if os.path.islink(link):
+                os.unlink(link)                              # removes the symlink only, never what it points to
+            else:
+                os.rmdir(link)                               # removes the junction only, never what it points to
         else:
             return 'a real folder, kept (not replaced by the dump\'s)'
     os.makedirs(os.path.dirname(link), exist_ok=True)
+    if LINUX_HOST:
+        os.symlink(target, link, target_is_directory=True)
+        return 'symlink to ' + target
     r = subprocess.run(['cmd', '/c', 'mklink', '/J', link, target], capture_output=True, text=True)
     if r.returncode:
         raise Fail('could not make the junction %s -> %s: %s' % (link, target, (r.stdout + r.stderr).strip()))
@@ -210,6 +224,8 @@ def step_deps(cx):
     say('  python %s, packages lz4 Pillow: ok' % sys.version.split()[0])
 
     saved = cx.state.get('tools', {})                    # what an earlier run found (its options need not be given again)
+    if LINUX_HOST:
+        return deps_linux(cx, saved)
     name = a.toolchain or os.environ.get('TOOLCHAIN') or saved.get('TOOLCHAIN') or 'mingw'
     if name not in ('mingw', 'msvc'):
         raise Fail('--toolchain must be mingw or msvc, not %r' % name)
@@ -278,6 +294,66 @@ def step_deps(cx):
     else:
         raise Fail('ssbu_glslang.dll (the shader compiler shim) has no source: give a built one (--glslang-dll <file>, '
                    'GLSLANG_DLL, deps\\ssbu_glslang.dll), or glslang 16.6.0 + the MSVC Build Tools to build it (--glslang <folder>)')
+    cx.state['tools'] = dict(cx.tools)
+
+
+def deps_linux(cx, saved):
+    """[Recomps#1] deps on Linux: zig (or clang), SDL3, Vulkan-Headers, the shader shim; a test program built and run."""
+    a = cx.a
+    cx.tools['TOOLCHAIN'] = 'linux'
+    zig = find_first([a.zig, os.environ.get('ZIG'), os.path.join(DEPS, 'zig'), saved.get('ZIG')], 'zig')
+    if zig:
+        cx.tools['ZIG'] = zig
+        cc = [os.path.join(zig, 'zig'), 'cc', '-target', 'x86_64-linux-gnu.2.35']
+    elif shutil.which('clang'):
+        cc = [shutil.which('clang')]
+        say("  no zig (deps/zig): the system's clang builds a game for this PC's glibc only")
+    else:
+        raise Fail('no compiler: unpack zig 0.17.0 (x86_64-linux) into deps/zig (the Linux builder package has it), '
+                   'or install clang')
+    ver = subprocess.run(cc[:1] + (['version'] if zig else ['--version']), capture_output=True, text=True).stdout.splitlines()[0]
+    say('  compiler: %s %s   [%s]' % ('zig' if zig else 'clang', ver, cc[0]))
+    probe = os.path.join(cx.build, 'probe')
+    os.makedirs(probe, exist_ok=True)
+    with open(os.path.join(probe, 'p.c'), 'w') as f:
+        f.write('#include <stdio.h>\n#include <pthread.h>\nint main(void){puts("ok");return 0;}\n')
+    exe = os.path.join(probe, 'p')
+    r = subprocess.run(cc + [os.path.join(probe, 'p.c'), '-o', exe, '-lpthread'], capture_output=True, text=True)
+    if r.returncode or subprocess.run([exe], capture_output=True, text=True).stdout.strip() != 'ok':
+        raise Fail('the compiler cannot build and run a Linux program\n%s' % (r.stdout + r.stderr)[-800:])
+    say('  compiler builds and runs a Linux program: ok')
+    sdl = find_first([a.sdl3, os.environ.get('SDL3_ROOT'), os.path.join(DEPS, 'SDL3'), saved.get('SDL3_ROOT')],
+                     os.path.join('lib', 'libSDL3.so.0')) or \
+        find_first([a.sdl3, os.environ.get('SDL3_ROOT'), os.path.join(DEPS, 'SDL3'), saved.get('SDL3_ROOT')],
+                   os.path.join('lib', 'libSDL3.so'))
+    if sdl:
+        cx.tools['SDL3_ROOT'] = sdl
+        cx.tools['SDL3_LINUX_LIB'] = os.path.join(sdl, 'lib')
+        say('  SDL3            %s (copied beside the game)' % sdl)
+    elif os.path.exists('/usr/include/SDL3/SDL.h') and not zig:
+        say("  SDL3            the system's (/usr/include/SDL3)")
+    else:
+        raise Fail('SDL3 not found: deps/SDL3 with include/ and lib/libSDL3.so.0 (the Linux builder package has it), or '
+                   '--sdl3 <folder>')
+    vk = find_first([a.vulkan_headers, os.environ.get('VULKAN_HEADERS'), os.path.join(DEPS, 'Vulkan-Headers'),
+                     saved.get('VULKAN_HEADERS')], os.path.join('include', 'vulkan', 'vulkan.h'))
+    if vk:
+        cx.tools['VULKAN_HEADERS'] = vk
+        say('  Vulkan-Headers  %s' % vk)
+    elif os.path.exists('/usr/include/vulkan/vulkan.h') and not zig:
+        say("  Vulkan-Headers  the system's (/usr/include/vulkan)")
+    else:
+        raise Fail('Vulkan-Headers not found: deps/Vulkan-Headers (include/vulkan/vulkan.h), or --vulkan-headers <folder>')
+    shim = next((os.path.abspath(f) for f in (a.glslang_so, os.environ.get('GLSLANG_SO'), os.path.join(DEPS, 'libssbu_glslang.so'),
+                                              saved.get('GLSLANG_SO')) if f and os.path.isfile(f)), None)
+    if shim:
+        cx.tools['GLSLANG_SO'] = shim
+        say('  shader shim     %s (copied beside the game)' % shim)
+    elif os.path.exists('/usr/include/glslang/Include/glslang_c_interface.h'):
+        say("  shader shim     built from the system's glslang in the link step")
+    else:
+        raise Fail('the shader compiler shim is missing: deps/libssbu_glslang.so (the Linux builder package has it), or '
+                   'install glslang')
     cx.state['tools'] = dict(cx.tools)
 
 
@@ -455,6 +531,15 @@ def step_icon(cx):
 
 
 def step_link(cx):
+    if LINUX_HOST:                                           # [Recomps#1] the Linux version: build-linux/
+        cx.run('link', [sys.executable, os.path.join(REPO, 'scripts', 'build_runtime_linux.py'), '--strict'])
+        out = os.path.join(REPO, 'build-linux')
+        for f in ('game.so', 'game_native', 'libSDL3.so.0', 'libssbu_glslang.so'):
+            if not os.path.isfile(os.path.join(out, f)) and not (f == 'libSDL3.so.0' and 'SDL3_LINUX_LIB' not in cx.tools):
+                raise Fail('build-linux/%s is missing after the link step (see %s)' % (f, os.path.join(cx.logs, 'link.log')))
+        say('  build-linux/game_native %.1f MB, game.so %.0f MB' % (os.path.getsize(os.path.join(out, 'game_native')) / 2 ** 20,
+                                                                  os.path.getsize(os.path.join(out, 'game.so')) / 2 ** 20))
+        return
     cx.run('link', [sys.executable, os.path.join(REPO, 'scripts', 'build_runtime.py')])
     cx.run('link', [sys.executable, os.path.join(REPO, 'scripts', 'build_launcher.py')])
     for f in ('game.dll', 'game_native.exe', 'SDL3.dll', 'ssbu_glslang.dll', 'launcher.exe'):
@@ -475,6 +560,35 @@ def step_check(cx):
     say('  ' + (tail.strip().splitlines() or ['ok'])[-1])
 
 
+# ---------------------------------------------------------------------------------------------- updates
+# [Recomps#1] A newer B2recomp unpacked over a finished build: the files the later steps read have changed, so tables,
+# lift, compile, link and check run again (compile_main.py then compiles only the C files that changed; a runtime fix
+# costs about a minute). The fingerprint of these files is kept in build/setup_state.json after a complete run, with the
+# package's VERSION (the launcher compares that one to show its build screen after an update).
+SOURCE_GLOBS = ('lifter/*.py', 'lifter/*.txt', 'lifter/*.h', 'runtime/*.c', 'runtime/*.h', 'runtime/*.inc',
+                'runtime/gen/make_gen.py', 'runtime/linux/*.c', 'runtime/linux/*.h', 'runtime/linux/GL/*.h', 'scripts/*.py')
+REDO_ON_UPDATE = ('tables', 'lift', 'compile', 'link', 'check')
+
+
+def source_fingerprint():
+    import glob
+    h = hashlib.sha256()
+    for pat in SOURCE_GLOBS:
+        for p in sorted(glob.glob(os.path.join(REPO, *pat.split('/')))):
+            h.update(os.path.relpath(p, REPO).replace(os.sep, '/').encode('utf-8') + b'\0')
+            with open(p, 'rb') as f:
+                h.update(hashlib.sha256(f.read()).digest())
+    return h.hexdigest()[:20]
+
+
+def package_version():
+    try:
+        with open(os.path.join(REPO, 'VERSION'), encoding='utf-8') as f:
+            return f.read().strip() or None
+    except OSError:
+        return None
+
+
 # ---------------------------------------------------------------------------------------------- main
 def main():
     ap = argparse.ArgumentParser(description='Build the native port from your own extracted dump.')
@@ -485,7 +599,9 @@ def main():
     ap.add_argument('--status', action='store_true')
     ap.add_argument('--accept-modified', action='store_true')
     ap.add_argument('--mods', help='folder of emulator-style code mods (.pchtxt / .ips); default <repo>\\mods (remembered)')
-    ap.add_argument('--toolchain', choices=('mingw', 'msvc'))
+    ap.add_argument('--toolchain', choices=('mingw', 'msvc', 'linux'))
+    ap.add_argument('--zig', help='zig 0.17.0 folder (Linux: the compiler; deps/zig in the Linux builder package)')
+    ap.add_argument('--glslang-so', help='Linux: a built libssbu_glslang.so (deps/libssbu_glslang.so in the package)')
     ap.add_argument('--llvm-mingw', help='llvm-mingw folder (bin\\x86_64-w64-mingw32-clang.exe)')
     ap.add_argument('--llvm', help='LLVM 9.0.0 folder (bin\\clang.exe), --toolchain msvc only')
     ap.add_argument('--sdl3', help='SDL3 development package (VC) folder: include\\, lib\\x64\\')
@@ -502,6 +618,13 @@ def main():
     if a.dump and cx.state.get('dump') and os.path.normcase(cx.dump) != os.path.normcase(cx.state['dump']):
         done.clear()                                         # another dump: everything is made again
     todo = sorted(ALWAYS | {a.only}, key=STEPS.index) if a.only else STEPS
+    fp = source_fingerprint()
+    if not a.only and cx.state.get('source_fp') != fp and any(s in done for s in REDO_ON_UPDATE):
+        redo = [s for s in REDO_ON_UPDATE if s in done]
+        for s in redo:
+            done.pop(s)
+        say('B2recomp itself changed since the last build (an update): %s run again; compile redoes only the files '
+            'that changed' % ', '.join(redo))
     if a.from_step:
         for s in STEPS[STEPS.index(a.from_step):]:
             done.pop(s, None)
@@ -522,7 +645,12 @@ def main():
         say('[%d/%d] %s: ok  %s' % (i + 1, len(STEPS), s, fmt(done[s])))
     say('setup: %s this run' % fmt(time.time() - t_all))
     if all(s in done for s in STEPS):
-        say('Start the game: build\\launcher.exe (Play), or scripts\\play.ps1')
+        cx.state['source_fp'] = fp                           # the build matches these files (and this package version)
+        if package_version():
+            cx.state['version'] = package_version()
+        cx.save()
+        say('Start the game: ./B2recomp (Play), or scripts/play.sh' if LINUX_HOST else
+            'Start the game: build\\launcher.exe (Play), or scripts\\play.ps1')
     return 0
 
 

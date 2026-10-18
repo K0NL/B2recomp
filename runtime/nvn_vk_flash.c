@@ -55,7 +55,7 @@ static void fl_report(int first, int count, int came_back) {
     SYSTEMTIME st; GetLocalTime(&st);
     if (g_fl.reports >= 40) return;
     g_fl.reports++;
-    if (n > 4) { strcpy(path + n - 4, "_flash.txt"); fp = fopen(path, "ab"); }
+    if (n > EXE_EXT_LEN) { strcpy(path + n - EXE_EXT_LEN, "_flash.txt"); fp = fopen(path, "ab"); }
     for (int pass = 0; pass < 2; pass++) {
         FILE *o = pass ? fp : stdout;
         if (!o) continue;

@@ -194,3 +194,58 @@ Both are marked `[Recomps#1]` in the code; the values the game sees are unchange
   only when chosen (`button_prompts`). `mod_family` guesses a prompt mod's kind from a word that starts with ds4, ds5,
   dualshock, dualsense, playstation, ps4, ps5 / xbox (or the word ps), so the DS4Prompts / XBOXPrompts folders of the
   GameBanana prompt mod 360121 need no [prompts] line.
+- 2026-10-18, new folder `runtime/linux/` (Linux only, never built on Windows; notes/linux-port-plan.md step 1): `windows.h`
+  (the Win32 subset the runtime uses, on pthreads / clock_gettime / __atomic / mmap / ucontext), `win32_compat.c` (kernel
+  objects, threads, events, waitable timers, fibers + fiber-local storage, VirtualAlloc with recorded reservations at
+  64 KiB granularity, FindFirstFile, UTF-8 / wide text), `io.h`, `psapi.h`, `tlhelp32.h`, and `compat_test.c` (self-test).
+  With it 30 of the 44 host sources compile for x86_64-linux-gnu unchanged; the rest are the shape-different files (plan
+  steps 4-8). `os_threads.c`, `nvn_gl.c`: `guest_thread_name_of` declared with `DWORD` instead of `unsigned long` (the
+  same type on Windows, 64-bit on Linux); their Windows objects are byte-identical before and after.
+- 2026-10-18, `nntime.c` (Linux, plan step 4): behind `#ifndef _WIN32`, the device's rule is the zone file of the PC's own
+  zone (`/usr/share/zoneinfo`, the console's own format), its footer rule spelled out as transitions up to 2037 for slim
+  files; location from $TZ / /etc/localtime; a Linux self-test against localtime_r. Windows code unchanged (object
+  byte-identical). `runtime/linux/`: file handles (CreateFileA ... OVERLAPPED, mappings, CopyFile), named mutexes as lock
+  files, OpenProcess, case-insensitive path lookup; `nnfs.c` / `nnfsdir.c` compile for Linux unchanged.
+- 2026-10-18, `display.c` (Linux, plan step 5): behind `#ifdef _WIN32` the Win32 window, wndproc, raw mouse, D3DKMT vblank
+  thread and CPU sets stay as they were; the Linux part is an SDL3 window on its own thread (graphics.ini size / borderless /
+  fullscreen, hidden test copies, relative mouse mode for the mouse camera, close = exit request; vblank: our own 60 Hz
+  clock for now) and answers the Win32 window functions the rest uses (GetForegroundWindow, IsIconic, SetWindowTextA via
+  the window thread, GetAsyncKeyState from SDL's keyboard / mouse state, MessageBoxA/W via SDL). `nnpad_sdl.c`: on Linux
+  poll_devices flushes only the pad events (the window's events share SDL's queue). Windows objects byte-identical.
+- 2026-10-18, `nnaudio.c` (Linux, plan step 5): unchanged sound path; on Linux `runtime/linux/mmsystem.h` + `waveout_sdl.c`
+  give the waveOut subset on an SDL3 audio stream (buffers marked done in order as SDL takes them, CALLBACK_EVENT set,
+  position, reset, pause, volume as stream gain; `waveout_test.c`: 20 of 20 with the dummy and the PulseAudio driver under
+  WSL2). Behind `#ifdef`: the audible-exe rule (Linux names, no .exe) and the COM device watcher (SDL follows the default
+  device). libopus-0.dll / opus.dll map to libopus.so.0. Windows object byte-identical.
+- 2026-10-18, `nnmisc.c` / `nnnet.c` (Linux, plan step 8): compile for Linux with no change of their own; `nnnet_c4a.inc`
+  spells `in_addr` as `.s_addr` (Windows' own macro for `.S_un.S_addr`: Windows object byte-identical). `runtime/linux/`:
+  winsock2.h / ws2tcpip.h on POSIX sockets (WSAE* = errno, lookups = EAI_*), wincrypt.h with SHA-1 / MD5 (RFC 3174 /
+  1321, checked against their test vectors) and getrandom, the user's language from $LANGUAGE / $LANG, window shims for
+  nnmisc.c's freeze test (display.c), IsBadWritePtr. compat_test 56 of 56 under WSL2 Arch.
+- 2026-10-18, Linux (plan step 8): `nnapplet.c` - the Win32 software-keyboard dialog and its self-test round behind
+  `#ifdef _WIN32`; on Linux the game's initial text is answered (SDL3 has no text dialog). `nnfontll.c` - GDI outlines
+  behind `#ifdef _WIN32`; on Linux the outline is read from the font's glyf / loca tables (simple + composite TrueType
+  glyphs, unhinted, flattened like the GDI path; CFF fonts blank). `nnmovie_mf.c`, `nnalbum.c` - the whole Media
+  Foundation body behind `#ifdef _WIN32`; Linux gets empty registrations (Bayonetta 2 plays CRI USM movies in game code and
+  imports no movie:: or nn::album). All four Windows objects byte-identical; 43 of 46 host files compile for Linux.
+- 2026-10-18, Linux renderer (plan step 6): `nvn_vk.c` - on Linux the instance takes SDL's surface extensions
+  (SDL_Vulkan_GetInstanceExtensions: xlib / xcb / wayland) and the surface comes from SDL_Vulkan_CreateSurface on the
+  window display.c made; vkCreateWin32SurfaceKHR is not required from the loader there. `nvn_vk_wd.c` - wd_export (PE
+  export table walk) gives no name on Linux. `display.c` - GetClientRect / GetWindowTextA over the SDL window.
+  `vk_glslang_shim.c` - pthread_once instead of InitOnceExecuteOnce on Linux; built as `libssbu_glslang.so` against the
+  system's glslang (16.6.0 on Arch). `runtime/linux/`: GL/gl.h (Mesa's prototypes renamed where nvn_gl.c declares its own
+  pointers), WGL / GDI window stubs that report "no context" (the OpenGL renderer is Windows only), semaphores,
+  GetSystemInfo, GetThreadPriority. All 44 host objects and the shim's Windows object byte-identical; 46 of 46 host files
+  compile and game_native links on Linux (WSL2 Arch).
+- 2026-10-18, Linux builder package (plan step 10): `nnmisc.c`, `nnnet.c`, `nvn_gl.c` - their `#pragma comment(lib, ...)`
+  lines behind `#ifdef _WIN32` (zig's lld obeys them on ELF and looks for advapi32.lib ...). `runtime/linux/`: GL/gl.h is
+  now the self-contained OpenGL 1.1 subset the two GL files use (no system OpenGL headers needed) and gl_stubs.c gives its
+  38 functions as do-nothing stand-ins (game_native needs no libGL; the OpenGL renderer is Windows only). Windows objects
+  of the three files byte-identical.
+- 2026-10-18, Linux, from the first test on a real Linux PC (Arch/CachyOS, RTX 4060 laptop): `runtime/linux/` -
+  GetModuleFileNameA spells the program's path with '\' as Windows does, so the runtime's `<exe folder>\..\config`
+  (gfx_options.c, nnpad_sdl.c, nnfs.c, nnmisc.c) finds config/ (the launcher's settings were not read); the Linux
+  branches of `display.c` / `nnaudio.c` cut at '\' too. `nnpl.c` - on Linux, with no console fonts, a TrueType font of
+  the system stands in (Noto Sans, DejaVu Sans, Liberation Sans ... under /usr/share/fonts; the game stopped there).
+  `nvn_vk.c` - EXE_EXT_LEN (4 on Windows, 0 on Linux) for the report names of `nvn_vk_wd.c` / `nvn_vk_flash.c`
+  (game_native_freeze.txt, not game_na_freeze.txt). Windows objects of all four byte-identical.

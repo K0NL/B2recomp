@@ -11,12 +11,24 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
 #include <windows.h>
+#endif
 #include <glslang/Include/glslang_c_interface.h>
 #include <glslang/Public/resource_limits_c.h>
 
+#ifdef _WIN32
 static INIT_ONCE g_once = INIT_ONCE_STATIC_INIT;
 static BOOL CALLBACK init_once(PINIT_ONCE once, PVOID arg, PVOID *ctx) { (void)once; (void)arg; (void)ctx; return glslang_initialize_process() != 0; }
+#else
+/* [Recomps#1] Linux (notes/linux-port-plan.md step 6): libssbu_glslang.so, linked against the system's glslang (16.6.0 on
+ * Arch, the version of the Windows release); the process initialisation runs once through pthread_once. */
+#include <pthread.h>
+#define __declspec(x) __attribute__((visibility("default")))
+static pthread_once_t g_once = PTHREAD_ONCE_INIT;
+static int g_init_ok;
+static void init_once(void) { g_init_ok = glslang_initialize_process() != 0; }
+#endif
 
 __declspec(dllexport) void ssbu_spirv_free(uint32_t *words) { free(words); }
 
@@ -25,7 +37,11 @@ __declspec(dllexport) int ssbu_glsl_to_spirv(int stage, const char *src, uint32_
     int ok = 0;
     if (log && log_size) log[0] = 0;
     *words = NULL; *count = 0;
+#ifdef _WIN32
     if (!InitOnceExecuteOnce(&g_once, init_once, NULL, NULL)) { if (log) snprintf(log, log_size, "glslang_initialize_process failed"); return 0; }
+#else
+    if ((pthread_once(&g_once, init_once), !g_init_ok)) { if (log) snprintf(log, log_size, "glslang_initialize_process failed"); return 0; }
+#endif
     memset(&in, 0, sizeof in);
     in.language = GLSLANG_SOURCE_GLSL;
     in.stage = stage == 0 ? GLSLANG_STAGE_VERTEX : stage == 1 ? GLSLANG_STAGE_FRAGMENT : stage == 5 ? GLSLANG_STAGE_COMPUTE : GLSLANG_STAGE_COUNT;

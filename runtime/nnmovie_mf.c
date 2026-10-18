@@ -1,3 +1,4 @@
+#ifdef _WIN32
 /* movie:: (the SDK's video player library) on Windows Media Foundation.
  *
  * The SDK library is a port of Android's stagefright (NuMediaExtractor / MediaCodec); the game's own
@@ -1371,3 +1372,9 @@ void register_movie_mf_imports(void) {
     InitializeCriticalSection(&g_init_lock);
     register_imports(movie_mf_imports, (int)(sizeof movie_mf_imports / sizeof movie_mf_imports[0]));
 }
+#else
+/* [Recomps#1] Linux (notes/linux-port-plan.md step 8): no Media Foundation. Bayonetta 2 plays CRI USM movies with CRI's
+ * own decoder inside the game code and does not use the SDK's movie:: player, so nothing is registered here and
+ * nnmovie.c's placeholder answers any movie:: call. */
+void register_movie_mf_imports(void) {}
+#endif

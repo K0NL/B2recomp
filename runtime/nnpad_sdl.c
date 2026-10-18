@@ -471,7 +471,11 @@ static void reassign_all(void) {                  /* [players] changed in the fi
 static void poll_devices(void) {                  /* lock held */
     int n = 0;
     SDL_UpdateJoysticks();
+#ifdef _WIN32
     SDL_FlushEvents(SDL_EVENT_FIRST, SDL_EVENT_LAST);
+#else
+    SDL_FlushEvents(SDL_EVENT_JOYSTICK_AXIS_MOTION, SDL_EVENT_FINGER_DOWN - 1);   /* [Recomps#1] Linux: the window's events share the queue (display.c): only the pads' */
+#endif
     SDL_JoystickID *ids = SDL_GetJoysticks(&n);
     for (int i = 0; i < MAXDEV; i++) {
         int alive = 0;

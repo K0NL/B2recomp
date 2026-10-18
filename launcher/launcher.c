@@ -1897,13 +1897,36 @@ static LRESULT CALLBACK wndproc(HWND w, UINT m, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(w, m, wp, lp);
 }
 
+/* [Recomps#1] finding 123: the window is S(WIN_W) x S(WIN_H) plus its frame, and at a high display scaling that can be
+ * larger than the screen (a player's 4K screen: the bottom row with Play was below it; a 1080p screen at 150 % too). Then
+ * everything is laid out at a smaller scale (g_dpi), so the whole window fits the work area; g_dpi_sys stays the system's,
+ * for the system's message font. TEST: B2RECOMP_LAUNCHER_DPI=<dpi> lays out as at that display scaling (144 = 150 %). */
+static int g_dpi_sys = 96;
+static void fit_dpi(void) {
+    wchar_t e[16];
+    int want = g_dpi_sys;
+    if (GetEnvironmentVariableW(L"B2RECOMP_LAUNCHER_DPI", e, 16) && _wtoi(e) >= 48 && _wtoi(e) <= 960) want = _wtoi(e);
+    g_dpi = want;
+    static const int k_win[3][2] = { {WIN_W, WIN_H}, {KW_W, KW_H}, {MW_W, MW_H} };     /* the main window, Keyboard and mouse, Mods */
+    RECT wa, r = { 0, 0, S(WIN_W), S(WIN_H) };
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
+    AdjustWindowRectEx(&r, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN, FALSE, WS_EX_CONTROLPARENT);
+    int ncw = (r.right - r.left) - S(WIN_W), nch = (r.bottom - r.top) - S(WIN_H);   /* frame and title bar: drawn by the system at its scale */
+    int aw = wa.right - wa.left - 16 - ncw, ah = wa.bottom - wa.top - 16 - nch;      /* room for a client area, 8 px margin each side */
+    for (int i = 0; i < 3; i++) {
+        int dw = MulDiv(aw, 96, k_win[i][0]), dh = MulDiv(ah, 96, k_win[i][1]), d = dw < dh ? dw : dh;
+        if (d < g_dpi) g_dpi = d < 48 ? 48 : d;
+    }
+}
+
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmdline, int show) {
     (void)prev;
     SetProcessDPIAware();
     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);   /* the folder dialog of the build screen */
     INITCOMMONCONTROLSEX icc = { sizeof icc, ICC_STANDARD_CLASSES | ICC_BAR_CLASSES | ICC_TAB_CLASSES | ICC_TREEVIEW_CLASSES };
     InitCommonControlsEx(&icc);
-    {   HDC dc = GetDC(NULL); g_dpi = GetDeviceCaps(dc, LOGPIXELSY); ReleaseDC(NULL, dc); }
+    {   HDC dc = GetDC(NULL); g_dpi = g_dpi_sys = GetDeviceCaps(dc, LOGPIXELSY); ReleaseDC(NULL, dc); }
+    fit_dpi();                                              /* finding 123: smaller than the system's scale when the window would not fit */
     {   /* dark controls: uxtheme's unnamed exports SetPreferredAppMode (135; 2 = force dark) and AllowDarkModeForWindow (133),
            as used by Explorer and Notepad; without them (older Windows) the controls stay light and everything still works */
         HMODULE ux = LoadLibraryExW(L"uxtheme.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
@@ -1936,6 +1959,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmdline, int show) {
 
     NONCLIENTMETRICSW ncm = { sizeof ncm };
     SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof ncm, &ncm, 0);
+    ncm.lfMessageFont.lfHeight = MulDiv(ncm.lfMessageFont.lfHeight, g_dpi, g_dpi_sys);      /* finding 123: the system's font, at our scale */
     g_font = CreateFontIndirectW(&ncm.lfMessageFont);
     LOGFONTW lf = ncm.lfMessageFont;
     lf.lfWeight = FW_BOLD; lf.lfHeight = -MulDiv(12, g_dpi, 72);

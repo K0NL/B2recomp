@@ -31,9 +31,16 @@ static float uncap_min(void) { static float m = -1; if (m < 0) { const char *e =
 static float uncap_f(uint64_t a) { uint32_t b = rd32(a); float f; memcpy(&f, &b, 4); return f; }
 '''
 LIMIT = r'''
+#ifdef _WIN32
 __declspec(dllimport) int __stdcall QueryPerformanceCounter(long long *);
 __declspec(dllimport) int __stdcall QueryPerformanceFrequency(long long *);
 __declspec(dllimport) void __stdcall Sleep(unsigned long);
+#else /* [fps_patch.py] Linux (notes/linux-port-plan.md step 2): the same three, on the monotonic clock */
+#include <time.h>
+static int QueryPerformanceCounter(long long *c) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); *c = (long long)t.tv_sec * 1000000000 + t.tv_nsec; return 1; }
+static int QueryPerformanceFrequency(long long *f) { *f = 1000000000; return 1; }
+static void Sleep(unsigned long ms) { struct timespec t = { (time_t)(ms / 1000), (long)(ms % 1000) * 1000000 }; nanosleep(&t, 0); }
+#endif
 /* RECOMPS_UNCAP_FPS=<n>: frame limiter at the game's present (0 / unset = none) */
 static void uncap_limit(void) {
     static long long freq, next; static int fps = -1;

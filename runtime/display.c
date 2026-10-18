@@ -70,8 +70,10 @@ static void vsync_test_key(void);
  *     its present and the next frame's (0 = replaced before it was shown). Histogram in the report and per 600 frames
  *     with SSBU_PACESTAT=1. This is the compositor model "the last picture presented before a vblank is what the next
  *     refresh shows" on MEASURED vblank times; it is not a camera. */
+#ifdef _WIN32
 typedef struct { HDC hDc; UINT hAdapter; LUID AdapterLuid; UINT VidPnSourceId; } KmtOpenAdapterFromHdc;
 typedef struct { UINT hAdapter; UINT hDevice; UINT VidPnSourceId; } KmtWaitVblank;
+#endif
 static SRWLOCK g_vb_lock = SRWLOCK_INIT;
 static CONDITION_VARIABLE g_vb_cv = CONDITION_VARIABLE_INIT;
 static volatile LONG64 g_vb_count, g_vb_qpc;           /* vblanks seen, time of the last one (under g_vb_lock for a consistent pair) */
@@ -107,6 +109,7 @@ static int g_pc_n = -1, g_pc_on = 1;
 static uint8_t g_cpu_class[256], g_class_max;
 static volatile LONG64 g_pc_frames, g_pc_frames_slow;
 static void pcore_init(void) {
+#ifdef _WIN32
     ULONG len = 0;
     const char *e = getenv("SSBU_PCORES");
     g_pc_n = 0;
@@ -136,6 +139,9 @@ static void pcore_init(void) {
         st.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION; st.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED; st.StateMask = 0;
         SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &st, sizeof st);
     }
+#else
+    g_pc_n = 0;                                    /* [Recomps#1] Linux: CPU sets are Windows' hybrid-CPU API; the kernel places the threads */
+#endif
 }
 /* the calling thread: performance cores only (once per thread is enough; cheap to repeat) */
 void display_perf_thread(void) {
@@ -153,6 +159,12 @@ static void precise_wait_until(LONGLONG target, HANDLE timer) {
 }
 static DWORD WINAPI vblank_thread(LPVOID arg) {
     (void)arg;
+#ifndef _WIN32
+    /* [Recomps#1] Linux: no D3DKMT; the refresh clock is our own (a Linux vblank source: plan step 6) */
+    printf("display: no vblank source on Linux yet: the refresh clock stays our own 60 Hz clock%c", 10);
+    InterlockedExchange(&g_vb_state, -1);
+    return 0;
+#else
     HMODULE gdi = LoadLibraryA("gdi32.dll");
     LONG (WINAPI *open_adapter)(KmtOpenAdapterFromHdc *) = gdi ? (void *)GetProcAddress(gdi, "D3DKMTOpenAdapterFromHdc") : NULL;
     LONG (WINAPI *wait_vblank)(const KmtWaitVblank *) = gdi ? (void *)GetProcAddress(gdi, "D3DKMTWaitForVerticalBlankEvent") : NULL;
@@ -206,6 +218,7 @@ static DWORD WINAPI vblank_thread(LPVOID arg) {
         ReleaseSRWLockExclusive(&g_vb_lock);
         WakeAllConditionVariable(&g_vb_cv);
     }
+#endif
 }
 static void pace_options(void) {
     if (g_pace_want >= 0) return;
@@ -256,6 +269,7 @@ int oe_exit_request(void);                            /* nnmisc.c */
  * it is in front; a smaller window only after a click into the picture, so the title bar stays reachable for moving the
  * window (the user could not drag it: the clip pulled the cursor back). Esc (pause), losing the foreground (Alt+Tab, a click
  * elsewhere) and the end of the game let it go. The click that captures is not passed to the game (display_mouse_hold). */
+#ifdef _WIN32
 static volatile LONG g_mdx, g_mdy, g_mouse_want, g_mouse_hold;
 static int g_mouse_clipped, g_mouse_grab;
 void display_mouse_want(int on) {
@@ -377,6 +391,214 @@ static DWORD WINAPI window_thread(LPVOID arg) {
     while (GetMessageA(&msg, NULL, 0, 0) > 0) { TranslateMessage(&msg); DispatchMessageA(&msg); }
     return 0;
 }
+#else
+/* [Recomps#1] Linux (notes/linux-port-plan.md step 5): the window is an SDL3 window, made and served on a thread of its
+ * own (all SDL video calls stay on it; other threads only post requests: mouse capture, title). Same behaviour as the
+ * Windows window: graphics.ini size / borderless / fullscreen, test copies hidden unless SSBU_SHOW=1, the mouse camera's
+ * relative movement while the mouse is captured (relative mouse mode: the cursor hidden and kept in the window; a window
+ * that fills its monitor captures as soon as it is in front, a smaller one after a click into the picture; Esc, losing
+ * the focus and the end of the game let it go), the close button as the exit request. Below: the few Win32 window
+ * functions the rest of the runtime calls (runtime/linux/windows.h), answered from this window and SDL's keyboard. */
+#include <SDL3/SDL.h>
+static volatile LONG g_mdx, g_mdy, g_mouse_want, g_mouse_hold, g_mouse_dirty, g_title_dirty, g_show_cmd;
+static int g_mouse_clipped, g_mouse_grab;
+static char g_title_want[160];
+static SRWLOCK g_title_lock = SRWLOCK_INIT;
+void display_mouse_want(int on) { InterlockedExchange(&g_mouse_want, on); InterlockedExchange(&g_mouse_dirty, 1); }
+void display_mouse_take(int *dx, int *dy) { *dx = InterlockedExchange(&g_mdx, 0); *dy = InterlockedExchange(&g_mdy, 0); }
+int display_mouse_hold(void) {                              /* 1 while the buttons of the capturing click are still down */
+    if (!g_mouse_hold) return 0;
+    static const int b[5] = {VK_LBUTTON, VK_RBUTTON, VK_MBUTTON, VK_XBUTTON1, VK_XBUTTON2};
+    for (int i = 0; i < 5; i++) if (GetAsyncKeyState(b[i]) & 0x8000) return 1;
+    InterlockedExchange(&g_mouse_hold, 0);
+    return 0;
+}
+static int fills_monitor(SDL_Window *w) {
+    SDL_Rect b;
+    int x, y, ww, wh;
+    if (SDL_GetWindowFlags(w) & SDL_WINDOW_FULLSCREEN) return 1;
+    SDL_DisplayID d = SDL_GetDisplayForWindow(w);
+    if (!d || !SDL_GetDisplayBounds(d, &b) || !SDL_GetWindowPosition(w, &x, &y) || !SDL_GetWindowSize(w, &ww, &wh)) return 0;
+    return x <= b.x && y <= b.y && x + ww >= b.x + b.w && y + wh >= b.y + b.h;
+}
+static void mouse_update(SDL_Window *w) {
+    SDL_WindowFlags f = SDL_GetWindowFlags(w);
+    int front = g_mouse_want && (f & SDL_WINDOW_INPUT_FOCUS) && !(f & SDL_WINDOW_MINIMIZED);
+    if (!front) g_mouse_grab = 0;
+    else if (fills_monitor(w)) g_mouse_grab = 1;
+    if (!g_mouse_grab) { InterlockedExchange(&g_mdx, 0); InterlockedExchange(&g_mdy, 0); }
+    int on = front && g_mouse_grab;
+    if (on != g_mouse_clipped) { SDL_SetWindowRelativeMouseMode(w, on); g_mouse_clipped = on; }
+}
+static void window_close(void) {                            /* the exit request, as WM_CLOSE on Windows */
+    printf("\nwindow closed by the user after %lld frames\n", (long long)g_frames);
+    { extern volatile LONG g_display_close; InterlockedExchange(&g_display_close, 1); }
+    if (!oe_exit_request()) report_and_exit(0);
+}
+
+static char g_title[96];
+
+static DWORD WINAPI window_thread(LPVOID arg) {
+    (void)arg;
+    const GfxOptions *go = gfx_options();
+    SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");
+    if (!SDL_InitSubSystem(SDL_INIT_VIDEO)) { printf("display: SDL video could not start: %s\n", SDL_GetError()); fflush(stdout); _exit(1); }
+    char exe[MAX_PATH] = "";
+    GetModuleFileNameA(NULL, exe, sizeof exe);
+    const char *base = strrchr(exe, '\\') ? strrchr(exe, '\\') + 1 : exe, *show = getenv("SSBU_SHOW");   /* GetModuleFileNameA: '\\' */
+    int visible = show ? atoi(show) != 0 : (!strcmp(base, "ssbu_native") || !strcmp(base, "ssbu_user") || !strcmp(base, "game_native"));
+    snprintf(g_title, sizeof g_title, "%s", getenv("SSBU_TITLE") ? getenv("SSBU_TITLE") : "B2recomp");
+    SDL_WindowFlags fl = SDL_WINDOW_VULKAN | (visible ? 0 : SDL_WINDOW_HIDDEN);
+    int cw = go->width, ch = go->height;
+    if (go->window_mode) {                                  /* borderless / fullscreen: the primary monitor's size */
+        SDL_Rect b;
+        fl |= SDL_WINDOW_BORDERLESS;
+        if (SDL_GetDisplayBounds(SDL_GetPrimaryDisplay(), &b)) { cw = b.w; ch = b.h; }
+        if (go->window_mode == 2) fl |= SDL_WINDOW_FULLSCREEN | SDL_WINDOW_ALWAYS_ON_TOP;
+    } else fl |= SDL_WINDOW_RESIZABLE;
+    printf("display: window %s, client %dx%d (graphics.ini; SDL3 video driver %s)\n", go->window_mode == 2 ? "fullscreen" : go->window_mode ? "borderless" : "windowed",
+           cw, ch, SDL_GetCurrentVideoDriver() ? SDL_GetCurrentVideoDriver() : "?");
+    SDL_Window *w = SDL_CreateWindow(g_title, cw, ch, fl);
+    if (!w) { printf("display: SDL_CreateWindow failed: %s\n", SDL_GetError()); fflush(stdout); _exit(1); }
+    g_hwnd = (HWND)w;
+    InterlockedExchange(&g_ready, 1);
+    float fx = 0, fy = 0;                                   /* fractions of a count the mouse moved (SDL3 reports float) */
+    for (;;) {
+        SDL_Event e;
+        if (SDL_WaitEventTimeout(&e, 10)) do {
+            switch (e.type) {
+            case SDL_EVENT_QUIT: case SDL_EVENT_WINDOW_CLOSE_REQUESTED: window_close(); break;
+            case SDL_EVENT_MOUSE_MOTION:
+                if (g_mouse_want && g_mouse_grab) {
+                    fx += e.motion.xrel; fy += e.motion.yrel;
+                    LONG dx = (LONG)fx, dy = (LONG)fy;
+                    fx -= (float)dx; fy -= (float)dy;
+                    if (dx) InterlockedAdd(&g_mdx, dx);
+                    if (dy) InterlockedAdd(&g_mdy, dy);
+                }
+                break;
+            case SDL_EVENT_MOUSE_BUTTON_DOWN:
+                if (g_mouse_want && !g_mouse_grab && (SDL_GetWindowFlags(w) & SDL_WINDOW_INPUT_FOCUS)) {
+                    g_mouse_grab = 1;
+                    InterlockedExchange(&g_mouse_hold, 1);
+                    mouse_update(w);
+                }
+                break;
+            case SDL_EVENT_KEY_DOWN:
+                if (e.key.key == SDLK_ESCAPE && g_mouse_grab && !fills_monitor(w)) { g_mouse_grab = 0; mouse_update(w); }
+                break;
+            case SDL_EVENT_WINDOW_FOCUS_GAINED: case SDL_EVENT_WINDOW_FOCUS_LOST: case SDL_EVENT_WINDOW_MINIMIZED:
+            case SDL_EVENT_WINDOW_RESTORED: case SDL_EVENT_WINDOW_RESIZED: case SDL_EVENT_WINDOW_MOVED:
+                mouse_update(w);
+                break;
+            default: break;
+            }
+        } while (SDL_PollEvent(&e));
+        if (InterlockedExchange(&g_mouse_dirty, 0)) mouse_update(w);
+        { LONG sc = InterlockedExchange(&g_show_cmd, 0); if (sc == 1) SDL_MinimizeWindow(w); else if (sc == 2) SDL_RestoreWindow(w); }
+        if (InterlockedExchange(&g_title_dirty, 0)) {
+            char t[160];
+            AcquireSRWLockShared(&g_title_lock);
+            snprintf(t, sizeof t, "%s", g_title_want);
+            ReleaseSRWLockShared(&g_title_lock);
+            SDL_SetWindowTitle(w, t);
+        }
+    }
+    return 0;
+}
+
+/* ---- the Win32 window functions of runtime/linux/windows.h, for the rest of the runtime */
+HWND GetForegroundWindow(void) {                            /* this window when it has the keyboard focus, else none */
+    SDL_Window *w = (SDL_Window *)g_hwnd;
+    return w && (SDL_GetWindowFlags(w) & SDL_WINDOW_INPUT_FOCUS) ? g_hwnd : NULL;
+}
+BOOL IsIconic(HWND h) { return h && (SDL_GetWindowFlags((SDL_Window *)h) & SDL_WINDOW_MINIMIZED) != 0; }
+BOOL EnumWindows(WNDENUMPROC cb, LPARAM l) { if (g_hwnd) cb(g_hwnd, l); return TRUE; }
+BOOL IsWindowVisible(HWND h) { return h && !(SDL_GetWindowFlags((SDL_Window *)h) & SDL_WINDOW_HIDDEN); }
+HWND GetWindow(HWND h, UINT cmd) { (void)h; (void)cmd; return NULL; }
+BOOL GetClientRect(HWND h, RECT *r) {                       /* the drawable size in pixels (a Vulkan surface may leave it to us) */
+    int w = 0, hh = 0;
+    if (!h || !SDL_GetWindowSizeInPixels((SDL_Window *)h, &w, &hh)) return FALSE;
+    r->left = r->top = 0; r->right = w; r->bottom = hh;
+    return TRUE;
+}
+int GetWindowTextA(HWND h, char *out, int n) {
+    if (!h || n <= 0) return 0;
+    AcquireSRWLockShared(&g_title_lock);
+    snprintf(out, (size_t)n, "%s", g_title_want[0] ? g_title_want : g_title);
+    ReleaseSRWLockShared(&g_title_lock);
+    return (int)strlen(out);
+}
+BOOL ShowWindow(HWND h, int cmd) {                          /* nnmisc.c's freeze test: minimise / restore on the window thread */
+    if (!h) return FALSE;
+    InterlockedExchange(&g_show_cmd, cmd == SW_MINIMIZE || cmd == SW_SHOWMINNOACTIVE || cmd == SW_SHOWMINIMIZED ? 1 : 2);
+    return TRUE;
+}
+BOOL SetForegroundWindow(HWND h) { (void)h; return FALSE; }   /* never takes the focus from the user (Windows' rule too) */
+BOOL SetWindowTextA(HWND h, LPCSTR text) {                  /* applied by the window thread */
+    (void)h;
+    AcquireSRWLockExclusive(&g_title_lock);
+    snprintf(g_title_want, sizeof g_title_want, "%s", text);
+    ReleaseSRWLockExclusive(&g_title_lock);
+    InterlockedExchange(&g_title_dirty, 1);
+    return TRUE;
+}
+DWORD GetWindowThreadProcessId(HWND h, DWORD *pid) { if (pid) *pid = h ? (DWORD)getpid() : 0; return h ? 1 : 0; }
+void keybd_event(BYTE vk, BYTE scan, DWORD flags, ULONG_PTR extra) { (void)vk; (void)scan; (void)flags; (void)extra; }   /* test aid: Windows only */
+static SDL_Scancode sc_of(int vk) {                         /* a Windows virtual-key code (controllers.ini [keyboard]) as an SDL scancode */
+    if (vk >= 'A' && vk <= 'Z') return (SDL_Scancode)(SDL_SCANCODE_A + (vk - 'A'));
+    if (vk >= '1' && vk <= '9') return (SDL_Scancode)(SDL_SCANCODE_1 + (vk - '1'));
+    if (vk == '0') return SDL_SCANCODE_0;
+    if (vk >= VK_F1 && vk <= VK_F1 + 11) return (SDL_Scancode)(SDL_SCANCODE_F1 + (vk - VK_F1));
+    if (vk >= VK_NUMPAD0 + 1 && vk <= VK_NUMPAD0 + 9) return (SDL_Scancode)(SDL_SCANCODE_KP_1 + (vk - VK_NUMPAD0 - 1));
+    switch (vk) {
+    case VK_NUMPAD0: return SDL_SCANCODE_KP_0;
+    case VK_BACK: return SDL_SCANCODE_BACKSPACE; case VK_TAB: return SDL_SCANCODE_TAB; case VK_RETURN: return SDL_SCANCODE_RETURN;
+    case VK_ESCAPE: return SDL_SCANCODE_ESCAPE; case VK_SPACE: return SDL_SCANCODE_SPACE;
+    case VK_LEFT: return SDL_SCANCODE_LEFT; case VK_UP: return SDL_SCANCODE_UP; case VK_RIGHT: return SDL_SCANCODE_RIGHT; case VK_DOWN: return SDL_SCANCODE_DOWN;
+    case VK_LSHIFT: return SDL_SCANCODE_LSHIFT; case VK_RSHIFT: return SDL_SCANCODE_RSHIFT;
+    case VK_LCONTROL: return SDL_SCANCODE_LCTRL; case VK_RCONTROL: return SDL_SCANCODE_RCTRL;
+    case VK_LMENU: return SDL_SCANCODE_LALT; case VK_RMENU: return SDL_SCANCODE_RALT;
+    case 0x21: return SDL_SCANCODE_PAGEUP; case 0x22: return SDL_SCANCODE_PAGEDOWN; case 0x23: return SDL_SCANCODE_END; case 0x24: return SDL_SCANCODE_HOME;
+    case 0x2D: return SDL_SCANCODE_INSERT; case 0x2E: return SDL_SCANCODE_DELETE; case 0x14: return SDL_SCANCODE_CAPSLOCK;
+    case 0xBA: return SDL_SCANCODE_SEMICOLON; case 0xBB: return SDL_SCANCODE_EQUALS; case 0xBC: return SDL_SCANCODE_COMMA;
+    case 0xBD: return SDL_SCANCODE_MINUS; case 0xBE: return SDL_SCANCODE_PERIOD; case 0xBF: return SDL_SCANCODE_SLASH;
+    case 0xC0: return SDL_SCANCODE_GRAVE; case 0xDB: return SDL_SCANCODE_LEFTBRACKET; case 0xDC: return SDL_SCANCODE_BACKSLASH;
+    case 0xDD: return SDL_SCANCODE_RIGHTBRACKET; case 0xDE: return SDL_SCANCODE_APOSTROPHE;
+    default: return SDL_SCANCODE_UNKNOWN;
+    }
+}
+SHORT GetAsyncKeyState(int vk) {                            /* 0x8000 = down now (from SDL's state of this window's keyboard / mouse) */
+    if (!g_hwnd) return 0;
+    if (vk >= VK_LBUTTON && vk <= VK_XBUTTON2 && vk != 3) {
+        static const int btn[7] = {0, SDL_BUTTON_LEFT, SDL_BUTTON_RIGHT, 0, SDL_BUTTON_MIDDLE, SDL_BUTTON_X1, SDL_BUTTON_X2};
+        return (SDL_GetMouseState(NULL, NULL) & SDL_BUTTON_MASK(btn[vk])) ? (SHORT)0x8000 : 0;
+    }
+    const bool *k = SDL_GetKeyboardState(NULL);
+    if (vk == VK_SHIFT) return k[SDL_SCANCODE_LSHIFT] || k[SDL_SCANCODE_RSHIFT] ? (SHORT)0x8000 : 0;
+    if (vk == VK_CONTROL) return k[SDL_SCANCODE_LCTRL] || k[SDL_SCANCODE_RCTRL] ? (SHORT)0x8000 : 0;
+    if (vk == VK_MENU) return k[SDL_SCANCODE_LALT] || k[SDL_SCANCODE_RALT] ? (SHORT)0x8000 : 0;
+    SDL_Scancode s = sc_of(vk);
+    return s != SDL_SCANCODE_UNKNOWN && k[s] ? (SHORT)0x8000 : 0;
+}
+int MessageBoxA(HWND h, LPCSTR text, LPCSTR caption, UINT type) {
+    (void)h;
+    SDL_MessageBoxButtonData yes_no[2] = {{SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT, IDYES, "Yes"}, {SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT, IDNO, "No"}};
+    SDL_MessageBoxButtonData ok[1] = {{SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT | SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT, IDOK, "OK"}};
+    int yn = (type & 0xF) == MB_YESNO;
+    SDL_MessageBoxData d = {(type & 0xF0) == MB_ICONWARNING ? SDL_MESSAGEBOX_WARNING : (type & 0xF0) == 0x10 ? SDL_MESSAGEBOX_ERROR : SDL_MESSAGEBOX_INFORMATION,
+                            NULL, caption ? caption : "B2recomp", text ? text : "", yn ? 2 : 1, yn ? yes_no : ok, NULL};
+    int id = yn ? IDNO : IDOK;
+    if (!SDL_ShowMessageBox(&d, &id)) printf("message box: %s: %s\n", caption ? caption : "", text ? text : "");
+    return id;
+}
+int MessageBoxW(HWND h, LPCWSTR text, LPCWSTR caption, UINT type) {
+    char t[2048] = "", c[256] = "";
+    if (text) WideCharToMultiByte(CP_UTF8, 0, text, -1, t, sizeof t, NULL, NULL);
+    if (caption) WideCharToMultiByte(CP_UTF8, 0, caption, -1, c, sizeof c, NULL, NULL);
+    return MessageBoxA(h, t, c, type);
+}
+#endif
 
 /* Signals the guest's vsync event 60 times per second. */
 static DWORD WINAPI vsync_thread(LPVOID arg) {
