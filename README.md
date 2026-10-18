@@ -42,8 +42,15 @@ the **builder package**: the same source plus the free tools the build needs, so
   [BUILDING.md](BUILDING.md#what-you-extract-from-your-own-console)). The build checks that it is exactly that version
   and explains a mismatch. Encrypted packages (`.nsp`, `.xci`, `.nca`, ...) are refused: this project decrypts nothing
   and reads no keys.
-- Windows 10/11 x64 and a GPU with a Vulkan 1.3 driver. AMD RX 400/500 cards (Polaris) run on a fallback path that is new
-  and not yet confirmed on a real card: a log from one is welcome.
+- Windows 10/11 x64 and a GPU with a Vulkan 1.3 driver. A Linux version is in testing (the Linux builder on the
+  **Releases** page, with its own `START HERE.txt`).
+- **AMD Radeon RX 400 / 500 cards (Polaris):** AMD's Windows driver for these cards lacks Vulkan features that
+  B2recomp's renderer normally uses (dynamic vertex input and pipeline libraries), and it offers no mailbox vsync.
+  B2recomp works around that on Windows: the game runs (confirmed on an RX 560), but its first runs build more shaders
+  while you play, so expect short hitches until they are cached, and vsync waits for the screen (FIFO). This is the
+  driver, not your card: on **Linux** the Mesa driver (RADV) has all of these features, so the same card runs the full
+  renderer there. If you have Linux on that PC, the Linux version is the better choice for these cards. (Their speed
+  in fights is often set by the processor these PCs have: a 4-core CPU from around 2013 gives a steady 30 fps there.)
 - With the builder package: nothing else. From the source alone: Python 3.10+ and the free tools listed in
   [BUILDING.md](BUILDING.md#what-you-need-on-your-pc).
 

@@ -45,6 +45,14 @@ Playing
 - Your saves are in build-linux/play/userdata/
 - To play without the launcher, run scripts/play.sh
 
+AMD Radeon RX 400 / 500 cards (Polaris)
+- These cards run the full renderer on Linux. On Windows, AMD's driver for them lacks Vulkan features B2recomp
+  normally uses (dynamic vertex input, pipeline libraries, mailbox vsync), so the Windows version has to take a slower
+  path there (more shader building while you play, short hitches). The Mesa driver on Linux (RADV) has all of them:
+  just keep Mesa up to date (Arch: vulkan-radeon; Ubuntu / Debian / Fedora: mesa-vulkan-drivers).
+- In fights their speed is often set by the processor of these PCs: a 4-core CPU from around 2013 gives a steady
+  30 fps there (menus and cutscenes stay at 60).
+
 Steam Deck
 - Do steps 1 to 4 in Desktop Mode.
 - To play in Game Mode: in Desktop Mode open Steam, choose Games > "Add a Non-Steam Game to My Library...",
