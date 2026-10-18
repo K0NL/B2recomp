@@ -43,11 +43,12 @@ static const char *const k_default_ini =
 ";            each frame is on screen for exactly the same time. No tearing. The game runs at refresh / k frames per\r\n"
 ";            second (59.94 on a 119.88 Hz panel). Falls back to 'clock' when the rate is not a multiple of 60.\r\n"
 ";   clock:   the program's own 60.000 Hz clock; a finished frame is shown at the next tick of that clock (mailbox when\r\n"
-";            the GPU offers it, else immediate). On a display that is not 60 / 120 / 240 Hz some frames stay on screen\r\n"
+";            the GPU offers it, else FIFO: no tearing). On a display that is not 60 / 120 / 240 Hz some frames stay on screen\r\n"
 ";            one refresh longer than others: that cannot be avoided there.\r\n"
 ";   off:     immediate presentation as soon as a frame is ready, tearing allowed. Lowest latency. Still 60 frames per second.\r\n"
-";   on:      the swapchain's own vertical sync (FIFO) next to the program's clock: two clocks, not recommended.\r\n"
-";   mailbox: as clock, mailbox or nothing.\r\n"
+";   on:      the swapchain's own vertical sync (FIFO) next to the program's clock: two clocks, not recommended. (auto,\r\n"
+";            display and clock use FIFO too on a GPU without mailbox, e.g. AMD on Windows.)\r\n"
+";   mailbox: as clock; FIFO when the GPU has no mailbox.\r\n"
 "vsync = auto\r\n"
 "\r\n"
 "; latency = normal | low | lowest      (track L1, input latency; Vulkan)\r\n"
@@ -124,7 +125,7 @@ static const char *const k_default_ini =
 ";   real time and the frame rate is capped at this value; its timers that count frames are converted to game time\r\n"
 ";   (scripts/fps_patch.py, notes/fps-research.md). Not every frame counter is converted yet: some effects, menus and\r\n"
 ";   button-mash prompts may run faster than at 60, and the cinematics run in real time. vsync = clock / display /\r\n"
-";   auto still show each frame at once above 60 (no tearing where the GPU offers mailbox).\r\n"
+";   auto still show each frame at once above 60 (no tearing: mailbox, else FIFO, which shows at most one frame per refresh).\r\n"
 "frame_rate = 60\r\n";
 
 #define GFX_LOW_SCALE 0.5f
