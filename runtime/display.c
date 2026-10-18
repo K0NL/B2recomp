@@ -80,6 +80,7 @@ static volatile LONG g_vb_state;                       /* 0 not started, 1 measu
 static int g_pace_want = -1;                           /* 0 clock, 1 display lock when the refresh rate allows */
 static int g_hold_on = -1;                             /* present at the tick */
 static volatile LONG g_lock_k;                         /* display lock: refreshes per game frame, 0 = our own clock */
+static volatile LONG64 g_lock_drops, g_lock_relocks;   /* [Recomps#1] finding 122: lock lost after a vblank gap / taken again */
 static double g_lock_phase = 0.5;                      /* the tick's place between two vblanks */
 static volatile LONG64 g_hold_target;                  /* tick the planned present waits for, 0 = present at once */
 static volatile LONG64 g_defer_target;                 /* a finished frame is kept on the render thread for this tick (display_present_defer) */
@@ -170,9 +171,13 @@ static DWORD WINAPI vblank_thread(LPVOID arg) {
     LARGE_INTEGER now;
     LONGLONG prev = 0, first[24];
     int nfirst = 0, fails = 0;
+    LONGLONG gap_at = 0;                                                   /* TEST (finding 122): SSBU_VBLANK_GAP=<s>,<ms> = no vblank seen for <ms> once, <s> after start */
+    int gap_ms = 0;
+    { const char *e = getenv("SSBU_VBLANK_GAP"); if (e) { double s = atof(e); const char *c = strchr(e, ','); gap_ms = c ? atoi(c + 1) : 0; QueryPerformanceCounter(&now); if (s > 0 && gap_ms > 0) gap_at = now.QuadPart + (LONGLONG)(s * (double)g_freq.QuadPart); } }
     for (;;) {
         LONG st = wait_vblank(&wv);
         QueryPerformanceCounter(&now);
+        if (gap_at && now.QuadPart >= gap_at) { gap_at = 0; printf("display: SSBU_VBLANK_GAP: the vblank thread stops for %d ms (a test)%c", gap_ms, 10); Sleep((DWORD)gap_ms); QueryPerformanceCounter(&now); }
         if (st != 0) { if (++fails == 20) { printf("display: the vblank wait fails (status 0x%lx): display lock off%c", (unsigned long)st, 10); InterlockedExchange(&g_vb_state, -1); return 0; } Sleep(50); prev = 0; continue; }
         fails = 0;
         LONGLONG dt = prev ? now.QuadPart - prev : 0;
@@ -385,6 +390,9 @@ static DWORD WINAPI vsync_thread(LPVOID arg) {
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
         int lock_tried = 0;
         LONG64 vb_last = 0;
+        LONG relock_k = 0;                                                     /* finding 122: the lock a vblank gap took away, to be taken again */
+        LONG64 relock_vb = 0;
+        LARGE_INTEGER relock_t = {0};
         pace_options();
         display_perf_thread();
         for (;;) {
@@ -402,11 +410,15 @@ static DWORD WINAPI vsync_thread(LPVOID arg) {
                 while (g_vb_count < vb_target && timeouts < 5) if (!SleepConditionVariableSRW(&g_vb_cv, &g_vb_lock, 20, 0)) timeouts++;
                 vc = g_vb_count; vq = g_vb_qpc; period = g_vb_period;
                 ReleaseSRWLockExclusive(&g_vb_lock);
-                if (vc < vb_target) {                                              /* no vblank for 100 ms (display off, mode change): our clock goes on from here */
-                    printf("display: no vblank for 100 ms: display lock off, our own 60 Hz clock goes on%c", 10);
+                if (vc < vb_target) {                                              /* no vblank for 100 ms (display off, mode change, a stall): our clock goes on */
                     InterlockedExchange(&g_lock_k, 0);
                     QueryPerformanceCounter(&now);
                     t0.QuadPart = now.QuadPart - n * g_freq.QuadPart / 60;
+                    /* finding 122: not for the rest of the run (a player's RX 560 lost it once, 1,200 frames in, and ran 59.79 Hz
+                     * against our 60.000 Hz clock from there): it is taken again after a second of regular vblanks */
+                    relock_k = (LONG)k; relock_vb = vc; relock_t = now;
+                    if (InterlockedIncrement64(&g_lock_drops) <= 20)
+                        printf("display: no vblank for 100 ms: display lock off, our own 60 Hz clock goes on until the vblanks are regular again%c", 10);
                     continue;
                 }
                 LONG64 extra = (vc - vb_target) / k;                               /* whole game frames this thread slept through */
@@ -424,6 +436,21 @@ static DWORD WINAPI vsync_thread(LPVOID arg) {
             if (passed < n + 1) passed = n + 1;
             if (passed > n + 1) InterlockedExchangeAdd64(&g_vsync_late, passed - (n + 1));
             n = passed;
+            if (relock_k && now.QuadPart - relock_t.QuadPart >= g_freq.QuadPart) {      /* finding 122: a second since the gap or the last look */
+                LONG64 vcount;
+                double per;
+                AcquireSRWLockExclusive(&g_vb_lock);
+                vcount = g_vb_count; per = g_vb_period;
+                ReleaseSRWLockExclusive(&g_vb_lock);
+                double expect = per > 0 ? (double)(now.QuadPart - relock_t.QuadPart) / per : 0;
+                if (expect > 0 && (double)(vcount - relock_vb) >= expect * 0.9) {      /* the vblanks came at the rate measured at start: lock again */
+                    vb_last = vcount;
+                    InterlockedExchange(&g_lock_k, relock_k);
+                    if (InterlockedIncrement64(&g_lock_relocks) <= 20)
+                        printf("display: the vblanks are regular again: display lock on (%ld refreshes per game frame)%c", (long)relock_k, 10);
+                    relock_k = 0;
+                } else { relock_vb = vcount; relock_t = now; }
+            }
             }
             if (g_vsync_event) { os_signal_event(g_vsync_event); InterlockedIncrement64(&g_vsync_signals); }
             AcquireSRWLockExclusive(&g_vsync_lock);
@@ -965,8 +992,8 @@ void display_report(FILE *out) {
     fprintf(out, "display: %s; %lld vsync signals, %lld refreshes slept through by the vsync thread\n", old_pacing() ? "old pacing (SSBU_OLD_PACING=1: two clocks)" : "one refresh clock", (long long)g_vsync_signals, (long long)g_vsync_late);
     if (g_pc_n > 0) fprintf(out, "display: the game's thread was on an EFFICIENCY core at %lld of %lld presents (%s)\n", (long long)g_pc_frames_slow, (long long)g_pc_frames, g_pc_on ? "performance cores asked for" : "SSBU_PCORES=0: left to the system");
     if (g_vb_state == 2) {
-        fprintf(out, "display: refresh %.3f Hz measured; %s; presents held for their tick %lld, late frames presented at once %lld\n", (double)g_freq.QuadPart / g_vb_period,
-                g_lock_k ? "DISPLAY LOCK (the tick is the display's vblank)" : "our own 60.000 Hz clock", (long long)g_hold_n, (long long)g_hold_late);
+        fprintf(out, "display: refresh %.3f Hz measured; %s; presents held for their tick %lld, late frames presented at once %lld; display lock lost after a vblank gap %lld times, taken again %lld times\n", (double)g_freq.QuadPart / g_vb_period,
+                g_lock_k ? "DISPLAY LOCK (the tick is the display's vblank)" : "our own 60.000 Hz clock", (long long)g_hold_n, (long long)g_hold_late, (long long)g_lock_drops, (long long)g_lock_relocks);
         pace_stat_line(out, "all frames", 0, 0);
         pace_stat_line(out, "fight frames", 1, 0);
         fprintf(out, "display-timing: presents by tenth of a refresh after the vblank before them: %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld\n", (long long)g_ps_phase[0], (long long)g_ps_phase[1], (long long)g_ps_phase[2], (long long)g_ps_phase[3],
