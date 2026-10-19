@@ -208,7 +208,7 @@ static Setting g_s[S_COUNT] = {
     [S_WIDTH]    = { F_GFX, "width", K_NUM, .nlo = 320, .nhi = 16384, .def = "1280", .label = L"Window size" },
     [S_HEIGHT]   = { F_GFX, "height", K_NUM, .nlo = 180, .nhi = 16384, .def = "720" },
     [S_VSYNC]    = { F_GFX, "vsync", K_COMBO, OPTS(o_vsync), 2, .def = "auto", .label = L"Vertical sync",
-                     .tip = L"Auto: 'display' on a 60, 120 or 240 Hz monitor, else the program's own 60 Hz clock. Off: tearing allowed, lowest latency." },
+                     .tip = L"Auto: 'display' on a 60, 120 or 240 Hz monitor (the program's clock while its refresh drifts: G-Sync / FreeSync), else the program's own 60 Hz clock. Off: tearing allowed, lowest latency." },
     [S_LATENCY]  = { F_GFX, "latency", K_COMBO, OPTS(o_latency), 0, .def = "normal", .label = L"Input latency",
                      .tip = L"Low: the controller is read 2-5 ms later, closer to the screen. Lowest: about 4 ms less again, but frames no longer last the same time." },
     [S_SCALE]    = { F_GFX, "resolution_scale", K_SLIDER, .lo = 0.5, .hi = 3.0, .step = 0.05, .def = "1.0", .label = L"Resolution scale",
