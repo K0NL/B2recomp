@@ -887,6 +887,7 @@ static volatile LONG g_in_fight;                   /* nvn_vk_m4.c (included furt
 static VTex *vt_get2(Tex *t, int sync) {
     VTex *vt = t->vk;
     LONG64 tu0 = 0, ub0 = R.upload_bytes;
+    int clear_last = 0;                            /* TEST ONLY: SSBU_VK_CLEARLAST (finding 130) */
     if (!vt) {
         tu0 = tk();
         TexBuilder *b = &t->b;
@@ -939,6 +940,14 @@ static VTex *vt_get2(Tex *t, int sync) {
             if (vt->samples == 1) {
                 if (can_color) { VkClearColorValue z; memset(&z, 0, sizeof z); vkCmdClearColorImage(R.cmd, vt->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &z, 1, &sr); }
                 else { VkClearDepthStencilValue z = {0.0f, 0}; vkCmdClearDepthStencilImage(R.cmd, vt->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &z, 1, &sr); }
+                /* [Recomps#1] finding 130: the clear and the texels copied in next (vt_put, rs_upload, a copy into the image) are
+                 * two transfer writes in the same layout, which vt_layout does not separate: without this barrier the order is
+                 * undefined. NVIDIA ran them in order; on an AMD RX 6950 XT the clear won: the game's RGBA8 textures (the
+                 * tutorial's combo icons, the letters of the button icons, the colour of the health bars) read as zero, while
+                 * block-compressed ones (never cleared: not renderable) drew. SSBU_VK_CLEARLAST=1 (test) clears such an image
+                 * again after its first upload: the picture an unordered clear gives, on any GPU. */
+                if (getenv("SSBU_VK_CLEARLAST") && atoi(getenv("SSBU_VK_CLEARLAST")) && can_color) clear_last = 1;
+                else image_barrier(vt->img, vt->aspect, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
             }
         }
     }
@@ -949,6 +958,13 @@ static VTex *vt_get2(Tex *t, int sync) {
         cmd_begin();
         if (!nvn_front_tex_read(t, vt->decode, vt_put)) { static int n; if (n++ < 20) printf("nvn_vk: texture %dx%d format 0x%x: its memory is not readable; not uploaded\n", t->b.width, t->b.height, t->b.format); }
         R.uploads++;
+    }
+    if (clear_last) {                              /* TEST ONLY (SSBU_VK_CLEARLAST, above): the creation clear lands after the upload */
+        VkImageSubresourceRange sr = {vt->aspect, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
+        VkClearColorValue z; memset(&z, 0, sizeof z);
+        pass_end(); cmd_begin(); vt_layout(vt, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        image_barrier(vt->img, vt->aspect, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        vkCmdClearColorImage(R.cmd, vt->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &z, 1, &sr);
     }
     if (tu0 && !g_ta_inside) {                     /* made or read again at its use (a draw, a copy, a target): the frame pays */
         LONG64 d = tk() - tu0;
@@ -1549,6 +1565,7 @@ static int g_ptm_on = -1;                          /* [Recomps#1] SSBU_VK_PREPTI
 const LONG64 *nvn_front_ww_times(void);            /* nvn_gl.c */
 static LONG64 g_ptr[4], g_ptr_n;                   /* its split of resolve_sampler: handle, image, view + layout, sampler; samplers resolved */
 static int shlog_on(void);                         /* [Recomps#1] TEST ONLY: SSBU_VK_SHLOG (above exec) */
+static int drawlog_on(void);                       /* [Recomps#1] TEST ONLY: SSBU_VK_DRAWLOG (below) */
 /* The image view and sampler of one declared sampler of stage s. May end the pass (upload, layout change). */
 static void resolve_sampler(int s, VStage *v, int i) {
     unsigned u = v->smp[i].unit;
@@ -1579,6 +1596,9 @@ static void resolve_sampler(int s, VStage *v, int i) {
             if (n++ < 20) printf("nvn_vk: texture unit %u of the %s stage: the shader declares view kind %d, the texture is kind %d (target %d, %d samples): a dummy is bound\n", u, s ? "fragment" : "vertex", dim, have, e.target, vt->samples); }
         if (g_ptm_on > 0) { LONG64 x = tk(); g_ptr[2] += x - rt0; rt0 = x; }
         if (r & 2) g_dtex[g_ndtex].smp = sampler_get(&sp);
+        if (drawlog_on()) printf("DLT s%d u%u tex=%p fmt=0x%x %dx%dx%d lv=%d tgt=%d view(fmt=0x%x lvl0=%d nlvl=%d swz=%d%d%d%d) dim=%d have=%d ok=%d rs=%d smp=%d min=%u mag=%u wrap=%u,%u,%u lod=%g..%g bias=%g aniso=%g cmode=%u border=%g,%g,%g,%g\n",
+                               s, u, (void *)t, t->b.format, t->b.width, t->b.height, t->b.depth, nvn_front_tex_levels(t), t->b.target, e.format, e.lvl0, e.nlvl, e.swz[0], e.swz[1], e.swz[2], e.swz[3], dim, have, ok, vt->rs,
+                               (r & 2) != 0, sp.min, sp.mag, sp.ws, sp.wt, sp.wr, sp.lodmin, sp.lodmax, sp.bias, sp.aniso, sp.cmode, sp.border[0], sp.border[1], sp.border[2], sp.border[3]);      /* TEST ONLY: SSBU_VK_DRAWLOG */
         if (t->b.width == 1024 && t->b.height == 2048 && shlog_on()) {      /* [Recomps#1] TEST ONLY: SSBU_VK_SHLOG */
             static long long fr; static int nf;
             if (fr != nvn_front_frame_next()) { fr = nvn_front_frame_next(); nf = 0; }
@@ -1590,6 +1610,15 @@ static void resolve_sampler(int s, VStage *v, int i) {
     g_ndtex++; g_ptr_n++;
 }
 static int have_targets_live(void);
+/* [Recomps#1] TEST ONLY (finding 130): SSBU_VK_DRAWLOG=<first>,<last>: in those frames (nvn_front_frame_next) every draw prints
+ * a "DLD" line (programs, blend, depth-stencil, alpha test, uniform ranges, target) after "DLT" lines of its textures. */
+static int drawlog_on(void) {
+    static long long a = -2, b;
+    if (a == -2) { const char *e = getenv("SSBU_VK_DRAWLOG"); a = -1; if (e) { a = atoll(e); b = strchr(e, ',') ? atoll(strchr(e, ',') + 1) : a; } }
+    if (a < 0) return 0;
+    long long f = nvn_front_frame_next();
+    return f >= a && f <= b;
+}
 /* Track O: a rectangle of the game's pixels (scissor, clear) on the scaled images of the pass: every image pixel the
  * rectangle touches (floor of the first edge, ceiling of the last). */
 /* [Recomps#1] finding 83: in double and clamped before the conversion to int. Bayonetta 2 clears its depth with the scissor
@@ -2503,6 +2532,23 @@ static int draw_prepare(unsigned prim) {
         vkCmdPushConstants(R.cmd, p->layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 16, pc);
     }
     PT(10);
+    if (drawlog_on()) {                            /* TEST ONLY: SSBU_VK_DRAWLOG */
+        static long long n, fr;
+        if (fr != nvn_front_frame_next()) { fr = nvn_front_frame_next(); n = 0; }
+        printf("DLD f%lld #%lld prim=%u vs=#%d fs=#%d vsrc=%016llx fsrc=%016llx nattr=%d vattr=", fr, n++, prim, R.prog[0] ? R.prog[0]->serial : -1, R.prog[1] ? R.prog[1]->serial : -1,
+               (unsigned long long)vs->h, fs ? (unsigned long long)fs->h : 0ull, R.nattr);
+        for (int i = 0; i < R.nattr && i < 16; i++) printf("%x:%u%s", R.vattr[i] & 0xff, (R.vattr[i] >> 14) & 0xffff, i + 1 < R.nattr ? "," : "");
+        printf(" ds=%llx blend_on=%x b0=%u,%u,%u,%u,%u,%u logic=%u chanmask=%x alpha=%d,%g poly=%u,%u,%u,%u pass=%dx%d rs=%d ncol=%d cfmt=0x%x depth=%d dfmt=0x%x vp=%g,%g,%g,%g sc=%d,%d,%d,%d(%d) ubo=",
+               (unsigned long long)R.ds, R.blend_on, R.blend[0][0], R.blend[0][1], R.blend[0][2], R.blend[0][3], R.blend[0][4], R.blend[0][5], R.logic, R.chanmask, R.alpha_func, R.alpha_ref,
+               R.poly[0], R.poly[1], R.poly[2], R.poly[3], R.pass_w, R.pass_h, R.pass_rs, R.ncol, R.ncol && R.col[0].tex ? R.col[0].tex->b.format : 0, R.depth.tex != NULL, R.depth.tex ? R.depth.tex->b.format : 0,
+               R.viewport[0], R.viewport[1], R.viewport[2], R.viewport[3], R.scissor[0], R.scissor[1], R.scissor[2], R.scissor[3], R.have_scissor);
+        for (int s = 0; s < (fs ? 2 : 1); s++) { VStage *v = s ? fs : vs; Stage *st = &R.prog[s]->st[s];
+            for (int k = 1; k < 18; k++) if (v->cbufs >> k & 1) {
+                if (k == 1) printf("%c1:code+%x ", s ? 'f' : 'v', st->ctl[3]);
+                else if (k == 2) printf("%c2:c2 ", s ? 'f' : 'v');
+                else printf("%c%d:%llx+%llx ", s ? 'f' : 'v', k, (unsigned long long)R.ubo[s][k - 3].addr, (unsigned long long)R.ubo[s][k - 3].size); } }
+        printf("\n");
+    }
     return 1;
 }
 
