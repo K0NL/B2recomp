@@ -14,6 +14,9 @@ frame_rate (runtime/gfx_options.c sets the variables below for 61..120) or from 
     the step to an accumulator and the tick is 1 when a whole 60 Hz frame is due, else 0 (always 1 with a step >= 1, so
     60 fps and slower behave as the original). RECOMPS_FPS_TICKS=0 keeps the counters per pass (for comparisons);
   - RECOMPS_UNCAP_LOG=1: a line per 600 clock updates (step mean / min / max, ticks).
+  - a cinematic's shot and scene changes (0x7100e322e8, 0x7100e32758) keep their game time: the hold on a shot's last
+    keyframe lasts as long as at 30 fps instead of one update (finding 129: the pictures ran ahead of the voices);
+    RECOMPS_CINE_FIX=0 = the game's own.
 The patched files include their helpers after '#include "funcs.h"'; funcs.h gains 'extern int recomps_fps_tick;'.
 """
 import os, re, shutil, sys
@@ -59,6 +62,56 @@ static void uncap_tick(float step) {
                 fflush(stdout); sum = 0; mn = 99; mx = 0; ticks = 0; } } }
 }
 '''
+CINE = r'''
+/* [fps_patch.py] finding 129: a cinematic's shots above 60 fps. 0x7100e322e8 moves the shot position (shot i, frame f)
+ * by the step; at the end of a shot it holds f at length - k (k = 2 while the game asks for 30 fps) and switches to frame
+ * 0 of the next shot one update later; on the scene's last shot 0x7100e32758 reports the end as soon as f is at
+ * length - k, and the next scene starts one update later. One update is 33 ms at 30 fps and 8 ms at 120: every shot and
+ * scene change gained up to 1.5 frames and the pictures ran ahead of the voices. Here the hold lasts k frames of game time
+ * (what is left over carries into the next shot): the same as before at 30 fps. RECOMPS_CINE_FIX=0: the game's own (tests). */
+static int cine_fix_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("RECOMPS_CINE_FIX"); v = uncap_on() && (!e || atoi(e)); } return v; }
+static struct { uint64_t cur; int32_t shot; float excess, delta; } cine_st[8];     /* per position: the hold so far, the last step */
+static int cine_slot(uint64_t cur, int add) {
+    int s;
+    for (s = 0; s < 8 && cine_st[s].cur != cur; s++) {}
+    if (s < 8 || !add) return s < 8 ? s : -1;
+    for (s = 0; s < 8 && cine_st[s].cur; s++) {}
+    if (s == 8) s = 0;
+    cine_st[s].cur = cur; cine_st[s].shot = -1; cine_st[s].excess = cine_st[s].delta = 0;
+    return s;
+}
+/* where the frame would be without the hold, after this update's step (fc = now, fn = after the step, lim = length - k) */
+static double cine_hold(int s, int32_t i, float fc, float fn, float lim) {
+    double t = (fc >= lim && cine_st[s].shot == i ? (double)lim + cine_st[s].excess : (double)fc) + ((double)fn - (double)fc);
+    cine_st[s].shot = i; cine_st[s].excess = (float)(t - lim); cine_st[s].delta = fn - fc;
+    return t;
+}
+static void cine_shot_end(Ctx *c) {         /* a next shot exists: x20 = the position, x19 = the next one, x23 = shot + 1,
+                                               x21 = k; v0 = the next frame (>= v1), v1 = length - k */
+    uint64_t cur = c->x[20], nxt = c->x[19];
+    float fc = uncap_f(cur + 4), lim = c->v[1].f[0], out;
+    int s = cine_slot(cur, 1);
+    double t = cine_hold(s, (int32_t)rd32(cur), fc, c->v[0].f[0], lim), k = (double)(int32_t)(uint32_t)c->x[21];
+    if (t < (double)lim + k) out = lim;
+    else { wr32(nxt, (uint32_t)c->x[23]); out = (float)(t - lim - k); cine_st[s].shot = (int32_t)c->x[23]; cine_st[s].excess = 0; }
+    uint32_t b; memcpy(&b, &out, 4); wr32(nxt + 4, b);
+}
+static void cine_last_hold(Ctx *c) {        /* the scene's last shot: x20 = the position, v0 = length - k, v1 = the next frame */
+    uint64_t cur = c->x[20];
+    cine_hold(cine_slot(cur, 1), (int32_t)rd32(cur), uncap_f(cur + 4), c->v[1].f[0], c->v[0].f[0]);
+}
+static int cine_end_early(Ctx *c) {         /* 0x7100e32758, f at length - k: x20 = the position, x11 = length, x10 = length - k */
+    uint64_t cur = c->x[20];
+    int s = cine_slot(cur, 0);
+    if (s < 0 || cine_st[s].shot != (int32_t)rd32(cur)) return 0;
+    return (double)cine_st[s].excess + cine_st[s].delta < (double)((int32_t)(uint32_t)c->x[11] - (int32_t)(uint32_t)c->x[10]) - 1e-3;
+}
+'''
+CINE_HOOKS = [                              # (label, code put before it); the three functions are in one file
+    ('L_7100e3242c: fcmp', 'if (cine_fix_on() && c->v[0].f[0] >= c->v[1].f[0]) { cine_shot_end(c); goto L_7100e3244c; }'),
+    ('L_7100e32408: fcmp', 'if (cine_fix_on() && c->v[1].f[0] >= c->v[0].f[0]) cine_last_hold(c);'),
+    ('L_7100e327d0: c->x[20] =', 'if (cine_fix_on() && cine_end_early(c)) goto L_7100e32854;'),
+]
 
 
 def find_file(gen, fn):
@@ -178,6 +231,11 @@ def main():
     present_file = name
     name, ls = lines_of('7100dc4f4c')
     replace_once(ls, 'L_7100dc4f60: {', 'if (uncap_on()) c->x[8] = 0;\nL_7100dc4f60: {')
+    # a cinematic's shot changes (finding 129): the end of a shot keeps its game time
+    name, ls = lines_of('7100e322e8')
+    for lab, hook in CINE_HOOKS:
+        replace_once(ls, lab, hook + '\n' + lab)
+    cine_file = name
     # the counters
     done = 0
     for fn, lab, kind in sites:
@@ -198,7 +256,7 @@ def main():
         src = os.path.join(gen, fname)
         if fname in files:
             text = '\n'.join(files[fname])
-            extra = HELP + (LIMIT if fname == present_file else '') + (TICK if fname == clock_file else '')
+            extra = HELP + (LIMIT if fname == present_file else '') + (TICK if fname == clock_file else '') + (CINE if fname == cine_file else '')
             assert text.count('#include "funcs.h"\n') == 1, fname
             write(os.path.join(out, fname), text.replace('#include "funcs.h"\n', '#include "funcs.h"\n' + extra, 1))
         elif fname == 'funcs.h':
@@ -215,7 +273,7 @@ def main():
             dst = os.path.join(out, fname)
             if not os.path.exists(dst) or os.path.getmtime(dst) < os.path.getmtime(src) or os.path.getsize(dst) != os.path.getsize(src):
                 shutil.copy2(src, dst)
-    print('patched %d counters in %d files (+ clock, present); out: %s' % (done, len(files), out))
+    print('patched %d counters in %d files (+ clock, present, cinematic shots); out: %s' % (done, len(files), out))
 
 
 if __name__ == '__main__':
