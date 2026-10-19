@@ -1209,3 +1209,153 @@ void GetSystemInfo(SYSTEM_INFO *si) {
     si->lpMinimumApplicationAddress = (void *)(uintptr_t)0x10000;
     si->lpMaximumApplicationAddress = (void *)(uintptr_t)0x7ffffffeffff;
 }
+
+/* ---- [Recomps#1] the freeze watchdog's thread report on Linux (nvn_vk_wd.c; windows.h: LxThread). Windows suspends a thread
+ * and unwinds it from outside; here each thread records its own call stack in a signal handler (SIGRTMIN + 7, sent to that
+ * one thread with tgkill; SA_RESTART, so a wait it interrupts goes on), with glibc's backtrace() and the unwind tables of
+ * the program and game.so. What it waits for comes from /proc/self/task/<tid>: state, kernel wait channel, the system call
+ * it is in and its first argument (a futex address). */
+#include <execinfo.h>
+#include <elf.h>
+static struct { volatile pid_t tid; volatile int seq, done, n; uint64_t rip; void *pc[64]; } g_stk;
+static int lx_read_small(const char *path, char *out, size_t n);
+static void stk_handler(int sig, siginfo_t *si, void *ucv) {
+    int e = errno;
+    (void)sig; (void)si;
+    if ((pid_t)syscall(SYS_gettid) == g_stk.tid) {
+        int seq = g_stk.seq;
+        void *pc[64];
+        int n = backtrace(pc, 64);
+        if (g_stk.seq == seq && !g_stk.done) {
+            g_stk.rip = (uint64_t)((ucontext_t *)ucv)->uc_mcontext.gregs[REG_RIP];
+            memcpy(g_stk.pc, pc, sizeof pc); g_stk.n = n;
+            __atomic_store_n(&g_stk.done, 1, __ATOMIC_RELEASE);
+        }
+    }
+    errno = e;
+}
+int lx_thread_stack(DWORD tid, uint64_t *pcs, int max) {
+    static pthread_mutex_t lk = PTHREAD_MUTEX_INITIALIZER;
+    static int sig;
+    int n = -2;
+    pthread_mutex_lock(&lk);
+    if (!sig) {
+        struct sigaction sa;
+        void *w[4];
+        memset(&sa, 0, sizeof sa);
+        sa.sa_sigaction = stk_handler; sa.sa_flags = SA_SIGINFO | SA_RESTART; sigemptyset(&sa.sa_mask);
+        sig = sigaction(SIGRTMIN + 7, &sa, NULL) ? -1 : SIGRTMIN + 7;
+        backtrace(w, 4);                                  /* glibc loads its unwinder at the first call: here, never in the handler */
+    }
+    if (sig < 0) { pthread_mutex_unlock(&lk); return -3; }
+    {   /* a thread that blocks the signal (the threads of Mesa, PulseAudio ...) would not answer: not asked (no 200 ms wait each) */
+        char p[64], b[2048];
+        const char *q;
+        unsigned long long blk = 0;
+        snprintf(p, sizeof p, "/proc/self/task/%lu/status", (unsigned long)tid);
+        if (lx_read_small(p, b, sizeof b) && (q = strstr(b, "SigBlk:")) != NULL && sscanf(q + 7, "%llx", &blk) == 1 && (blk >> (sig - 1) & 1)) { pthread_mutex_unlock(&lk); return -4; }
+    }
+    g_stk.done = 0; g_stk.n = 0; g_stk.seq++; g_stk.tid = (pid_t)tid;
+    if (syscall(SYS_tgkill, getpid(), (pid_t)tid, sig)) { g_stk.tid = 0; pthread_mutex_unlock(&lk); return -1; }
+    for (int i = 0; i < 200 && !__atomic_load_n(&g_stk.done, __ATOMIC_ACQUIRE); i++) { struct timespec ts = {0, 1000000}; nanosleep(&ts, NULL); }
+    if (__atomic_load_n(&g_stk.done, __ATOMIC_ACQUIRE)) {
+        int s = -1;
+        for (int i = 0; i < g_stk.n; i++) if ((uint64_t)(uintptr_t)g_stk.pc[i] == g_stk.rip) { s = i; break; }      /* the frames before it: the handler and the signal trampoline */
+        n = 0;
+        if (s < 0) { if (max > 0) pcs[n++] = g_stk.rip; s = 3; }
+        for (int i = s; i < g_stk.n && n < max; i++) pcs[n++] = (uint64_t)(uintptr_t)g_stk.pc[i];
+    }
+    g_stk.tid = 0;                                         /* a late handler (a thread that blocked the signal) records nothing */
+    pthread_mutex_unlock(&lk);
+    return n;
+}
+static int lx_read_small(const char *path, char *out, size_t n) {
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    ssize_t k = fd >= 0 ? read(fd, out, n - 1) : -1;
+    if (fd >= 0) close(fd);
+    if (k < 0) { out[0] = 0; return 0; }
+    out[k] = 0;
+    while (k > 0 && (out[k - 1] == '\n' || out[k - 1] == ' ')) out[--k] = 0;
+    return 1;
+}
+int lx_thread_read(LxThread *t) {
+    char p[96], b[512];
+    snprintf(p, sizeof p, "/proc/self/task/%lu/stat", (unsigned long)t->tid);
+    if (!lx_read_small(p, b, sizeof b)) return 0;
+    const char *o = strchr(b, '('), *c = strrchr(b, ')');
+    if (o && c && c > o) { size_t l = (size_t)(c - o - 1); if (l >= sizeof t->comm) l = sizeof t->comm - 1; memcpy(t->comm, o + 1, l); t->comm[l] = 0; }
+    if (c) {                                               /* after the name: state ppid pgrp session tty tpgid flags minflt cminflt majflt cmajflt utime stime cutime cstime priority nice */
+        unsigned long long ut = 0, st = 0; long pri = 0, ni = 0;
+        sscanf(c + 2, "%c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %llu %llu %*d %*d %ld %ld", &t->state, &ut, &st, &pri, &ni);
+        t->nice = (int)ni;
+        t->cpu_ns = (ut + st) * (1000000000ull / (unsigned long long)sysconf(_SC_CLK_TCK));
+    }
+    snprintf(p, sizeof p, "/proc/self/task/%lu/schedstat", (unsigned long)t->tid);      /* nanoseconds on a CPU: finer than the clock ticks of stat */
+    if (lx_read_small(p, b, sizeof b)) { unsigned long long ns; if (sscanf(b, "%llu", &ns) == 1) t->cpu_ns = ns; }
+    snprintf(p, sizeof p, "/proc/self/task/%lu/wchan", (unsigned long)t->tid);
+    lx_read_small(p, t->wchan, sizeof t->wchan);
+    snprintf(p, sizeof p, "/proc/self/task/%lu/syscall", (unsigned long)t->tid);      /* "<nr> <arg1> ... <sp> <pc>", "running" or "-1 <sp> <pc>" */
+    t->sysno = -1; t->sysarg[0] = t->sysarg[1] = 0;
+    if (lx_read_small(p, b, sizeof b) && b[0] >= '0' && b[0] <= '9') { unsigned long long a0 = 0, a1 = 0; long nr = -1; if (sscanf(b, "%ld %llx %llx", &nr, &a0, &a1) >= 1) { t->sysno = nr; t->sysarg[0] = a0; t->sysarg[1] = a1; } }
+    return 1;
+}
+int lx_threads(LxThread *t, int max) {
+    DIR *d = opendir("/proc/self/task");
+    struct dirent *e;
+    int n = 0;
+    if (!d) return 0;
+    while (n < max && (e = readdir(d)) != NULL) {
+        if (e->d_name[0] < '0' || e->d_name[0] > '9') continue;
+        memset(&t[n], 0, sizeof t[n]);
+        t[n].tid = (DWORD)strtoul(e->d_name, NULL, 10);
+        if (lx_thread_read(&t[n])) n++;
+    }
+    closedir(d);
+    return n;
+}
+typedef struct { uint64_t a; char name[68]; } LxSym;
+static LxSym *g_lxs;
+static int g_nlxs, g_lxs_tried;
+static int lxs_cmp(const void *x, const void *y) { const LxSym *p = x, *q = y; return p->a < q->a ? -1 : p->a > q->a; }
+static void lxs_load(void) {                               /* the functions of the program's own symbol table (.symtab: the build keeps it) */
+    Elf64_Ehdr eh;
+    Elf64_Shdr *sh = NULL;
+    Elf64_Sym *sy = NULL;
+    char *str = NULL;
+    Dl_info di;
+    FILE *f = fopen("/proc/self/exe", "rb");
+    g_lxs_tried = 1;
+    if (!f) return;
+    if (fread(&eh, sizeof eh, 1, f) != 1 || memcmp(eh.e_ident, ELFMAG, SELFMAG) || eh.e_ident[EI_CLASS] != ELFCLASS64 || eh.e_shentsize != sizeof(Elf64_Shdr) || !eh.e_shnum) goto done;
+    sh = calloc(eh.e_shnum, sizeof *sh);
+    if (!sh || fseek(f, (long)eh.e_shoff, SEEK_SET) || fread(sh, sizeof *sh, eh.e_shnum, f) != eh.e_shnum) goto done;
+    for (int i = 0; i < eh.e_shnum; i++) {
+        if (sh[i].sh_type != SHT_SYMTAB || sh[i].sh_link >= eh.e_shnum) continue;
+        size_t ns = sh[i].sh_size / sizeof *sy, nstr = sh[sh[i].sh_link].sh_size;
+        sy = malloc(sh[i].sh_size); str = malloc(nstr + 1);
+        if (!sy || !str || fseek(f, (long)sh[i].sh_offset, SEEK_SET) || fread(sy, sizeof *sy, ns, f) != ns) goto done;
+        if (fseek(f, (long)sh[sh[i].sh_link].sh_offset, SEEK_SET) || fread(str, 1, nstr, f) != nstr) goto done;
+        str[nstr] = 0;
+        uint64_t bias = eh.e_type == ET_DYN && dladdr((void *)lxs_load, &di) ? (uint64_t)(uintptr_t)di.dli_fbase : 0;
+        g_lxs = calloc(ns ? ns : 1, sizeof *g_lxs);
+        if (!g_lxs) goto done;
+        for (size_t k = 0; k < ns; k++) {
+            if (ELF64_ST_TYPE(sy[k].st_info) != STT_FUNC || !sy[k].st_value || sy[k].st_shndx == SHN_UNDEF || sy[k].st_name >= nstr) continue;
+            g_lxs[g_nlxs].a = sy[k].st_value + bias;
+            snprintf(g_lxs[g_nlxs].name, sizeof g_lxs[0].name, "%s", str + sy[k].st_name);
+            g_nlxs++;
+        }
+        qsort(g_lxs, (size_t)g_nlxs, sizeof *g_lxs, lxs_cmp);
+        break;
+    }
+done:
+    free(sh); free(sy); free(str); fclose(f);
+}
+const char *lx_exe_symbol(uint64_t pc, uint64_t *off) {
+    if (!g_lxs_tried) lxs_load();
+    int lo = 0, hi = g_nlxs - 1, at = -1;
+    while (lo <= hi) { int mid = (lo + hi) / 2; if (g_lxs[mid].a <= pc) { at = mid; lo = mid + 1; } else hi = mid - 1; }
+    if (at < 0 || pc - g_lxs[at].a >= 0x100000) return NULL;
+    *off = pc - g_lxs[at].a;
+    return g_lxs[at].name;
+}

@@ -249,3 +249,9 @@ Both are marked `[Recomps#1]` in the code; the values the game sees are unchange
   the system stands in (Noto Sans, DejaVu Sans, Liberation Sans ... under /usr/share/fonts; the game stopped there).
   `nvn_vk.c` - EXE_EXT_LEN (4 on Windows, 0 on Linux) for the report names of `nvn_vk_wd.c` / `nvn_vk_flash.c`
   (game_native_freeze.txt, not game_na_freeze.txt). Windows objects of all four byte-identical.
+- 2026-10-18, Linux freeze watchdog (finding 127): `nvn_vk_wd.c` - Linux parts behind `#ifndef _WIN32`: the thread list
+  from /proc/self/task with each thread's kernel wait (futex address, our locks by name, "a mutex HELD BY" from the glibc
+  owner field), call stacks recorded by each thread in a signal handler, wd_addr by dladdr + the program's .symtab, the
+  stall sampler and getrusage counters on Linux, the game's presenting thread labelled, test switch SSBU_VK_WDTEST.
+  `runtime/linux/win32_compat.c` - lx_threads / lx_thread_read / lx_thread_stack / lx_exe_symbol (`windows.h`: LxThread).
+  The Windows preprocessed `nvn_vk.c` is byte-identical to before.

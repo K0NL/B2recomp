@@ -472,6 +472,13 @@ static inline BOOL GetThreadTimes(HANDLE h, FILETIME *a, FILETIME *b, FILETIME *
 static inline BOOL GetProcessTimes(HANDLE h, FILETIME *a, FILETIME *b, FILETIME *k, FILETIME *u) { (void)h; (void)a; (void)b; (void)k; (void)u; return FALSE; }
 static inline BOOL GetSystemTimes(FILETIME *i, FILETIME *k, FILETIME *u) { (void)i; (void)k; (void)u; return FALSE; }
 BOOL ReadProcessMemory(HANDLE p, LPCVOID from, void *to, SIZE_T n, SIZE_T *got);     /* this process only */
+/* [Recomps#1] the freeze watchdog's thread report (nvn_vk_wd.c) has a Linux form of its own instead of the stubs above
+ * (win32_compat.c): the threads from /proc/self/task, a call stack recorded by the thread itself in a signal handler */
+typedef struct { DWORD tid; char comm[20]; char state; int nice; uint64_t cpu_ns; char wchan[48]; long sysno; uint64_t sysarg[2]; } LxThread;
+int lx_threads(LxThread *t, int max);                 /* every thread of this process; returns how many */
+int lx_thread_read(LxThread *t);                      /* again for t->tid: state, CPU time (ns), kernel wait, system call */
+int lx_thread_stack(DWORD tid, uint64_t *pcs, int max);   /* return addresses, innermost first; -1 thread gone, -2 no answer in 200 ms, -4 it blocks the signal */
+const char *lx_exe_symbol(uint64_t pc, uint64_t *off);    /* the nearest function of the program's own symbol table, or NULL */
 
 /* ---- the window: on Linux an SDL3 window (display.c), whose thread answers these (display.c, Linux part) */
 typedef void *HWND;
