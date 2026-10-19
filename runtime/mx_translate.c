@@ -88,6 +88,11 @@ static void fail(Mx *e, const char *op, const char *fmt, ...) {
 }
 
 /* ---------------------------------------------------------------- operands */
+/* Finding 124. Vulkan, a graphics stage: the rest of c0 is NVN's driver constant buffer, which no pipeline layout of ours
+ * declares (layout_bindings starts at c1). Reading it named a binding the layout lacks: invalid Vulkan that NVIDIA lets
+ * through and AMD's compiler refuses (VK_ERROR_INITIALIZATION_FAILED). Seen only as the point size limit c0[0x610] of
+ * B2's particle vertex shaders, which Vulkan ignores (mx_psize; the size comes from MXPC): it reads 0. */
+static int c0_unbacked(const Mx *e) { return e->in->target == 1 && e->in->stage != MX_COMPUTE; }
 static const char *X(Mx *e, unsigned r) { if (r == 255) return "0u"; e->regs[r] = 1; return S(e, "r%u", r); }
 static const char *D(Mx *e, unsigned r) { if (r == 255) return "rz"; e->regs[r] = 1; return S(e, "r%u", r); }
 static const char *CB(Mx *e, uint64_t i) {                /* c[bits 34..38][bits 20..33 words] */
@@ -105,6 +110,7 @@ static const char *CB(Mx *e, uint64_t i) {                /* c[bits 34..38][bits
         if (f == 0) { e->gubos |= 1u << n; e->cbufs |= 1u << (3 + n); return S(e, "0x%08xu", (17 + n) << 27); }
         return f == 2 ? "0x07fffffcu" : "0u";
     }
+    if (b == 0 && c0_unbacked(e)) return "0u";
     e->cbufs |= 1u << b;
     return S(e, "c%u[%uu]", b, w);
 }
@@ -1055,6 +1061,7 @@ static void insn(Mx *e, unsigned pc, uint64_t i) {
         unsigned cb = MXB(i, 36, 5), sz = MXB(i, 48, 3), mode = MXB(i, 44, 2), rd = MXB(i, 0, 8);
         int off = (int)(int16_t)MXB(i, 20, 16);
         if (mode != 0) { fail(e, "LDC.IS", "LDC mode %u", mode); break; }
+        if (cb == 0 && c0_unbacked(e) && sz <= 5) { emit(e, "%s = 0u;", DST); if (sz == 5) emit(e, " %s = 0u;", D(e, rd == 255 ? 255 : rd + 1)); break; }      /* finding 124 */
         e->cbufs |= 1u << cb;
         emit(e, "uint ad = %s + 0x%08xu, w = c%u[ad >> 2];", A8, (uint32_t)off, cb);
         switch (sz) {

@@ -163,7 +163,8 @@ static int stage_rec_read(int s, uint64_t vh, StageRec *r) {
     if (!fp) return 0;
     size_t got = fread(r, 1, sizeof *r, fp);
     fclose(fp);
-    return got == sizeof *r && r->magic == STAGEREC_MAGIC && r->stage == s && r->nsmp >= 0 && r->nsmp <= 64;
+    return got == sizeof *r && r->magic == STAGEREC_MAGIC && r->stage == s && r->nsmp >= 0 && r->nsmp <= 64
+        && !(s != 5 && (r->cbufs & 1));      /* finding 124: a graphics stage that reads c0 was translated before the fix: made again (only those records change) */
 }
 static void vstage_from_rec(VStage *v, const StageRec *r, uint64_t vh, VkShaderModule mod) {
     v->h = vh; v->hb = r->hb; v->code_len = r->code_len; memcpy(v->key, r->key, 16); v->fo = r->fo;
@@ -226,7 +227,10 @@ static void vstage_build(VStage *v, const SSrc *src) {
         if (!mx_translate(&in, &out)) { printf("nvn_vk: %s: machine code not translated: %s\n", what, out.why); fflush(stdout); }
         else {
             uint64_t spv_hash = 0;
-            glsl_dump(src->serial, s, out.glsl);       /* [Recomps#1] TEST ONLY: SSBU_VK_GLSLDUMP (nvn_vk_draw.c) */
+            if (getenv("SSBU_VK_GLSLDUMP")) {          /* [Recomps#1] TEST ONLY: SSBU_VK_GLSLDUMP (nvn_vk_draw.c), named by the variant hash v->h gets below */
+                uint32_t dep = s == 0 ? out.int_dep : 0, ck[4] = { v->key[0] & dep, v->key[1] & dep, v->key[2] & out.tex_units, v->key[3] & out.tex_units };
+                glsl_dump(src->serial, s, fnv(fnv(v->hb, ck, 16), &v->fo, 4), out.glsl);
+            }
             if (in.screen_scale) { InterlockedIncrement64(&g_rs_stages); if (strstr(out.glsl, "mx_fcs)")) InterlockedIncrement64(&g_rs_fcs); if (strstr(out.glsl, "mx_tf(")) InterlockedIncrement64(&g_rs_tf); }
             v->mod = module_from_glsl(s, out.glsl, what, &spv_hash);
             v->cbufs = out.cbufs; v->ssbos = out.ssbos; v->ssbo_w = out.ssbo_written; v->images = out.images; v->in_attr = out.in_attr; v->out_attr = out.out_attr;

@@ -1124,13 +1124,14 @@ static VkSampler sampler_get(const SamplerParams *p) {
     return s;
 }
 
-/* [Recomps#1] TEST ONLY (shadow flicker): SSBU_VK_GLSLDUMP=<folder>: every translated stage as p<serial>_<vs|fs|cs>.glsl */
-static void glsl_dump(int serial, int s, const char *glsl) {
+/* [Recomps#1] TEST ONLY (shadow flicker): SSBU_VK_GLSLDUMP=<folder>: every translated stage as p<serial>_<vs|fs|cs>_<variant hash>.glsl
+ * (the variant hash is the one in cache\vk\stage\<s>_<hash>.st and in the "THE DRIVER REFUSED" lines, finding 124) */
+static void glsl_dump(int serial, int s, uint64_t h, const char *glsl) {
     const char *dir = getenv("SSBU_VK_GLSLDUMP");
     char path[MAX_PATH];
     if (!dir || !glsl) return;
     CreateDirectoryA(dir, NULL);
-    snprintf(path, sizeof path, "%s/p%05d_%s.glsl", dir, serial, s == 5 ? "cs" : s ? "fs" : "vs");
+    snprintf(path, sizeof path, "%s/p%05d_%s_%016llx.glsl", dir, serial, s == 5 ? "cs" : s ? "fs" : "vs", (unsigned long long)h);
     FILE *f = fopen(path, "wb");
     if (f) { fputs(glsl, f); fclose(f); }
 }
@@ -1268,7 +1269,7 @@ static VStage *vstage_get(Prog *p, int s, const uint32_t *key, uint32_t fo) {
     snprintf(what, sizeof what, "program #%d %s stage", p->serial, s == 5 ? "compute" : s ? "fragment" : "vertex");
     if (!mx_translate(&in, &out)) { printf("nvn_vk: %s: machine code not translated: %s\n", what, out.why); fflush(stdout); return NULL; }
     uint64_t spv_hash = 0;
-    glsl_dump(p->serial, s, out.glsl);                 /* [Recomps#1] TEST ONLY: SSBU_VK_GLSLDUMP */
+    glsl_dump(p->serial, s, 0, out.glsl);                 /* [Recomps#1] TEST ONLY: SSBU_VK_GLSLDUMP */
     v->mod = module_from_glsl(s, out.glsl, what, &spv_hash);
     memcpy(v->local, st->local, sizeof v->local);
     v->cbufs = out.cbufs; v->ssbos = out.ssbos; v->ssbo_w = out.ssbo_written; v->images = out.images; v->in_attr = out.in_attr; v->out_attr = out.out_attr; v->dep = s == 0 ? out.int_dep : 0; v->tex_units = out.tex_units; v->uses_alpha = out.uses_alpha; v->nsmp = out.nsmp;
