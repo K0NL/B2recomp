@@ -243,6 +243,8 @@ static int g_exists[2], g_loading, g_devover;
 static HWND g_main, g_tip, g_status, g_save, g_play, g_sizes, g_padnote, g_gfxnote;
 static HFONT g_font, g_bigfont, g_smallfont;
 static HANDLE g_proc;
+static wchar_t g_playlog[MAX_PATH];                          /* the running game's build\play\stdout.txt: its exit line goes there */
+static ULONGLONG g_play_t0;
 static int g_dpi = 96;
 #define S(x) MulDiv((x), g_dpi, 96)
 enum { ID_SET = 100, ID_SIZES = 200, ID_REMAP, ID_TEST, ID_SAVE, ID_PLAY, ID_CLOSE, ID_CONFIG, ID_STATUS, ID_KEYS, ID_MODS, ID_REPORT, ID_TIMER = 1 };
@@ -460,6 +462,37 @@ static void run_tool(const wchar_t *args, const wchar_t *title) {   /* the pad t
     if (CreateProcessW(NULL, cmd, NULL, NULL, FALSE, CREATE_NEW_CONSOLE, NULL, g_buildd, &si, &pi)) { CloseHandle(pi.hThread); CloseHandle(pi.hProcess); }
     else MessageBoxW(g_main, L"Could not start the controller tool.", L"B2recomp", MB_ICONERROR);
 }
+/* finding 128: the game's exit code as the last line of its log, so a report has it. A crash that never reached the game's
+   own handler (a fast-fail, a stack overflow, heap corruption, a crash inside the graphics driver) writes no line itself. */
+static const char *exit_meaning(DWORD code) {
+    switch (code) {
+    case 0:          return "a normal end";
+    case 1:          return "ended from outside (Task Manager) or a start-up error (see the lines above)";
+    case 0xC0000005: return "a crash: access violation (memory read or written that is not there)";
+    case 0xC00000FD: return "a crash: stack overflow";
+    case 0xC0000409: return "a crash: fast-fail (the program or a driver in it ended the process at once)";
+    case 0xC0000374: return "a crash: heap corruption";
+    case 0xC000001D: return "a crash: illegal instruction (the CPU lacks an instruction)";
+    case 0xC000041D: return "a crash inside a callback from Windows";
+    case 0xC0000135: return "a DLL was not found";
+    case 0xC0000142: return "a DLL failed to start";
+    case 0x80000003: return "a breakpoint (an assertion)";
+    case 0xE06D7363: return "a crash: a C++ exception nobody caught";
+    }
+    return code >= 0xC0000000 ? "a crash (a Windows error code)" : "the game's own exit code: the reason is in the lines above";
+}
+static void log_exit(DWORD code) {
+    if (!g_playlog[0]) return;
+    HANDLE h = CreateFileW(g_playlog, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    g_playlog[0] = 0;
+    if (h == INVALID_HANDLE_VALUE) return;
+    char line[320];
+    int n = snprintf(line, sizeof line, "\r\nlauncher: the game exited after %.1f s with code %ld (0x%08lX): %s\r\n",
+                     (double)(GetTickCount64() - g_play_t0) / 1000.0, (long)code, (unsigned long)code, exit_meaning(code));
+    DWORD wr;
+    if (n > 0) WriteFile(h, line, (DWORD)n, &wr, NULL);
+    CloseHandle(h);
+}
 static void play(void) {
     if (g_proc || !save_all() || !have_game()) return;
     wchar_t user[MAX_PATH], tmp[MAX_PATH], log[MAX_PATH], cmd[3 * MAX_PATH];
@@ -490,6 +523,8 @@ static void play(void) {
     if (!ok) { MessageBoxW(g_main, L"Could not start build\\game_native.exe.", L"B2recomp", MB_ICONERROR); return; }
     CloseHandle(pi.hThread);
     g_proc = pi.hProcess;
+    g_play_t0 = GetTickCount64();
+    if (hl != INVALID_HANDLE_VALUE) wcscpy(g_playlog, log); else g_playlog[0] = 0;
     EnableWindow(g_play, FALSE);
     SetWindowTextW(g_play, L"Running");
     SetWindowTextW(g_status, L"The game is running (log: build\\play\\stdout.txt).");
@@ -1903,6 +1938,7 @@ static LRESULT CALLBACK wndproc(HWND w, UINT m, WPARAM wp, LPARAM lp) {
         if (g_proc && WaitForSingleObject(g_proc, 0) == WAIT_OBJECT_0) {
             DWORD code = 0; GetExitCodeProcess(g_proc, &code);
             CloseHandle(g_proc); g_proc = NULL;
+            log_exit(code);
             EnableWindow(g_play, TRUE); SetWindowTextW(g_play, L"Play");
             wchar_t t[128]; swprintf(t, 128, L"The game has exited (code %ld; log: build\\play\\stdout.txt).", (long)code);
             SetWindowTextW(g_status, t);

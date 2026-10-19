@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
 """[Recomps#1] Makes b2recomp-report.zip in the B2recomp folder: what someone helping a player needs to see - this PC
-(Windows or Linux version, CPU, memory, graphics card and driver) and the logs (the build's, the game's, its freeze /
-flash / stall reports). Nothing of the game: no dump, no targets/, no translated code, no game files.
+(Windows or Linux version, CPU, memory, graphics card and driver), the logs (the build's, the game's, its freeze /
+flash / stall reports) and on Windows the crash / hang records Windows kept of our programs (windows-errors.txt,
+finding 128). Nothing of the game: no dump, no targets/, no translated code, no game files.
 
     python scripts/report.py        (the launcher's Report... button runs it; on Linux scripts/report.sh does the same)
 
 Standard library only (the builder package's Python, run with -I). A log above 50 MB keeps its last 50 MB.
 """
+import calendar
 import glob
+import html
 import os
 import platform
+import re
+import subprocess
 import sys
 import time
 import zipfile
@@ -21,6 +26,11 @@ LOGS = ['build/logs', 'build/setup_state.json', 'build/play/stdout.txt', 'build/
         'build-linux/play/stdout.txt', 'build-linux/boot_trace.txt', 'build-linux/*_freeze.txt', 'build-linux/*_flash.txt',
         'build-linux/*_stalls.txt']
 MAX_LOG = 50 << 20
+OUR_EXES = ('game_native.exe', 'launcher.exe', 'b2recomp.exe')
+ERROR_DAYS = 30
+CODES = {'c0000005': 'access violation', 'c00000fd': 'stack overflow', 'c0000409': 'fast-fail: ended at once by the program '
+         'or a driver in it', 'c0000374': 'heap corruption', 'c000001d': 'illegal instruction', 'c000041d': 'crash inside a '
+         'callback from Windows', '80000003': 'breakpoint (an assertion)', 'e06d7363': 'C++ exception nobody caught'}
 
 
 def windows_info():
@@ -67,6 +77,48 @@ def windows_info():
     return out
 
 
+def windows_errors():
+    """Finding 128: the Application log's crash ("Application Error", 1000) and hang ("Application Hang", 1002) records of
+    our programs over the last ERROR_DAYS days, newest first. They name the module, exception code and offset of a crash
+    the game's own handler never saw (a fast-fail, a stack overflow, heap corruption, a crash inside the graphics driver):
+    such a game log just stops. Read from the records' named fields, so the Windows language does not matter."""
+    q = ("*[System[Provider[@Name='Application Error' or @Name='Application Hang'] and (EventID=1000 or EventID=1002) and "
+         "TimeCreated[timediff(@SystemTime) <= %d]]]" % (ERROR_DAYS * 86400000))
+    head = ['Windows crash (Application Error) and hang (Application Hang) records of %s over the last %d days, newest first'
+            % (', '.join(OUR_EXES), ERROR_DAYS)]
+    try:
+        r = subprocess.run(['wevtutil', 'qe', 'Application', '/q:' + q, '/c:500', '/rd:true', '/f:xml'],
+                           capture_output=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as e:
+        return head + ['(the Windows log could not be read: %s)' % e]
+    if r.returncode:
+        return head + ['(the Windows log could not be read: wevtutil exit %d: %s)'
+                       % (r.returncode, r.stderr.decode('mbcs', errors='replace').strip())]
+    try:
+        text = r.stdout.decode('utf-8')
+    except UnicodeDecodeError:
+        text = r.stdout.decode('mbcs', errors='replace')
+    out = []
+    for ev in re.findall(r'<Event[ >].*?</Event>', text, re.S):
+        d = {k: html.unescape(v) for k, v in re.findall(r"<Data Name='(\w+)'>([^<]*)</Data>", ev)}
+        if d.get('AppName', '').lower() not in OUR_EXES:
+            continue
+        t = re.search(r"SystemTime='(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)", ev)
+        when = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(calendar.timegm(time.strptime(t.group(1), '%Y-%m-%dT%H:%M:%S')))) if t else '?'
+        if 'Application Hang' in ev:
+            out.append('%s  HANG   %s: Windows found its window not responding (hang type %s)  %s'
+                       % (when, d.get('AppName'), d.get('HangType', '?'), d.get('ExeFileName', '')))
+        else:
+            code = d.get('ExceptionCode', '?').lower()
+            out.append('%s  CRASH  %s: exception 0x%s%s in %s %s + 0x%s\n      module %s\n      program %s'
+                       % (when, d.get('AppName'), code, ' (%s)' % CODES[code] if code in CODES else '', d.get('ModuleName', '?'),
+                          d.get('ModuleVersion', ''), d.get('FaultingOffset', '?').lstrip('0') or '0', d.get('ModulePath', '?'),
+                          d.get('AppPath', '?')))
+        if len(out) >= 20:
+            break
+    return head + (out or ['(none)'])
+
+
 def linux_info():
     out = []
     try:
@@ -105,8 +157,16 @@ def main():
             elif os.path.isfile(p):
                 files.append(p)
     tmp = OUT + '.tmp'
+    errors = None
+    if os.name == 'nt':
+        try:
+            errors = windows_errors()
+        except Exception as e:                            # as the PC details: a help, never a reason to fail
+            errors = ['(the Windows crash records could not be read: %s)' % e]
     with zipfile.ZipFile(tmp, 'w', zipfile.ZIP_DEFLATED) as z:
         z.writestr('pc-info.txt', '\n'.join(lines) + '\n')
+        if errors:
+            z.writestr('windows-errors.txt', '\n'.join(errors) + '\n')
         for p in files:
             rel = os.path.relpath(p, ROOT).replace(os.sep, '/')
             if os.path.getsize(p) > MAX_LOG:
@@ -116,7 +176,7 @@ def main():
             else:
                 z.write(p, rel)
     os.replace(tmp, OUT)
-    print('Made %s (%d files)' % (OUT, len(files) + 1))
+    print('Made %s (%d files)' % (OUT, len(files) + 1 + (errors is not None)))
     print("Send that file to whoever helps you. It holds logs and this PC's details, nothing of the game.")
     return 0
 
