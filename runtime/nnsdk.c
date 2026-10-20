@@ -181,6 +181,10 @@ static void fs_QueryMountRomCacheSize(Ctx *c) { wr64(A0, 0x10000); RET(0); }
 static void nu_VirtualAllocHook(Ctx *c) { RET(1); }
 static void nu_VirtualFreeHook(Ctx *c) { RET(1); }
 static void c_wmemcpy(Ctx *c) { memcpy(P(0), P(1), (size_t)A2 * 4); }
+/* [Recomps#1] finding 133: wchar_t is 4 bytes; Tag Climax's online menu uses these three */
+static void c_wcslen(Ctx *c) { const uint32_t *s = (const uint32_t *)P(0); size_t n = 0; while (s[n]) n++; RET(n); }
+static void c_wcscpy(Ctx *c) { uint32_t *d = (uint32_t *)P(0); const uint32_t *s = (const uint32_t *)P(1); size_t i = 0; do d[i] = s[i]; while (s[i++]); RET(A0); }
+static void c_wcscmp(Ctx *c) { const uint32_t *a = (const uint32_t *)P(0), *b = (const uint32_t *)P(1); while (*a && *a == *b) { a++; b++; } RET((int64_t)(*a < *b ? -1 : *a > *b)); }
 
 /* True when a printf format has a floating-point conversion (looks only at conversion
  * specifiers, so letters in literal text such as "uTexture%d" are ignored). */
@@ -586,7 +590,7 @@ static const ImportDef sdk_imports[] = {
     {"sprintf", c_sprintf}, {"snprintf", c_snprintf},
     {"_ZN2nu16VirtualAllocHookEmmPv", nu_VirtualAllocHook},
     {"_ZN2nu15VirtualFreeHookEPv", nu_VirtualFreeHook},
-    {"wmemcpy", c_wmemcpy},
+    {"wmemcpy", c_wmemcpy}, {"wcslen", c_wcslen}, {"wcscpy", c_wcscpy}, {"wcscmp", c_wcscmp},
     {"_ZN2nn2oe10InitializeEv", keep},
     {"_ZN2nn2oe27SetPerformanceConfigurationENS0_15PerformanceModeEi", keep},
     {"_ZN2nn2oe20SetFocusHandlingModeENS0_17FocusHandlingModeE", keep},
