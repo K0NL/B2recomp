@@ -63,7 +63,7 @@ typedef struct {
     int recording, callback_off, in_callback, dispatches;
 } CmdBuf;
 typedef struct { int count, interval, nactive; Tex *tex[8]; int crop[4]; uint64_t native; } Window;
-typedef struct { void *s; volatile LONG dead; } SyncObj;       /* s: GL sync object; Vulkan: the number of the submission the fence follows */
+typedef struct { void *s; volatile LONG dead, posted, ran, unsafe; } SyncObj;       /* s: GL sync object; Vulkan: the number of the submission the fence follows (+1); posted / ran (finding 138): fences of it issued by the game (queue fence, or recorded in a command list) / run by the render thread (Vulkan); unsafe: more run than issued (a list submitted twice) */
 
 /* ---------------------------------------------------------------- command lists */
 enum {
