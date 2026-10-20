@@ -244,9 +244,10 @@ enum {
 };
 
 /* ---------------------------------------------------------------- the render thread */
-typedef struct Job { void (*fn)(void *); void *arg; HANDLE done; struct Job *next; } Job;
+typedef struct Job { void (*fn)(void *); void *arg; HANDLE done; struct Job *next; LONG64 t0, t1; } Job;      /* t0 / t1: the render thread began / ended it (finding 138) */
 static CRITICAL_SECTION g_job_lock;
 static Job *g_job_head, *g_job_tail;
+static volatile LONG64 g_job_posted_n, g_job_ran_n;      /* finding 138: jobs posted (under g_job_lock) / run by the render thread; jobs run in the order posted */
 static HANDLE g_job_event, g_ready_event;
 static DWORD g_render_tid;
 static HWND g_hwnd;
@@ -254,8 +255,13 @@ static HDC g_dc;
 static _Thread_local HANDLE t_done;
 static void gl_housekeeping(void);
 static void (*pf_job_submit)(void *), (*pf_job_present)(void *);
-static LONG64 g_joblog_frame, g_joblog_cur;
-static void joblog(void (*fn)(void *), LONG64 t);
+static LONG64 g_joblog_frame, g_joblog_cur, g_joblog_frames = 3;
+static void joblog(const char *ev, void (*fn)(void *), const void *arg, LONG64 t);
+static int joblog_on(void);
+static void joblog_print(void);
+static void joblog_slow(LONG64 t0, LONG64 now);
+static int g_jl_slow_ms;
+static LONG64 g_jl_slow_from;
 static inline LONG64 pf_now(void);
 static inline void pf_add(int k, LONG64 t0);
 enum { PF_WAIT_SUBMIT_ = 13, PF_WAIT_PRESENT_ = 14, PF_WAIT_OTHER_ = 15 };
@@ -267,21 +273,53 @@ void hitch_wait_render(int on); void hitch_frame(long long frame, double ms, int
 #define HS_IN(name, arg) const char *hs_p_ = (const char *)g_hitch_rt; uint64_t hs_a_ = g_hitch_rt_arg; g_hitch_rt_arg = (uint64_t)(arg); g_hitch_rt = (name)
 #define HS_OUT() (g_hitch_rt = hs_p_, g_hitch_rt_arg = hs_a_)
 
+/* [Recomps#1] finding 138: the game's threads blocked in jobs (gl_run), by kind: 0 SyncWait on the window texture's sync,
+ * 1-4 SyncWait on another sync by its result (0 signalled when the job ran, 1 waited for the GPU, 2 timed out, 3 never
+ * fenced: sync_wait files these), 5.. any other job by its function. Per kind: [0] calls, ticks [1] queued (posted -> the
+ * render thread began it: the jobs posted before it, a job waits for every one of them), [2] ran, [3] woke (job done ->
+ * the caller runs), [4] posted while the render thread replayed a submission, [5] submissions queued ahead of it,
+ * [6] presents running or queued ahead. Printed every 300 frames ("nvn_jobwait:" lines). */
+#define JW_N 16
+static void (*volatile g_jw_fn[JW_N])(void *);
+static volatile LONG64 g_jw[JW_N][7];
+static void (*volatile g_rt_cur)(void *);              /* the job the render thread runs now (NULL: idle) */
+static _Thread_local LONG64 t_jw[7];                    /* the last gl_run of this thread, as one row of g_jw */
+static int g_fastsync;                                  /* SSBU_FASTSYNC and its counters (at sync_wait) */
+static volatile LONG64 g_fs[11];
+static void jw_add(int k, const LONG64 *v) { for (int i = 0; i < 7; i++) InterlockedExchangeAdd64(&g_jw[k][i], v[i]); }
+static int jw_kind(void (*fn)(void *)) {
+    for (int k = 5; k < JW_N; k++) {
+        if (g_jw_fn[k] == fn) return k;
+        if (!g_jw_fn[k] && !InterlockedCompareExchangePointer((void *volatile *)&g_jw_fn[k], (void *)(uintptr_t)fn, NULL)) return k;
+        if (g_jw_fn[k] == fn) return k;
+    }
+    return JW_N - 1;
+}
 static void gl_run(void (*fn)(void *), void *arg) {
     if (GetCurrentThreadId() == g_render_tid) { fn(arg); return; }
     if (!t_done) t_done = CreateEventA(NULL, FALSE, FALSE, NULL);
     Job j = {fn, arg, t_done, NULL};
     LONG64 pf0 = pf_now();
-    if (g_joblog_frame > 0 && g_joblog_cur >= g_joblog_frame && g_joblog_cur < g_joblog_frame + 3) joblog(fn, pf0);
+    int jl = joblog_on();
+    if (jl) joblog("wait", fn, arg, pf0);
+    int subs = 0, pres = 0;
     EnterCriticalSection(&g_job_lock);
+    void (*busy)(void *) = g_rt_cur;
+    for (Job *q = g_job_head; q; q = q->next) { if (q->fn == g_rb->submit || q->fn == g_rb->submit_async) subs++; else if (q->fn == g_rb->present) pres++; }      /* finding 138 */
     if (g_job_tail) g_job_tail->next = &j; else g_job_head = &j;
+    g_job_posted_n++;
     g_job_tail = &j;
     LeaveCriticalSection(&g_job_lock);
     SetEvent(g_job_event);
     hitch_wait_render(1);
     WaitForSingleObject(j.done, INFINITE);
     hitch_wait_render(0);
+    LONG64 now = pf_now();
+    if (jl) { joblog("resumed", fn, arg, now); if (g_jl_slow_ms) joblog_slow(pf0, now); }
     pf_add(fn == pf_job_submit ? PF_WAIT_SUBMIT_ : fn == pf_job_present ? PF_WAIT_PRESENT_ : PF_WAIT_OTHER_, pf0);
+    t_jw[0] = 1; t_jw[1] = j.t0 - pf0; t_jw[2] = j.t1 - j.t0; t_jw[3] = now - j.t1;      /* finding 138 */
+    t_jw[4] = busy && (busy == g_rb->submit || busy == g_rb->submit_async); t_jw[5] = subs; t_jw[6] = pres + (busy && busy == g_rb->present);
+    if (fn != g_rb->sync_wait) jw_add(jw_kind(fn), t_jw);
 }
 
 /* P3: nvnQueueSubmitCommands / FenceSync / Flush do not wait for the render thread (SSBU_SYNC_SUBMIT=1: they wait, as before).
@@ -309,9 +347,11 @@ static void gl_post(void (*fn)(void *), const void *arg, size_t size) {       /*
     Job *j = malloc(sizeof *j + size + 8);
     if (size) memcpy(j + 1, arg, size);
     j->fn = fn; j->arg = j + 1; j->done = NULL; j->next = NULL;
+    if (joblog_on()) joblog("post", fn, j->arg, pf_now());
     InterlockedIncrement(&g_async_pending);
     EnterCriticalSection(&g_job_lock);
     if (g_job_tail) g_job_tail->next = j; else g_job_head = j;
+    g_job_posted_n++;
     g_job_tail = j;
     LeaveCriticalSection(&g_job_lock);
     SetEvent(g_job_event);
@@ -3509,6 +3549,7 @@ static void pf_frame_mark(LONG64 frame) {
     if (last) g_pf_ft[frame % 300] = (double)(now - last) * 1000.0 / (double)freq;
     if (last && g_hitch_ms) hitch_frame((long long)frame, (double)(now - last) * 1000.0 / (double)freq, g_frame_dispatch > 0);
     last = now;
+    if (g_joblog_frame > 0 && frame == g_joblog_frame + g_joblog_frames) joblog_print();      /* SSBU_JOBLOG */
     if (frame % 300) return;
     double ft[300], sum = 0;
     memcpy(ft, g_pf_ft, sizeof ft);
@@ -3525,6 +3566,29 @@ static void pf_frame_mark(LONG64 frame) {
     printf(" | MB/frame: streamed %.2f, read back %.2f, hashed %.2f\n", (double)(g_pf_arena_bytes - b0[0]) / 300.0 / 1048576.0, (double)(g_pf_cflush_bytes - b0[1]) / 300.0 / 1048576.0,
            (double)(g_pf_hash_bytes - b0[2]) / 300.0 / 1048576.0);
     b0[0] = g_pf_arena_bytes; b0[1] = g_pf_cflush_bytes; b0[2] = g_pf_hash_bytes;
+    {   /* finding 138: the waits of wait-submit / wait-present / wait-other by kind */
+        static LONG64 l[JW_N][7];
+        static const char *const sw[5] = {"SyncWait on the window texture's sync", "SyncWait signalled when the job ran", "SyncWait that waited for the GPU", "SyncWait timed out", "SyncWait never fenced"};
+        double ms = 1000.0 / (double)freq / 300.0;
+        printf("nvn_jobwait: frames %lld..%lld per frame, the game's threads blocked in render-thread jobs (ms = queued behind the jobs posted before + ran + woke):", (long long)frame - 300, (long long)frame);
+        for (int k = 0; k < JW_N; k++) {
+            LONG64 d[7];
+            for (int i = 0; i < 7; i++) { d[i] = g_jw[k][i] - l[k][i]; l[k][i] += d[i]; }
+            if (!d[0]) continue;
+            void (*fn)(void *) = g_jw_fn[k];
+            const char *name = k < 5 ? sw[k] : fn == g_rb->finish ? "Finish" : fn == g_rb->read_texels ? "ReadTexels" : fn == g_rb->write_texels ? "WriteTexels" : fn == job_nop ? "barrier (queue empty)" :
+                               fn == g_rb->housekeeping ? "housekeeping (ApplyDeferredFinalizes)" : fn == g_rb->sync_drop ? "Sync finalize" : fn == g_rb->reset_status ? "QueueGetError" : fn == g_rb->server_wait ? "QueueWaitSync" :
+                               fn == g_rb->submit ? "SubmitCommands (waited)" : fn == g_rb->present ? "PresentTexture (waited)" : fn == g_rb->present_movie ? "present to the movie maker" : fn == g_rb->sample_grid ? "sample locations grid" : "other";
+            printf(" | %s%s %.2f calls %.2f ms = %.2f + %.2f + %.2f; posted during a replay %.2f, submissions queued ahead %.2f, presents ahead %.2f", name, k == JW_N - 1 ? " (and more)" : "", (double)d[0] / 300.0,
+                   (double)(d[1] + d[2] + d[3]) * ms, (double)d[1] * ms, (double)d[2] * ms, (double)d[3] * ms, (double)d[4] / 300.0, (double)d[5] / 300.0, (double)d[6] / 300.0);
+            if (!strcmp(name, "other")) printf(" (job %p)", (void *)(uintptr_t)fn);
+        }
+        static LONG64 lf[11];
+        LONG64 f[11];
+        for (int i = 0; i < 11; i++) { f[i] = g_fs[i] - lf[i]; lf[i] += f[i]; }
+        printf(" || answered on the game's thread (SSBU_FASTSYNC=%d): SyncWait window %.2f, SyncWait finished %.2f, QueueWaitSync never fenced %.2f, finished %.2f; SyncWait on a fence run but not finished, waited for there %.2f (%.2f ms) | jobs all the same: SyncWait on a fence not run yet %.2f, run but not finished %.2f (by then the jobs posted before it had run, or the render thread was idle), with a timeout under 1 s %.2f, other %.2f, QueueWaitSync %.2f\n",
+               g_fastsync > 0, (double)f[0] / 300.0, (double)f[1] / 300.0, (double)f[2] / 300.0, (double)f[3] / 300.0, (double)f[8] / 300.0, (double)f[9] * ms, (double)f[4] / 300.0, (double)f[5] / 300.0, (double)f[10] / 300.0, (double)f[6] / 300.0, (double)f[7] / 300.0);
+    }
     {
         static int on = -1;
         static LONG64 z[16];
@@ -3552,12 +3616,70 @@ static void job_fence(void *arg);
 static void job_sync_wait(void *arg);
 static void job_flush(void *arg);
 static void job_finish(void *arg);
-static void joblog(void (*fn)(void *), LONG64 t) {
+/* SSBU_JOBLOG=<frame>[,<frames>] (default 3 frames): every job of those frames, as it is posted (gl_post), posted and
+ * waited for (gl_run: "wait", then "resumed" when the caller runs again), begun and ended by the render thread; kept in
+ * memory and printed after the last of those frames ("joblog:" lines, time in ms since the first event, the thread, the
+ * sync object of a fence / wait). SSBU_JOBLOG=slow,<ms>[,<count>] (finding 138): the same events kept in a ring, and the
+ * last 25 ms of them printed when a game thread was blocked in a job longer than <ms> (the first <count> times, default 5). */
+#define JL_MAX 8192
+static struct { LONG64 t, frame; unsigned long tid; const char *ev, *name; const void *obj; void (*fn)(void *); } g_jl[JL_MAX];
+static volatile LONG g_jl_n;
+static volatile LONG g_jl_slow_left;
+void nvn_vk_present_flush_job(void *arg);              /* nvn_vk_draw.c */
+static const char *job_name(void (*fn)(void *), const void *arg) {
+    if (fn == g_rb->submit || fn == g_rb->submit_async) return "SubmitCommands (replay)";
+    if (fn == g_rb->present) return "PresentTexture";
+    if (fn == g_rb->fence) return "FenceSync";
+    if (fn == g_rb->sync_wait) return arg && ((const SyncJob *)arg)->o == g_window_sync ? "SyncWait (WINDOW texture)" : "SyncWait";
+    if (fn == g_rb->server_wait) return "QueueWaitSync";
+    if (fn == g_rb->flush) return "Flush";
+    if (fn == g_rb->finish) return "Finish";
+    if (fn == g_rb->read_texels) return "ReadTexels";
+    if (fn == g_rb->write_texels) return "WriteTexels";
+    if (fn == g_rb->housekeeping) return "housekeeping";
+    if (fn == g_rb->sync_drop) return "Sync finalize";
+    if (fn == job_nop) return "barrier";
+    if (fn == nvn_vk_present_flush_job) return "kept present (posted at the tick)";
+    return "other";
+}
+static void joblog(const char *ev, void (*fn)(void *), const void *arg, LONG64 t) {
+    LONG i = InterlockedIncrement(&g_jl_n) - 1;
+    if (g_jl_slow_ms) i &= JL_MAX - 1; else if (i >= JL_MAX) return;
+    g_jl[i].ev = NULL;
+    g_jl[i].t = t; g_jl[i].frame = g_joblog_cur; g_jl[i].tid = GetCurrentThreadId(); g_jl[i].name = job_name(fn, arg); g_jl[i].fn = fn;
+    g_jl[i].obj = arg && (fn == g_rb->fence || fn == g_rb->sync_wait || fn == g_rb->server_wait) ? (const void *)((const SyncJob *)arg)->o : NULL;
+    g_jl[i].ev = ev;
+}
+static int joblog_on(void) { return g_jl_slow_ms ? g_jl_slow_left > 0 : g_joblog_frame > 0 && g_joblog_cur >= g_joblog_frame && g_joblog_cur < g_joblog_frame + g_joblog_frames; }
+static void joblog_print_from(LONG64 from, LONG64 to) {     /* the events from..to (QPC) in time order */
     static LONG64 freq;
     if (!freq) { LARGE_INTEGER f; QueryPerformanceFrequency(&f); freq = f.QuadPart; }
-    printf("joblog: frame %lld t=%.3f ms thread %lu %s%c", (long long)g_joblog_cur, (double)(t % (freq * 100)) * 1000.0 / (double)freq, (unsigned long)GetCurrentThreadId(),
-           fn == job_submit ? "SubmitCommands" : fn == job_present ? "PresentTexture" : fn == job_fence ? "FenceSync" : fn == job_sync_wait ? "SyncWait" : fn == job_flush ? "Flush" :
-           fn == job_finish ? "Finish" : "other", 10);
+    static char taken[JL_MAX];
+    int n = g_jl_slow_ms || g_jl_n > JL_MAX ? JL_MAX : (int)g_jl_n, shown = 0;
+    LONG64 t0 = to;
+    for (int i = 0; i < n; i++) { taken[i] = !g_jl[i].ev || g_jl[i].t < from || g_jl[i].t > to; if (!taken[i] && g_jl[i].t < t0) t0 = g_jl[i].t; }
+    for (;;) {                                         /* a few hundred events: selection */
+        int b = -1;
+        for (int i = 0; i < n; i++) if (!taken[i] && (b < 0 || g_jl[i].t < g_jl[b].t)) b = i;
+        if (b < 0) break;
+        taken[b] = 1; shown++;
+        printf("joblog: frame %lld t=%8.3f ms thread %5lu %-8s %s", (long long)g_jl[b].frame, (double)(g_jl[b].t - t0) * 1000.0 / (double)freq, g_jl[b].tid, g_jl[b].ev, g_jl[b].name);
+        if (g_jl[b].obj) printf(" (sync %p)", g_jl[b].obj);
+        if (!strcmp(g_jl[b].name, "other")) printf(" (job %p)", (void *)(uintptr_t)g_jl[b].fn);
+        printf("\n");
+    }
+    printf("joblog: %d events\n", shown);
+}
+static void joblog_print(void) { if (!g_jl_slow_ms) joblog_print_from(0, 0x7fffffffffffffffll); }      /* render thread, at the frame mark after the window */
+static void joblog_slow(LONG64 t0, LONG64 now) {      /* game thread: its wait from t0 took long */
+    static LONG64 freq;
+    if (!freq) { LARGE_INTEGER f; QueryPerformanceFrequency(&f); freq = f.QuadPart; }
+    if (g_joblog_cur < g_jl_slow_from || (now - t0) * 1000 < (LONG64)g_jl_slow_ms * freq || InterlockedDecrement(&g_jl_slow_left) < 0) return;
+    static volatile LONG busy;
+    while (InterlockedExchange(&busy, 1)) Sleep(0);
+    printf("joblog: a game thread (%lu) was blocked %.2f ms in a job: the jobs of the last 25 ms\n", (unsigned long)GetCurrentThreadId(), (double)(now - t0) * 1000.0 / (double)freq);
+    joblog_print_from(now - freq / 40, now);
+    InterlockedExchange(&busy, 0);
 }
 static void job_present(void *arg) {
     pair_off();
@@ -3666,19 +3788,26 @@ static void job_write_texels(void *arg) {
 }
 
 /* The render thread's job loop (both back ends). */
+void nvn_front_done_moved(void);
 static void render_loop(void) {
     for (;;) {
         WaitForSingleObject(g_job_event, INFINITE);
         for (;;) {
             EnterCriticalSection(&g_job_lock);
             Job *j = g_job_head;
-            if (j) { g_job_head = j->next; if (!g_job_head) g_job_tail = NULL; }
+            if (j) { g_job_head = j->next; if (!g_job_head) g_job_tail = NULL; g_rt_cur = j->fn; }      /* g_rt_cur after the head (finding 138: sync_wait_here reads the head, then this) */
             LeaveCriticalSection(&g_job_lock);
-            if (!j) break;
+            if (!j) { nvn_front_done_moved(); break; }      /* finding 138: a game thread waiting for a fence takes the job now */
             HANDLE done = j->done;
             if (g_rb->idle) g_rb->idle();
             g_hitch_rt = j->fn == g_rb->submit || j->fn == g_rb->submit_async ? "submitted commands (outside the named scopes)" : j->fn == g_rb->present ? "present (blit)" : j->fn == g_rb->sync_wait ? "SyncWait job" : "other job (texel read/write, finish, barrier, ...)";
+            j->t0 = pf_now();                    /* finding 138 */
+            int jl = joblog_on();
+            if (jl) joblog("begin", j->fn, j->arg, j->t0);
             j->fn(j->arg);                       /* a member of g_rb (seam step S2), or a job of the front end / of the back end itself */
+            j->t1 = pf_now(); g_rt_cur = NULL; g_job_ran_n++;
+            nvn_front_done_moved();              /* finding 138: a game thread waiting for a fence looks again */
+            if (jl) joblog("end", j->fn, j->arg, j->t1);
             g_hitch_rt = "idle";
             if (done) SetEvent(done); else { free(j); InterlockedDecrement(&g_async_pending); }      /* gl_post: nobody waits */
         }
@@ -3689,6 +3818,13 @@ static DWORD WINAPI render_thread(LPVOID arg) {
     (void)arg;
     pf_job_submit = g_rb->submit; pf_job_present = g_rb->present;
     g_joblog_frame = getenv("SSBU_JOBLOG") ? atoi(getenv("SSBU_JOBLOG")) : 0;
+    if (g_joblog_frame && strchr(getenv("SSBU_JOBLOG"), ',')) g_joblog_frames = atoi(strchr(getenv("SSBU_JOBLOG"), ',') + 1);
+    if (getenv("SSBU_JOBLOG") && !strncmp(getenv("SSBU_JOBLOG"), "slow,", 5)) {      /* finding 138: slow,<ms>[,<count>] */
+        const char *e = getenv("SSBU_JOBLOG") + 5;
+        g_jl_slow_ms = atoi(e); g_jl_slow_left = strchr(e, ',') ? atoi(strchr(e, ',') + 1) : 5;
+        if (strchr(e, ',') && strchr(strchr(e, ',') + 1, ',')) g_jl_slow_from = atoi(strchr(strchr(e, ',') + 1, ',') + 1);
+        if (g_jl_slow_ms <= 0) g_jl_slow_ms = 1;
+    }
     PIXELFORMATDESCRIPTOR pfd;
     g_render_tid = GetCurrentThreadId();
     {   /* Round 17, MEASUREMENT: SSBU_RENDER_PRIO=1 above normal, 2 highest (default: normal, as before). The game's own
@@ -4838,7 +4974,64 @@ static void queue_fence_sync(Ctx *c) {                  /* (queue, sync, conditi
     L1T("fence sync %llx", (unsigned long long)A1);
     SyncObj *o = hobj(A1, K_SYNC);
     SyncJob j = {o, (int)A3, 0, 0};
-    if (o) { if (gl_async_on()) gl_post(g_rb->fence, &j, sizeof j); else gl_run(g_rb->fence, &j); }
+    if (o) { InterlockedIncrement(&o->posted); if (gl_async_on()) gl_post(g_rb->fence, &j, sizeof j); else gl_run(g_rb->fence, &j); }      /* posted: finding 138 */
+}
+/* [Recomps#1] finding 138 ("the game's waits"): a SyncWait or QueueWaitSync is a job, and a job runs after every job
+ * posted before it. B2's main thread begins each frame with a SyncWait on the window texture's acquire sync (never fenced:
+ * its job answers 3 at once), right after it has posted the last frame's submission, present and fence: in a heavy fight
+ * frame at 120 fps it stood there 4-5 ms, the whole replay of that submission, before it could run the next frame's logic
+ * (3-4 ms): the game and the replay took turns (9-10 ms frames). Now answered on the game's thread (Vulkan; SSBU_FASTSYNC=0:
+ * every wait is a job as before):
+ *   - SyncWait on the window texture's sync that no fence ever named (posted 0): 3 at once, the job's answer; the pipe /
+ *     refresh handling below as before;
+ *   - SyncWait on a sync whose every fence the game issued has run (posted == ran) and whose submission, with all before
+ *     it, has finished and landed (nvn_vk_sync_done: its read-backs are in guest memory): 0, signalled already, the job's
+ *     answer when it finds the same (B2's main thread waits next on the frame fence it issued two frames before);
+ *   - QueueWaitSync (on the console the queue waits, not the CPU): never fenced: 0 at once (the job waits for nothing and
+ *     answers 0); fenced, run, finished and landed: 1 at once. B2's render thread calls it once a frame on the next window
+ *     texture's acquire sync, never fenced; behind the replay it would have been the next wait.
+ *   - a fence not finished yet: waited for on the game's thread (sync_wait_here, below).
+ * Anything else (a list submitted twice: unsafe; a sync finalized; never fenced and not the window's) is a job as before.
+ * Counted in the "nvn_jobwait:" line (answered at once, waited for here, and why the others took a job). */
+static int g_fastsync = -1;
+static volatile LONG64 g_fs[11];     /* answered without a job: 0 SyncWait window, 1 SyncWait done, 2 QueueWaitSync never fenced, 3 QueueWaitSync done; jobs: 4 SyncWait on a fence not run yet, 5 run, not finished, 6 never fenced (not the window) / unsafe / finalized, 7 QueueWaitSync; 8 SyncWait waited for on the game's thread (sync_wait_here), 9 its ticks; 10 job: run, not finished, a timeout under 1 s */
+static int fastsync_on(void) { if (g_fastsync < 0) g_fastsync = !strcmp(g_rb->name, "vk") && !(getenv("SSBU_FASTSYNC") && !atoi(getenv("SSBU_FASTSYNC"))); return g_fastsync; }
+int nvn_vk_sync_done(const SyncObj *o);                 /* nvn_vk_draw.c */
+static int sync_fast_done(const SyncObj *o) { return !o->dead && !o->unsafe && o->posted && o->posted == o->ran && nvn_vk_sync_done(o); }      /* ran is read before s (nvn_vk_draw.c sync_ran) */
+/* A fence not finished yet. B2 waits on the fence it issued two frames before, and after a long frame its frame limiter
+ * lets it run frames back to back until it is on time again: then that fence has run but its submission is still on the
+ * GPU, or (the render thread over a frame behind) its job has not even run; its SyncWait job then waited behind one or two
+ * more replays (4.6-21 ms, the slow-wait job log) after the fence had run and finished. Now the game's thread waits for the
+ * fence to run (ran) and finish (R.done, kept current by the render thread during a replay, slot_poll, and between jobs),
+ * woken by the render thread (nvn_front_done_moved). The job as before once every job posted before this call has run
+ * (the job would have begun then: never later than before; e.g. a fence in a command list not submitted yet, or compute
+ * copy-backs to land, nvn_vk_sync_done), when the render thread has nothing to run (nobody would see the GPU finish: the
+ * job then runs at once and waits for the fence), or for a timeout under a second. 1 = finished (CONDITION_SATISFIED). */
+static SRWLOCK g_dw_lock = SRWLOCK_INIT;
+static CONDITION_VARIABLE g_dw_cv = CONDITION_VARIABLE_INIT;
+static volatile LONG g_dw_waiters;
+void nvn_front_done_moved(void) {                       /* render thread: R.done or a sync's ran moved, or it is idle */
+    MemoryBarrier();                                    /* that store before g_dw_waiters (a waiter counts itself, then looks) */
+    if (!g_dw_waiters) return;
+    AcquireSRWLockExclusive(&g_dw_lock); ReleaseSRWLockExclusive(&g_dw_lock);      /* a waiter is asleep or has not looked yet */
+    WakeAllConditionVariable(&g_dw_cv);
+}
+static int sync_wait_here(SyncObj *o, uint64_t timeout_ns) {
+    if (timeout_ns < 1000000000ull || o->dead || o->unsafe || !o->posted || o->ran > o->posted) return 0;
+    LONG64 before = g_job_posted_n;                     /* the jobs posted before this call (render_loop counts the ones run) */
+    int done = 0;
+    InterlockedIncrement(&g_dw_waiters);
+    AcquireSRWLockExclusive(&g_dw_lock);
+    for (;;) {
+        if (sync_fast_done(o)) { done = 1; break; }
+        if (o->dead || o->unsafe || o->ran > o->posted) break;
+        if (g_job_ran_n >= before) break;          /* every job posted before this call has run: the job, which would have begun now */
+        if (!*(Job *volatile *)&g_job_head && !g_rt_cur) break;      /* the render thread is idle (the head first: render_loop sets g_rt_cur as it takes the head) */
+        SleepConditionVariableSRW(&g_dw_cv, &g_dw_lock, 1, 0);
+    }
+    ReleaseSRWLockExclusive(&g_dw_lock);
+    InterlockedDecrement(&g_dw_waiters);
+    return done;
 }
 static void job_sync_wait(void *arg) {
     SyncJob *j = arg;
@@ -4850,7 +5043,15 @@ static void sync_wait(Ctx *c) {                         /* (sync, timeoutNs) -> 
     L1T("sync wait %llx%s", (unsigned long long)A0, hobj(A0, K_SYNC) == g_window_sync ? " (WINDOW texture)" : "");
     SyncObj *o = hobj(A0, K_SYNC);
     SyncJob j = {o, 0, A1, 3};
-    if (o) gl_run(g_rb->sync_wait, &j);
+    LONG64 sw0 = 0;
+    if (o && fastsync_on() && o == g_window_sync && !o->posted) { j.result = 3; InterlockedIncrement64(&g_fs[0]); }      /* finding 138: see fastsync_on */
+    else if (o && fastsync_on() && o != g_window_sync && sync_fast_done(o)) { j.result = 0; InterlockedIncrement64(&g_fs[1]); }
+    else if (o && fastsync_on() && o != g_window_sync && (sw0 = pf_now(), sync_wait_here(o, A1))) { j.result = 1; InterlockedIncrement64(&g_fs[8]); InterlockedExchangeAdd64(&g_fs[9], pf_now() - sw0); }
+    else if (o) {
+        if (fastsync_on() && o != g_window_sync) InterlockedIncrement64(&g_fs[o->dead || o->unsafe || !o->posted ? 6 : o->posted != o->ran ? 4 : A1 < 1000000000ull ? 10 : 5]);
+        gl_run(g_rb->sync_wait, &j);
+        if (GetCurrentThreadId() != g_render_tid) jw_add(o == g_window_sync ? 0 : 1 + (j.result & 3), t_jw);      /* finding 138 */
+    }
     if (o && o == g_window_sync && A1 && j.result == 3) {      /* P3 round 3: the window texture's sync (never fenced by us): it is free at the refresh that shows the queued frame (display.c) */
         if (l1_pipe_wait()) j.result = 1; else {      /* L1 round 2: pipe mode does not hold here */
         l1_early_present();                                    /* L1 (latency = early / SSBU_L1_EARLY=1): the picture the game finished before this wait goes to the window now (at its tick) */
@@ -4863,7 +5064,9 @@ static void job_server_wait(void *arg) { SyncJob *j = arg; if (j->o->s) glWaitSy
 static void queue_wait_sync(Ctx *c) {                   /* (queue, sync) -> NVNboolean */
     SyncObj *o = hobj(A1, K_SYNC);
     SyncJob j = {o, 0, 0, 0};
-    if (o) gl_run(g_rb->server_wait, &j);
+    if (o && fastsync_on() && !o->posted && !o->s) InterlockedIncrement64(&g_fs[2]);      /* finding 138: never fenced: the job waits for nothing and answers 0 */
+    else if (o && fastsync_on() && sync_fast_done(o)) { j.result = 1; InterlockedIncrement64(&g_fs[3]); }      /* the job's answer for a finished fence */
+    else if (o) { if (fastsync_on()) InterlockedIncrement64(&g_fs[7]); gl_run(g_rb->server_wait, &j); }
     RET(j.result);
 }
 static void sync_no_gl_interop(Ctx *c) { RET(0); }
@@ -5264,7 +5467,7 @@ static void cmd_render_enable_cond(Ctx *c) { Cmd *m = rec(c, OP_RENDER_ENABLE, 0
 static void cmd_reset_counter(Ctx *c) { rec(c, OP_COUNTER_RESET, 0); }
 static void cmd_report_counter(Ctx *c) { rec(c, OP_COUNTER_REPORT, 0); }
 static void cmd_report_value(Ctx *c) { rec(c, OP_REPORT_VALUE, 0); }
-static void cmd_fence_sync(Ctx *c) { SyncObj *o = hobj(A1, K_SYNC); rec(c, OP_FENCE, 0)->a[0] = (uint64_t)(uintptr_t)o; }      /* (cmdbuf, sync, condition, flags) */
+static void cmd_fence_sync(Ctx *c) { SyncObj *o = hobj(A1, K_SYNC); if (o) InterlockedIncrement(&o->posted); rec(c, OP_FENCE, 0)->a[0] = (uint64_t)(uintptr_t)o; }      /* (cmdbuf, sync, condition, flags); posted: finding 138 */
 static void cmd_wait_sync(Ctx *c) { SyncObj *o = hobj(A1, K_SYNC); rec(c, OP_WAITSYNC, 0)->a[0] = (uint64_t)(uintptr_t)o; }
 static void cmd_signal_event(Ctx *c) { uint64_t a = A1 ? rd64(A1 + 16) : 0; rec(c, OP_EVENT_SIGNAL, 0)->a[0] = a; }            /* (cmdbuf, event, mode, location, flags, value) */
 static void cmd_wait_event(Ctx *c) { uint64_t a = A1 ? rd64(A1 + 16) : 0; rec(c, OP_EVENT_WAIT, 0)->a[0] = a; }                /* (cmdbuf, event, waitMode, value) */
@@ -5508,6 +5711,7 @@ static void vk_shutdown_at_exit(void) {
     j.fn = job_vk_shutdown; j.arg = NULL; j.next = NULL; j.done = CreateEventA(NULL, FALSE, FALSE, NULL);
     EnterCriticalSection(&g_job_lock);
     if (g_job_tail) g_job_tail->next = &j; else g_job_head = &j;
+    g_job_posted_n++;
     g_job_tail = &j;
     LeaveCriticalSection(&g_job_lock);
     SetEvent(g_job_event);

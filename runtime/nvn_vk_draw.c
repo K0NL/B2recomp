@@ -392,6 +392,7 @@ static LONG64 g_fu_fr_n, g_fu_fr_linked, g_fu_fr_made, g_fu_fr_tk, g_fu_fr_newsi
 static LONG64 g_fu_frames, g_fu_total, g_fu_linked, g_fu_made, g_fu_newsig, g_fu_tk, g_fu_slow, g_fu_fight_frames, g_fu_fight_slow, g_fu_slow_tex;
 #define VK_SPLIT_DEFAULT 0
 static LONG64 g_tl_t0, g_tl_first, g_tl_last, g_tl_sum[8], g_tl_n;      /* sums: 0 first submission, 1 last submission, 2 present job, 3 fence waits (count), 4 fence wait ticks, 5 end of a fence wait after the batch start */
+void nvn_front_done_moved(void);                   /* nvn_gl.c (finding 138): R.done moved, a game thread may wait for it */
 static void slot_wait(Slot *s) {
     if (!s->pending) return;
     for (int i = 0; i < NSLOT; i++) if (R.slot[i].pending && R.slot[i].serial < s->serial) slot_wait(&R.slot[i]);   /* [Recomps#1] in submission order (oq_land) */
@@ -418,7 +419,7 @@ static void slot_wait(Slot *s) {
     oq_land((int)(s - R.slot));                    /* [Recomps#1] counter reports of this command buffer */
     lr_land((int)(s - R.slot));                    /* [Recomps#1] finding 118: texels the game reads on the CPU */
     s->pending = 0;
-    if (s->serial > R.done) R.done = s->serial;
+    if (s->serial > R.done) { R.done = s->serial; nvn_front_done_moved(); }      /* finding 138: a game thread waiting for this fence goes on */
 }
 static void garbage_collect(void);
 static uint32_t g_tset_gen = 1;                   /* texture descriptor sets live as long as the command buffer whose pools they come from */
@@ -498,7 +499,7 @@ static uint64_t cmd_submit(VkSemaphore wait, VkSemaphore signal) {
     R.recording = 0; R.cmd = NULL; R.flushes++;
     return R.serial;
 }
-static void cmd_wait_all(void) { cmd_submit(NULL, NULL); for (int i = 0; i < NSLOT; i++) slot_wait(&R.slot[i]); R.done = R.serial; }
+static void cmd_wait_all(void) { cmd_submit(NULL, NULL); for (int i = 0; i < NSLOT; i++) slot_wait(&R.slot[i]); R.done = R.serial; nvn_front_done_moved(); }
 
 /* ---------------------------------------------------------------- stream ring */
 #define RING_ALIGN 256
@@ -512,14 +513,17 @@ static uint64_t ring_raw(const void *p, uint64_t n) {
     R.ring_pos += n;
     return off;
 }
+static LONG64 g_rp_asked, g_rp_hits, g_rp_bytes;     /* finding 138: the range cache of ring_put ("nvn_vk_ring:" line) */
 static uint64_t ring_put(uint64_t addr, uint64_t size) {
     unsigned h = (unsigned)(((addr >> 4) ^ (size * 0x9E3779B1u)) * 2654435761u) >> 19;
+    g_rp_asked++;
     for (int probe = 0; probe < 8; probe++) {
         unsigned i = (h + (unsigned)probe) & 8191;
-        if (R.acache[i].gen == R.gen && R.acache[i].addr == addr && R.acache[i].size == size) return R.acache[i].off;
+        if (R.acache[i].gen == R.gen && R.acache[i].addr == addr && R.acache[i].size == size) { g_rp_hits++; return R.acache[i].off; }
         if (R.acache[i].gen != R.gen) { h = i; break; }
     }
     uint64_t off = ring_raw(P(addr), size);
+    g_rp_bytes += (LONG64)size;
     h &= 8191;
     R.acache[h].addr = addr; R.acache[h].size = size; R.acache[h].off = off; R.acache[h].gen = R.gen;
     return off;
@@ -2926,9 +2930,41 @@ static void lr_record(Tex *d) {
     g_lr_nev[R.cur]++; g_lr_recorded++;
 }
 static void replay(uint64_t handle, int depth);
+/* [Recomps#1] finding 138: submissions that have finished are seen (landed, R.done) during a long replay too, every
+ * 256 commands: the game's fence waits are answered on its own thread from R.done (nvn_vk_sync_done). Without it R.done moved
+ * only between jobs (oq_poll), so a fence that finished during a 4-7 ms replay looked unfinished until the replay's end. */
+static void sync_ran(SyncObj *o);
+static int g_poll_ops, g_fastsync_vk = -1;
+static LONG64 g_sp_calls, g_sp_landed, g_sp_tk;      /* "nvn_vk_ring:" line */
+static void slot_poll(void) {
+    LONG64 t0 = tk();
+    g_sp_calls++;
+    for (;;) {
+        Slot *o = NULL;
+        for (int i = 0; i < NSLOT; i++) if (R.slot[i].pending && (!o || R.slot[i].serial < o->serial)) o = &R.slot[i];
+        if (!o || vkGetFenceStatus(V.device, o->fence) != VK_SUCCESS) break;
+        slot_wait(o); g_sp_landed++;
+    }
+    g_sp_tk += tk() - t0;
+}
+int nvn_vk_sync_done(const SyncObj *o) {          /* any thread: the fence's submission and all before it have finished and landed */
+    uint64_t want = (uint64_t)(uintptr_t)*(void *volatile *)&o->s;
+    if (!want) return 0;
+    /* compute copy-back buffers in flight or kept (B2 dispatches none): they land in cb_poll / cb_sync, which the job runs
+     * around its wait; the game's thread does not answer then (the job does) */
+    if (*(volatile int *)&g_cb_live || *(volatile int *)&g_cb_pending || *(volatile int *)&g_cb_nkept) return 0;
+    int done = want - 1 <= *(volatile uint64_t *)&R.done;
+    MemoryBarrier();                               /* what the game reads next was landed before R.done moved */
+    return done;
+}
 static void exec(const Cmd *m, int depth) {
     const uint8_t *blob = BLOB(m);
     const uint64_t *a = m->a;
+    if (++g_poll_ops >= 256) {                     /* finding 138 (SSBU_FASTSYNC=0: as before) */
+        g_poll_ops = 0;
+        if (g_fastsync_vk < 0) g_fastsync_vk = !(getenv("SSBU_FASTSYNC") && !atoi(getenv("SSBU_FASTSYNC")));
+        if (g_fastsync_vk) slot_poll();
+    }
     switch (m->op) {
     case OP_NOP: case OP_DEBUG: case OP_DISCARD: case OP_CONSDILATE: case OP_SUBPIXEL: break;
     case OP_TEXPOOL: R.tpool = P(a[0]); break;
@@ -3012,7 +3048,7 @@ static void exec(const Cmd *m, int depth) {
     case OP_PRIMRESTART: R.restart = a[0] & 1; break;
     case OP_PATCHSIZE: break;                      /* only read by tessellation, which stops at the draw */
     case OP_IMAGES: break;                         /* only read by compute programs: DispatchCompute stops with its name until M3 */
-    case OP_FENCE: if (a[0]) { SyncObj *o = P(a[0]); if (!o->dead) o->s = (void *)(uintptr_t)(cmd_submit(NULL, NULL) + 1); } break;
+    case OP_FENCE: if (a[0]) { SyncObj *o = P(a[0]); if (!o->dead) { o->s = (void *)(uintptr_t)(cmd_submit(NULL, NULL) + 1); sync_ran(o); } } break;      /* sync_ran: finding 138 */
     case OP_WAITSYNC: break;                       /* one queue: what was submitted before has run before */
     /* [Recomps#1] counters and reports, as the OpenGL back end writes them (nvn_gl.c OP_COUNTER_*): an NVNcounterData
      * {counter, timestamp} at the report address, written when the list is replayed. Type 0 = TIMESTAMP (counter 0, as
@@ -3216,7 +3252,8 @@ static void vk_idle(void) { if (V.alive) { cb_poll(); nvn_front_take_dead(vk_dro
 static void vk_housekeeping(void *arg) { (void)arg; if (V.alive) nvn_front_take_dead(vk_drop); }
 static void vk_flush(void *arg) { (void)arg; if (V.alive) cmd_submit(NULL, NULL); }
 static void vk_finish(void *arg) { (void)arg; if (V.alive) cmd_wait_all(); }
-static void vk_fence(void *arg) { SyncJob *j = arg; if (j->o->dead || !V.alive) return; j->o->s = (void *)(uintptr_t)(cmd_submit(NULL, NULL) + 1); }
+static void sync_ran(SyncObj *o) { if (InterlockedIncrement(&o->ran) > o->posted) o->unsafe = 1; nvn_front_done_moved(); }      /* finding 138: after s (nvn_gl.c sync_fast_done reads ran, then s); a game thread waiting for it looks again */
+static void vk_fence(void *arg) { SyncJob *j = arg; if (j->o->dead || !V.alive) return; j->o->s = (void *)(uintptr_t)(cmd_submit(NULL, NULL) + 1); sync_ran(j->o); }
 static void vk_sync_wait(void *arg) {
     SyncJob *j = arg;
     uint64_t want = (uint64_t)(uintptr_t)j->o->s;
@@ -3863,6 +3900,13 @@ swap: ;
                 l[5] = g_ptm[11]; l[6] = g_set0_upd;
             }
         }
+        {   /* finding 138: the ring's range cache; the polls for finished submissions during a replay (slot_poll) */
+            static LONG64 la, lh, lb, lc, ll, lt; static uint32_t lg;
+            printf("nvn_vk_ring: frames %lld..%lld per frame: %.0f ranges asked, %.0f from the cache, %.0f KB copied, %.1f cache resets | polls for finished submissions during a replay %.1f (%.3f ms), %.2f submissions landed by them\n",
+                   (long long)frame - 300, (long long)frame, (double)(g_rp_asked - la) / 300.0, (double)(g_rp_hits - lh) / 300.0, (double)(g_rp_bytes - lb) / 1024.0 / 300.0, (double)(uint32_t)(R.gen - lg) / 300.0,
+                   (double)(g_sp_calls - lc) / 300.0, (double)(g_sp_tk - lt) * 1000.0 / (double)fq.QuadPart / 300.0, (double)(g_sp_landed - ll) / 300.0);
+            la = g_rp_asked; lh = g_rp_hits; lb = g_rp_bytes; lg = R.gen; lc = g_sp_calls; ll = g_sp_landed; lt = g_sp_tk;
+        }
         if (g_tl_n) {
             double q = 1000.0 / (double)fq.QuadPart / (double)g_tl_n;
             printf("nvn_vk_timeline: frames %lld..%lld, %lld frames with fighters, ms after the start of the batch replay: first submission to the GPU %.2f, last (the frame is complete on the GPU's queue) %.2f, present job begins %.2f | per frame %.2f submissions between passes (SSBU_VK_SPLIT=%d) | the game's fence waits that had to wait: %.2f per frame, %.2f ms each, ending %.2f ms after the batch start\n",
@@ -4166,7 +4210,7 @@ static void vkd_shutdown(void) {
     pcache_save();
     if (g_pcache) { vkDestroyPipelineCache(V.device, g_pcache, NULL); g_pcache = NULL; }
     for (int i = 0; i < NSLOT; i++) slot_wait(&R.slot[i]);
-    R.done = ~0ull; garbage_collect();
+    R.done = ~0ull; nvn_front_done_moved(); garbage_collect();
     while (g_vtex_all) { VTex *vt = g_vtex_all; if (vt->t) vt->t->vk = NULL; vt_destroy(vt); }
     for (int i = 0; i < 1024; i++) for (Pipe *p = g_pipes[i], *n; p; p = n) { n = p->next; vkDestroyPipeline(V.device, p->p, NULL); if (p->p_fast) vkDestroyPipeline(V.device, p->p_fast, NULL); if (!p->libbed) { vkDestroyPipelineLayout(V.device, p->layout, NULL); vkDestroyDescriptorSetLayout(V.device, p->dl[0], NULL); vkDestroyDescriptorSetLayout(V.device, p->dl[1], NULL); } free(p); }
     gpl_destroy();
