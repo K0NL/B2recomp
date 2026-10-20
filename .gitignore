@@ -30,6 +30,7 @@
 !/lifter/sdklift_roots.txt
 !/lifter/test_ext.py
 !/lifter/fps_ticks.txt
+!/lifter/fps_smooth.txt
 
 # ---- 4. runtime (GPL-3.0 copy of ssbu-recomp runtime/ + our changes): hand-written sources only
 !/runtime/LICENSE
