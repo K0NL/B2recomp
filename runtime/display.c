@@ -300,7 +300,49 @@ static void mouse_update(HWND h) {
     if (!g_mouse_grab) { InterlockedExchange(&g_mdx, 0); InterlockedExchange(&g_mdy, 0); }
     mouse_clip(h, front && g_mouse_grab);
 }
+/* [Recomps#1] finding 131: DPI awareness. Without it Windows gives a program on a scaled screen (125 %, 150 %, 300 % ...)
+ * a virtual screen of fewer pixels and enlarges its picture: a player's 4K screen at 300 % gave the borderless window and
+ * the swapchain 1280 x 720, stretched 3x (blurring whatever resolution_scale drew; with Windows HDR on, Vulkan's picture was
+ * also dim there, not explained yet). Now the process is DPI aware (per monitor v2, else per monitor, else system) before
+ * its first window: borderless / fullscreen get the monitor's real pixels, and a windowed size from graphics.ini is scaled
+ * by the monitor's scaling, so the window keeps the size it had. SSBU_DPI_AWARE=0: as before (Windows scales the picture).
+ * TEST: SSBU_DPI=<dpi> sizes the window as on a monitor of that DPI (96 = 100 %). */
+static int g_dpi_aware;
+static void dpi_aware_init(void) {
+    const char *e = getenv("SSBU_DPI_AWARE"), *how = "no";
+    if (e && !atoi(e)) { printf("display: DPI awareness off (SSBU_DPI_AWARE=0): on a scaled screen Windows enlarges the picture\n"); return; }
+    HMODULE u = GetModuleHandleA("user32.dll"), s;
+    BOOL (WINAPI *ctx)(HANDLE) = u ? (BOOL (WINAPI *)(HANDLE))(void *)GetProcAddress(u, "SetProcessDpiAwarenessContext") : NULL;
+    HRESULT (WINAPI *pa)(int) = NULL;
+    if (ctx && ctx((HANDLE)(LONG_PTR)-4)) how = "per monitor (v2)";      /* DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 */
+    else if ((s = LoadLibraryA("shcore.dll")) != NULL && (pa = (HRESULT (WINAPI *)(int))(void *)GetProcAddress(s, "SetProcessDpiAwareness")) != NULL && pa(2) == S_OK) how = "per monitor";
+    else if (SetProcessDPIAware()) how = "system";
+    g_dpi_aware = IsProcessDPIAware();               /* also when compatibility settings or a manifest had set it already */
+    printf("display: DPI aware: %s%s\n", g_dpi_aware ? how : "no", g_dpi_aware && !strcmp(how, "no") ? " (set before us: compatibility settings)" : "");
+}
+static UINT dpi_of(HMONITOR m, int test) {           /* the monitor's scaling as a DPI (96 = 100 %); test: SSBU_DPI wins */
+    const char *t = test ? getenv("SSBU_DPI") : NULL;
+    UINT x = 96, y = 96;
+    if (t && atoi(t) >= 48) return (UINT)atoi(t);
+    if (!g_dpi_aware) return 96;
+    HMODULE s = LoadLibraryA("shcore.dll");
+    HRESULT (WINAPI *gd)(HMONITOR, int, UINT *, UINT *) = s ? (HRESULT (WINAPI *)(HMONITOR, int, UINT *, UINT *))(void *)GetProcAddress(s, "GetDpiForMonitor") : NULL;
+    if (gd && gd(m, 0, &x, &y) == S_OK && x >= 48) return x;      /* MDT_EFFECTIVE_DPI */
+    HDC dc = GetDC(NULL);
+    int v = dc ? GetDeviceCaps(dc, LOGPIXELSX) : 96;
+    if (dc) ReleaseDC(NULL, dc);
+    return v >= 48 ? (UINT)v : 96;
+}
+static void adjust_rect(RECT *r, DWORD style, UINT dpi) {   /* the frame around a client rect, at the window's DPI */
+    HMODULE u = GetModuleHandleA("user32.dll");
+    BOOL (WINAPI *af)(RECT *, DWORD, BOOL, DWORD, UINT) = u && g_dpi_aware ? (BOOL (WINAPI *)(RECT *, DWORD, BOOL, DWORD, UINT))(void *)GetProcAddress(u, "AdjustWindowRectExForDpi") : NULL;
+    if (!af || !af(r, style, FALSE, 0, dpi)) AdjustWindowRect(r, style, FALSE);
+}
 static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    if (m == 0x02E0) {                               /* WM_DPICHANGED (finding 131): a window moved to a monitor of another scaling */
+        if (!gfx_options()->window_mode) { const RECT *s = (const RECT *)l; SetWindowPos(h, NULL, s->left, s->top, s->right - s->left, s->bottom - s->top, SWP_NOZORDER | SWP_NOACTIVATE); }
+        return 0;                                    /* borderless / fullscreen: the monitor's pixels did not change */
+    }
     if (m == WM_INPUT) {
         if (g_mouse_want && g_mouse_grab) {
             RAWINPUT ri;
@@ -351,15 +393,17 @@ static DWORD WINAPI window_thread(LPVOID arg) {
     const GfxOptions *go = gfx_options();
     DWORD style = go->window_mode ? WS_POPUP : WS_OVERLAPPEDWINDOW;
     int cw = go->width, ch = go->height, px = CW_USEDEFAULT, py = CW_USEDEFAULT;
+    POINT origin = {0, 0};
+    UINT dpi = dpi_of(MonitorFromPoint(origin, MONITOR_DEFAULTTOPRIMARY), 1);
     if (go->window_mode) {
         MONITORINFO mi;
-        POINT origin = {0, 0};
         memset(&mi, 0, sizeof mi); mi.cbSize = sizeof mi;
         if (GetMonitorInfoA(MonitorFromPoint(origin, MONITOR_DEFAULTTOPRIMARY), &mi)) { cw = mi.rcMonitor.right - mi.rcMonitor.left; ch = mi.rcMonitor.bottom - mi.rcMonitor.top; px = mi.rcMonitor.left; py = mi.rcMonitor.top; }
-    }
+    } else { cw = MulDiv(cw, (int)dpi, 96); ch = MulDiv(ch, (int)dpi, 96); }      /* finding 131: the size it had when Windows scaled it */
     RECT r = {0, 0, cw, ch};
-    AdjustWindowRect(&r, style, FALSE);
-    printf("display: window %s, client %dx%d (graphics.ini)\n", go->window_mode == 2 ? "fullscreen (borderless, topmost)" : go->window_mode ? "borderless" : "windowed", cw, ch);
+    adjust_rect(&r, style, dpi_of(MonitorFromPoint(origin, MONITOR_DEFAULTTOPRIMARY), 0));      /* the frame at the monitor's real scaling */
+    printf("display: window %s, client %dx%d (graphics.ini; the screen's scaling %u %%%s)\n", go->window_mode == 2 ? "fullscreen (borderless, topmost)" : go->window_mode ? "borderless" : "windowed", cw, ch,
+           dpi * 100 / 96, go->window_mode ? ": the monitor's real pixels" : dpi != 96 ? ": graphics.ini's size scaled by it" : "");
     /* Only the copies a person plays (ssbu_native.exe, ssbu_user.exe, or SSBU_SHOW=1) get a window on screen;
      * test copies started under any other name keep theirs off-screen and out of the taskbar, so automated
      * runs do not cover the desktop. SSBU_TITLE names the window. */
@@ -545,6 +589,9 @@ static void vsync_test_key(void) {
 
 void hitch_init(void); void hitch_pacing(int on);      /* hitch.c: SSBU_HITCH */
 void display_init(void) {
+#ifdef _WIN32
+    dpi_aware_init();                                /* [Recomps#1] finding 131: before the first window */
+#endif
     QueryPerformanceFrequency(&g_freq);
     /* P3 round 3: the console's waits with a time-out (nn::os::TimedWaitEvent, TimedReceiveMessageQueue, timed condition
      * variables: os_threads.c, SleepConditionVariableCS with whole milliseconds) end at the time asked for. At the
