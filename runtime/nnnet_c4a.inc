@@ -174,6 +174,25 @@ static void nifm_HandleNetworkRequestErrorResult(Ctx *c) {
     if (g_nifm_init) trace_printf("     nn::nifm::HandleNetworkRequestErrorResult: no error applet to show (not modelled) -> false\n");
     RET(0);
 }
+/* [Recomps#1] finding 133: Tag Climax -> Online -> Quick Match (a player: "Error Code 2618-0006", then the game closed).
+ * The online library (Pia / NEX) asks nifm for a connection, then calls HandleNetworkRequestResult(), which on a console
+ * without internet shows the system's network-error applet and returns its result. The game's wrapper ([game]
+ * 0x7100f57368): 0 = connected; 0x17c6e (110-190) = ask again (tried first: 186,161 calls in a loop); any other failure
+ * = give up (its code 0xec6b). With no handler (0) it went on, set up its sockets through an overload we did not have,
+ * failed with its own 2618-0006 and, cleaning up, called Finalize on sockets we had never seen initialised: our SDK-abort
+ * check stopped the game. Now this answers 0x1906e (110-200), what the SDK gives with an empty applet block (as for
+ * HandleNetworkRequestErrorResult above), and once per run a message box says why (none in scripted runs or with
+ * SSBU_ERROR_DIALOG=0, as nn::err's dialog). */
+static void nifm_SetLocalNetworkMode(Ctx *c) { (void)c; }      /* (bool) local / internet: there is no network either way */
+static void nifm_HandleNetworkRequestResult(Ctx *c) {
+    static volatile LONG said;
+    const char *off = getenv("SSBU_ERROR_DIALOG");
+    printf("nn::nifm::HandleNetworkRequestResult: no network: 0x1906e, caller 0x%llx\n", (unsigned long long)c->x[30] - 4);
+    if (!((off && off[0] == '0') || getenv("SSBU_SEQ") || getenv("SSBU_PLAY") || getenv("SSBU_PRESS") || getenv("SSBU_SCRIPT")) && !InterlockedExchange(&said, 1))
+        MessageBoxA(NULL, "Online play is not available.\n\nB2recomp cannot connect to Nintendo's online services, so Quick Match and "
+                          "other online modes do not work.", "B2recomp", MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND | MB_TASKMODAL);
+    RET(0x1906eu);
+}
 
 /* ================================================================== nn::socket on Winsock */
 #define SO_MAX_FD 128
@@ -302,6 +321,12 @@ static void socket_Initialize(Ctx *c) {                   /* (void *pool, size_t
     if (g_so_init || !pool || (unsigned)(conc - 1) >= 14 || size <= alloc || (pool & 0xfff) || (size & 0xfff) || (alloc & 0xfff) || alloc <= 0xfff)
         guest_trap("nn::socket::Initialize: [sdk 0x36f89c] abort (already initialised or bad arguments)", c->x[30] - 4);
     if (size < 0xa0000) { RET(0x21bu); return; }
+    if (!g_so_wsa) { WSADATA d; if (WSAStartup(MAKEWORD(2, 2), &d) == 0) g_so_wsa = 1; }
+    g_so_init = 1;
+    RET(0);
+}
+static void socket_InitializeConfig(Ctx *c) {             /* [Recomps#1] finding 133: Initialize(const Config &), the overload B2's online library uses */
+    if (g_so_init) guest_trap("nn::socket::Initialize(Config): [sdk] abort (already initialised)", c->x[30] - 4);
     if (!g_so_wsa) { WSADATA d; if (WSAStartup(MAKEWORD(2, 2), &d) == 0) g_so_wsa = 1; }
     g_so_init = 1;
     RET(0);
@@ -1036,7 +1061,8 @@ static void c4a_register(void) {
         {"_ZN2nn4nifm22GetCurrentIpConfigInfoEP7in_addrS2_S2_S2_S2_", nifm_GetCurrentIpConfigInfo},
         {"_ZN2nn4nifm22GetCurrentProxySettingEPNS0_12ProxySettingE", nifm_GetCurrentProxySetting},
         {"_ZN2nn4nifm31HandleNetworkRequestErrorResultEv", nifm_HandleNetworkRequestErrorResult},
-        {SOK("10InitializeEPvmmi"), socket_Initialize}, {SOK("8FinalizeEv"), socket_Finalize},
+        {"_ZN2nn4nifm26HandleNetworkRequestResultEv", nifm_HandleNetworkRequestResult}, {"_ZN2nn4nifm19SetLocalNetworkModeEb", nifm_SetLocalNetworkMode},
+        {SOK("10InitializeEPvmmi"), socket_Initialize}, {SOK("10InitializeERKNS0_6ConfigE"), socket_InitializeConfig}, {SOK("8FinalizeEv"), socket_Finalize},
         {SOK("12GetLastErrnoEv"), socket_GetLastErrno2}, {"nnsocketGetLastErrno", socket_GetLastErrno2}, {"nnsocketSetLastErrno", socket_SetLastErrno2},
         {SOK("6SocketEiii"), socket_Socket}, {SOK("6SocketENS0_6FamilyENS0_4TypeENS0_8ProtocolE"), socket_Socket}, {"nnsocketSocket", socket_Socket},
         {SOK("5CloseEi"), socket_Close}, {"nnsocketClose", socket_Close},
