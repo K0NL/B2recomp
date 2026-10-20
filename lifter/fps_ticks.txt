@@ -47,5 +47,9 @@
 7100b01ce8 L_7100b01ddc int  +84 countdown, stops at 0 (Witch Time end, State_FinishSlowOff)
 7100b01ce8 L_7100b01dec int  +80 countdown, stops at 0 (same pass as +84; read, not measured)
 7100b01ce8 L_7100b01e0c int  +48 countdown, stops at 0
-7100b095b0 L_7100b09798 f1   +364 float countdown (-1.0 while > 0)
+7100b095b0 L_7100b09798 f1   +364 float countdown (-1.0 while > 0): the combo result display, 400 frames from 0x7100b0a678
+7100b09058 L_7100b09188 f1   combo list (3 entries at +0 / +56 / +112): +20 timer, 180 when a row moves in, -1.0 per pass (finding 137)
+7100b09058 L_7100b093ac f1   combo row 0: +188 timer, 180 when made and 60 per further hit (0x7100b09d8c), -1.0 per pass
+7100b09058 L_7100b093e4 f1   combo row 1: +244 timer, the same
+7100b09058 L_7100b09418 f1   combo row 2: +300 timer, the same; the combo ends when no row and no list entry is left
 7100b610f8 L_7100b61124 int  global countdown, tested
