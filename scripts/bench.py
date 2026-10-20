@@ -86,7 +86,9 @@ def busy_processes(own_pid=None):
     busy = []
     for line in out.splitlines():
         parts = [p.strip('"') for p in line.split('","')]
-        if len(parts) > 1 and re.match(r'(game_native\w*|ssbu_\w+|clang|clang\+\+|lld-link|link|analyzeHeadless)\.exe$', parts[0], re.I):
+        # [Recomps#1] finding 134: llvm-mingw's compiler runs as x86_64-w64-mingw32-clang.exe and clang-23.exe (its linker as
+        # ld.lld.exe), zig's as zig.exe: before, only clang.exe was matched, so a compile could run unnoticed during a run
+        if len(parts) > 1 and re.match(r'(game_native\w*|ssbu_\w+|clang(-\d+)?|clang\+\+|[\w.-]+-mingw32\w*-clang(\+\+)?|ld\.lld|lld-link|link|zig|analyzeHeadless)\.exe$', parts[0], re.I):
             if own_pid is None or int(parts[1]) != own_pid:
                 busy.append('%s (%s)' % (parts[0], parts[1]))
     return busy

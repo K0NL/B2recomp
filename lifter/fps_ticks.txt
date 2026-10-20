@@ -5,9 +5,11 @@
 # every-Nth-frame phase counters (mod 3 / cyclic reloads used for load balancing), the global frame number
 # (0x7100992cdc / 0x71009923b4), and the UI and engine counters.
 #
-# <function> <store label> <kind> <comment>; kind int = the +/-1 that feeds the store becomes +/- tick,
-# f1 = the +/-1.0 operand of the float add that feeds the store is multiplied by tick; f1op = the same, the label
-# naming the add itself.
+# <function> <store label> <kind> <comment>; kind int = the +/-1 that feeds the store moves by the frames due to the
+# visit (finding 134: scripts/fps_patch.py recomps_fps_ci, per store label and field address); f1 = the +/-1.0
+# operand of the float add that feeds the store is multiplied by them (recomps_fps_cf); f1op = the same, the label
+# naming the add itself; f1lin = x = a x + 1.0 (a multiply, then the add): the recurrence runs once per frame due
+# (recomps_fps_lmul / _lsum). The patcher checks each site: the value stepped is loaded from the stored field.
 
 # player (Bayonetta's object)
 7100026048 L_71000269f8 int  +0x4e14 countdown, stops at 0
@@ -30,10 +32,10 @@
 710035f108 L_710035f8c4 f1op em0074 ShieldFloat: +1.0 per frame (the add itself: two paths join at the store)
 
 # game systems
-710093caec L_710093cb94 f1   +2852 +1.0 per frame
-710093caec L_710093cb9c f1   +2860 +1.0 per frame
-710093caec L_710093cba4 f1   +2856 +1.0 per frame
-710093caec L_710093cbb0 f1   +2864 +1.0 per frame
+710093caec L_710093cb94 f1lin +2852 x = 0.9 x + 1.0 per frame (it approaches 10; finding 134, not a counter)
+710093caec L_710093cb9c f1lin +2860 x = 0.9 x + 1.0 per frame (it approaches 10; finding 134, not a counter)
+710093caec L_710093cba4 f1lin +2856 x = 0.9 x + 1.0 per frame (it approaches 10; finding 134, not a counter)
+710093caec L_710093cbb0 f1lin +2864 x = 0.9 x + 1.0 per frame (it approaches 10; finding 134, not a counter)
 71009786d4 L_710097898c f1   +12 +1.0 per frame (stage effect, pre_rocks_NM_height)
 710098fc64 L_710098fdfc int  +288 frames alive
 7100ae25a0 L_7100ae2784 int  +448 frames alive (enemy sound control, SE_EC_em*)

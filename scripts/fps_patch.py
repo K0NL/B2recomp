@@ -1,4 +1,4 @@
-"""Frame rate above 60 fps for Bayonetta 2: patches a copy of the lifted C (notes/fps-research.md, findings 107, 113, 114).
+"""Frame rate above 60 fps for Bayonetta 2: patches a copy of the lifted C (notes/fps-research.md, findings 107, 113, 114, 129, 134).
 
     python scripts/fps_patch.py [--gen=build/gen_eh] --out=<dir> [--ticks=lifter/fps_ticks.txt]
     python scripts/fps_patch.py [--gen=build/gen_eh] --inplace      (the real build: setup.py's lift step runs this)
@@ -10,14 +10,22 @@ frame_rate (runtime/gfx_options.c sets the variables below for 61..120) or from 
     becomes RECOMPS_UNCAP_MIN (default 0.0625 = 960 fps); the 2.0 ceiling stays (slow motion below 30 fps, as the game does);
   - the present 0x7100ed6ca4 asks for interval 0 and 0x7100dc4f4c's 30 fps request is ignored; RECOMPS_UNCAP_FPS=<n> limits
     the rate at the present (0 / unset = none; the display's vsync setting applies too);
-  - the frame counters of lifter/fps_ticks.txt advance by recomps_fps_tick instead of 1: once per logic pass the clock adds
-    the step to an accumulator and the tick is 1 when a whole 60 Hz frame is due, else 0 (always 1 with a step >= 1, so
-    60 fps and slower behave as the original). RECOMPS_FPS_TICKS=0 keeps the counters per pass (for comparisons);
-  - RECOMPS_UNCAP_LOG=1: a line per 600 clock updates (step mean / min / max, ticks).
+  - the frame counters of lifter/fps_ticks.txt advance by the 60 Hz frames of game time due to them (finding 134, the
+    "smart tick"): once per logic pass the clock adds the step to an accumulator and counts the
+    whole frames due (G, at most 4 a pass); per (counter site, field address) a counter that also ran in the previous
+    pass moves by the frames due since its last visit, any other visit (a one-off event) by 1 as made; a countdown never
+    passes 0 in one visit, an up-counter never skips a value (both owe the rest to the next visit), a countdown at 0 with
+    no frame due takes the stock step; the four float values x = 0.9 x + 1 of 0x710093caec run their recurrence once per
+    frame due. With a step >= 1 every visit moves 1 or more, so 60 fps behaves as the original.
+    RECOMPS_FPS_SMART=0: finding 114's tick instead (1 when a frame is due, else 0, for every counter);
+    RECOMPS_FPS_TICKS=0 keeps the counters per pass (for comparisons);
+  - RECOMPS_UNCAP_LOG=1: a line per 600 clock updates (step mean / min / max, ticks; the counters' visits);
+    RECOMPS_FPS_SITELOG=1: per counter site its visits every 6,000 clock updates, and where the first visits that ran off the
+    clock's thread came from (guest return addresses); RECOMPS_FPS_SITELOG=<site key, hex>: also that site's first 400 visits.
   - a cinematic's shot and scene changes (0x7100e322e8, 0x7100e32758) keep their game time: the hold on a shot's last
     keyframe lasts as long as at 30 fps instead of one update (finding 129: the pictures ran ahead of the voices);
     RECOMPS_CINE_FIX=0 = the game's own.
-The patched files include their helpers after '#include "funcs.h"'; funcs.h gains 'extern int recomps_fps_tick;'.
+The patched files include their helpers after '#include "funcs.h"'; funcs.h gains the declarations of PROTOS.
 """
 import os, re, shutil, sys
 
@@ -57,18 +65,194 @@ static void uncap_limit(void) {
 '''
 TICK = r'''
 int recomps_fps_tick = 1;                  /* 1 when a whole 60 Hz frame of game time is due this logic pass, else 0 */
+/* finding 134: N = clock updates so far, G = whole 60 Hz frames of game time due so far (0..4 an update; a longer freeze
+ * keeps 4), and a mark on the thread that runs the clock. Counters also run in jobs on the game's worker threads (object
+ * updates, a stage effect: finding 134), which read the clock while it moves: G of update n is kept at fps_gtab[n & 255]
+ * before n is published, so a reader takes n, then its G. */
+static uint64_t recomps_fps_n, recomps_fps_g, fps_gtab[256];
+static _Thread_local int recomps_fps_logic;
+static void fps_sites_log(long n);         /* the counters' visits (the sites' block) */
 static void uncap_tick(float step) {
-    static int on = -1; static double acc; static long n, ticks; static double sum, mn = 99, mx;
+    static int on = -1; static double acc, acc_g; static long n, ticks, due; static double sum, mn = 99, mx;
     if (on < 0) { const char *e = getenv("RECOMPS_FPS_TICKS"); on = !e || atoi(e); }
+    recomps_fps_logic = 1;
     if (!on) { recomps_fps_tick = 1; return; }
     acc += step;
     if (acc >= 0.999) { recomps_fps_tick = 1; acc -= 1.0; if (acc >= 0.999) acc = 0; } else recomps_fps_tick = 0;
+    acc_g += step;
+    int t = (int)(acc_g + 1e-3);
+    if (t > 4) { t = 4; acc_g = 4.0; }
+    acc_g -= t; if (acc_g < 0) acc_g = 0;
+    recomps_fps_g += (uint64_t)t;
+    fps_gtab[(recomps_fps_n + 1) & 255] = recomps_fps_g;
+    __atomic_store_n(&recomps_fps_n, recomps_fps_n + 1, __ATOMIC_RELEASE);
     {   static int log = -1; if (log < 0) { const char *e = getenv("RECOMPS_UNCAP_LOG"); log = e && atoi(e); }
-        if (log) { n++; ticks += recomps_fps_tick; sum += step; if (step < mn) mn = step; if (step > mx) mx = step;
-            if (n % 600 == 0) { printf("uncap: 600 clock updates: step mean %.3f min %.3f max %.3f, %ld ticks\n", sum / 600, mn, mx, ticks);
-                fflush(stdout); sum = 0; mn = 99; mx = 0; ticks = 0; } } }
+        if (log) { n++; ticks += recomps_fps_tick; due += t; sum += step; if (step < mn) mn = step; if (step > mx) mx = step;
+            if (n % 600 == 0) { printf("uncap: 600 clock updates: step mean %.3f min %.3f max %.3f, %ld ticks, %ld frames due\n", sum / 600, mn, mx, ticks, due);
+                fps_sites_log(n); fflush(stdout); sum = 0; mn = 99; mx = 0; ticks = 0; due = 0; } } }
 }
 '''
+# finding 134: the counters' rules (the design of a dynamic-FPS mod's counters, written again
+# for this game; none of the mod's code). Defined in the clock's file, declared in funcs.h (PROTOS).
+SITES = r'''
+/* One record per (counter site, field address): the update it last ran in (U), the frames due by then (S), the frames
+ * this update gave it (now) and what a limit still owes it (carry, at most 8). */
+typedef struct { uint64_t key, field, S, U; int64_t now, carry; } FpsRec;
+#define FPS_RECS 4096
+static FpsRec fps_rec[FPS_RECS];
+static uint64_t fps_st[8];                 /* visits credited 0 / 1 / more frames, first visits (moved by 1), visits again in the same
+                                              update, visits off the clock's thread, records given way, visits a limit held back */
+static int fps_smart_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("RECOMPS_FPS_SMART"); v = !e || atoi(e); } return v; }
+static uint64_t fps_seq_key;              /* RECOMPS_FPS_SITELOG=<site key, hex>: that site's first 400 visits too */
+static int fps_sitelog_on(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("RECOMPS_FPS_SITELOG"); v = e && strtoull(e, 0, 16); if (v) fps_seq_key = strtoull(e, 0, 16); }
+    return v;
+}
+static struct { uint64_t key, visits, held, de0, again, off, fields, last; int chains; } fps_sl[64];     /* RECOMPS_FPS_SITELOG: per site */
+static void fps_chain(Ctx *c, char *out, int n) {     /* the guest return addresses: x30, then the frame records from x29 */
+    int k = snprintf(out, n, "%llx", (unsigned long long)c->x[30]);
+    uint64_t fp = c->x[29];
+    for (int i = 0; i < 8 && fp && !(fp & 7) && k < n - 20; i++) { k += snprintf(out + k, n - k, " %llx", (unsigned long long)rd64(fp + 8)); fp = rd64(fp); }
+}
+static FpsRec *fps_find(uint64_t key, uint64_t field) {
+    uint64_t h = (key * 0x9E3779B97F4A7C15ull) ^ (field * 0xC2B2AE3D27D4EB4Full);
+    h ^= h >> 29;
+    FpsRec *victim = 0;
+    for (int i = 0; i < 8; i++) {
+        FpsRec *r = &fps_rec[(h + (uint64_t)i) % FPS_RECS];
+        uint64_t k = __atomic_load_n(&r->key, __ATOMIC_ACQUIRE);
+        if (k == key && r->field == field) return r;
+        if (!k) {                                                /* a free slot: claimed with a CAS (two threads may insert) */
+            if (__atomic_compare_exchange_n(&r->key, &k, key, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+                r->field = field; r->U = ~0ull; r->now = r->carry = 0;
+                return r;
+            }
+            if (k == key && r->field == field) return r;
+            continue;
+        }
+        if (!victim || r->U < victim->U) victim = r;            /* all 8 taken: the one visited longest ago gives way */
+    }
+    if (!victim) victim = &fps_rec[h % FPS_RECS];
+    fps_st[6]++;
+    victim->key = key; victim->field = field; victim->U = ~0ull; victim->now = victim->carry = 0;
+    return victim;
+}
+/* The frames due to one visit: a counter that also ran in the previous update gets the frames due since its last visit
+ * (at most 4) plus what an earlier visit was held back from; a second visit in the same update gets this update's frames
+ * again (a counter the game steps twice a frame); any other visit (the first one, a one-off event) moves 1, as made. */
+static int64_t fps_visit(Ctx *c, uint64_t key, uint64_t field, FpsRec **rp) {
+    uint64_t n = __atomic_load_n(&recomps_fps_n, __ATOMIC_ACQUIRE), g = fps_gtab[n & 255];
+    FpsRec *r = fps_find(key, field);
+    int held = r->U == n - 1, again = r->U == n;
+    int64_t de;
+    if (again) { de = r->now; fps_st[4]++; }
+    else {
+        if (held) { de = (int64_t)(g - r->S); if (de < 0) de = 0; if (de > 4) de = 4; de += r->carry; }
+        else { de = 1; fps_st[3]++; }
+        r->carry = 0;
+        if (de > 8) { r->carry = de - 8; de = 8; }
+        r->now = de;
+    }
+    r->S = g; r->U = n;
+    if (!recomps_fps_logic) fps_st[5]++;
+    if (fps_sitelog_on()) {
+        unsigned s = (unsigned)((key >> 2) * 2654435761u) & 63u;
+        for (int i = 0; i < 64; i++, s = (s + 1) & 63u)
+            if (fps_sl[s].key == key || !fps_sl[s].key) {
+                fps_sl[s].key = key; fps_sl[s].visits++; fps_sl[s].held += held; fps_sl[s].de0 += de == 0; fps_sl[s].again += again;
+                fps_sl[s].off += !recomps_fps_logic; if (fps_sl[s].last != field) { fps_sl[s].fields++; fps_sl[s].last = field; }
+                if (!recomps_fps_logic && fps_sl[s].chains < 3) {      /* where a visit off the clock's thread comes from */
+                    char ch[200]; fps_chain(c, ch, sizeof ch); fps_sl[s].chains++;
+                    printf("fps_site: %llx off the clock's thread (thread %p, update %llu): return addresses %s\n", (unsigned long long)key, (void *)&recomps_fps_logic, (unsigned long long)n, ch);
+                }
+                break;
+            }
+    }
+    if (fps_seq_key == key) {
+        static int seq;
+        if (seq++ < 400) printf("fps_seq: %llx update %llu frames due %llu field %llx: %s, credit %lld, thread %p%s\n", (unsigned long long)key, (unsigned long long)n, (unsigned long long)g,
+                                (unsigned long long)field, again ? "again in this update" : held ? "ran in the previous update" : "first visit", (long long)de, (void *)&recomps_fps_logic, recomps_fps_logic ? " (the clock's)" : "");
+    }
+    *rp = r;
+    return de;
+}
+static void fps_limit(FpsRec *r, int64_t *de, int64_t keep) {      /* at most keep frames now; the rest is owed */
+    if (*de > keep) { r->carry += *de - keep; if (r->carry > 8) r->carry = 8; *de = keep; fps_st[7]++; }
+}
+/* An integer counter: what its add / sub of k moves it by. k x the frames due to the visit; a countdown (sign < 0, w = its
+ * value before the sub) never passes 0 in one visit (the stock step still runs: 0 -> -1 as made) and with no frame due
+ * at 0 takes the stock step (a test of the result for 0 would fire again); an up-counter moves at most one step a visit
+ * (a test for an exact value elsewhere would be passed over). Off: k; RECOMPS_FPS_SMART=0: k x recomps_fps_tick. */
+uint32_t recomps_fps_ci(Ctx *c, uint64_t key, uint64_t field, uint32_t wb, int k, int sign) {
+    if (!uncap_on() || !recomps_fps_n) return (uint32_t)k;
+    if (!fps_smart_on()) return (uint32_t)(k * recomps_fps_tick);
+    FpsRec *r;
+    int64_t de = fps_visit(c, key, field, &r), w = (int32_t)wb;
+    if (sign < 0) {
+        if (de == 0 && w == 0) de = 1;
+        fps_limit(r, &de, w > k ? 1 + (w - k) / k : 1);
+    } else fps_limit(r, &de, 1);
+    fps_st[de == 0 ? 0 : de == 1 ? 1 : 2]++;
+    return (uint32_t)(k * de);
+}
+/* A float counter (an add of +-1.0): the frames due to the visit, which multiply the 1.0; the same limits (w = the value
+ * before the add). Off: 1; RECOMPS_FPS_SMART=0: recomps_fps_tick. */
+int recomps_fps_cf(Ctx *c, uint64_t key, uint64_t field, float w, int sign) {
+    if (!uncap_on() || !recomps_fps_n) return 1;
+    if (!fps_smart_on()) return recomps_fps_tick;
+    FpsRec *r;
+    int64_t de = fps_visit(c, key, field, &r);
+    fps_limit(r, &de, sign < 0 ? (w >= 2.0f ? 1 + (int64_t)(w - 1.0f) : 1) : 1);
+    fps_st[de == 0 ? 0 : de == 1 ? 1 : 2]++;
+    return (int)de;
+}
+/* x = a x + b once per frame (0x710093caec's four values, a = 0.9, b = 1.0: they approach 10): at the multiply the visit's
+ * frames d and a^d, at the add b x (1 + a + ... + a^(d-1)); d = 1 is the stock statement, d = 0 keeps x. Off: a and 1;
+ * RECOMPS_FPS_SMART=0: a and recomps_fps_tick, as finding 114 (which kept the multiply per pass). */
+static _Thread_local struct { int64_t d; float a; } fps_lin[4];
+float recomps_fps_lmul(Ctx *c, int slot, uint64_t key, uint64_t field, float a) {
+    int64_t d = 1;
+    float p = a;
+    if (uncap_on() && recomps_fps_n) {
+        if (!fps_smart_on()) d = recomps_fps_tick;
+        else {
+            FpsRec *r;
+            d = fps_visit(c, key, field, &r);
+            fps_st[d == 0 ? 0 : d == 1 ? 1 : 2]++;
+            p = 1.0f;
+            for (int64_t i = 0; i < d; i++) p *= a;
+        }
+    }
+    fps_lin[slot].d = d; fps_lin[slot].a = a;
+    return p;
+}
+float recomps_fps_lsum(int slot) {
+    float s = 0.0f, p = 1.0f;
+    for (int64_t i = 0; i < fps_lin[slot].d; i++) { s += p; p *= fps_lin[slot].a; }
+    return s;
+}
+static void fps_sites_log(long n) {
+    printf("uncap: counters: visits credited 0 / 1 / more frames %llu / %llu / %llu, first visits %llu, again in the same update %llu, "
+           "off the clock's thread %llu, records given way %llu, held back by a limit %llu\n", (unsigned long long)fps_st[0], (unsigned long long)fps_st[1],
+           (unsigned long long)fps_st[2], (unsigned long long)fps_st[3], (unsigned long long)fps_st[4], (unsigned long long)fps_st[5], (unsigned long long)fps_st[6],
+           (unsigned long long)fps_st[7]);
+    memset(fps_st, 0, sizeof fps_st);
+    if (fps_sitelog_on() && n % 6000 == 0) {
+        for (int i = 0; i < 64; i++)
+            if (fps_sl[i].visits)
+                printf("fps_site: %llx visits %llu, ran in the previous update %llu, credited 0 %llu, again in the same update %llu, off the clock's thread %llu, field changes %llu\n",
+                       (unsigned long long)fps_sl[i].key, (unsigned long long)fps_sl[i].visits, (unsigned long long)fps_sl[i].held, (unsigned long long)fps_sl[i].de0,
+                       (unsigned long long)fps_sl[i].again, (unsigned long long)fps_sl[i].off, (unsigned long long)fps_sl[i].fields);
+        memset(fps_sl, 0, sizeof fps_sl);
+    }
+}
+'''
+PROTOS = ('extern int recomps_fps_tick;\n'
+          'uint32_t recomps_fps_ci(Ctx *c, uint64_t key, uint64_t field, uint32_t wb, int k, int sign);\n'
+          'int recomps_fps_cf(Ctx *c, uint64_t key, uint64_t field, float w, int sign);\n'
+          'float recomps_fps_lmul(Ctx *c, int slot, uint64_t key, uint64_t field, float a);\n'
+          'float recomps_fps_lsum(int slot);\n')
 CINE = r'''
 /* [fps_patch.py] finding 129: a cinematic's shots above 60 fps. 0x7100e322e8 moves the shot position (shot i, frame f)
  * by the step; at the end of a shot it holds f at length - k (k = 2 while the game asks for 30 fps) and switches to frame
@@ -137,55 +321,122 @@ def func_range(lines, fn):
     return start, end
 
 
-INT_OP = [  # (regex on the defining line, replacement): the immediate 1 or 2 becomes tick x 1 or 2
-    (re.compile(r'(c->x\[(\d+)\] \+ |c->x\[(\d+)\] - )([12])ULL\)'), lambda m: m.group(1) + '(uint64_t)recomps_fps_tick * %sULL)' % m.group(4)),
-    (re.compile(r'~\(uint(32|64)_t\)([12])ULL, 1\)'), lambda m: '~(uint%s_t)(recomps_fps_tick * %sULL), 1)' % (m.group(1), m.group(2))),
-    (re.compile(r'\(uint(32|64)_t\)([12])ULL, 0\)'), lambda m: '(uint%s_t)(recomps_fps_tick * %sULL), 0)' % (m.group(1), m.group(2))),
+INT_OP = [  # the +/- 1 or 2 of a counter as the lifter writes it: (regex, sign); groups: source register, the immediate
+    (re.compile(r'\(uint32_t\)\(\(uint32_t\)c->x\[(\d+)\] \+ ([12])ULL\)'), 1),
+    (re.compile(r'\(uint32_t\)\(\(uint32_t\)c->x\[(\d+)\] - ([12])ULL\)'), -1),
+    (re.compile(r'adds32\(c, \(uint32_t\)c->x\[(\d+)\], ~\(uint32_t\)([12])ULL, 1\)'), -1),
+    (re.compile(r'adds32\(c, \(uint32_t\)c->x\[(\d+)\], \(uint32_t\)([12])ULL, 0\)'), 1),
 ]
 ASSIGN = lambda r: re.compile(r'^L_[0-9a-f]+: c->x\[%s\] = ' % r)
 MOV = re.compile(r'= \(uint(?:32|64)_t\)\(0U? \| (?:\(uint32_t\))?c->x\[(\d+)\]\);')
 VDEF = lambda r: re.compile(r'(c->v\[%s\]\.f\[0\] = t;|c->v\[%s\] = rdv|vzero\(&c->v\[%s\]\);|c->v\[%s\] = t[12]?;)' % (r, r, r, r))
 CALL = re.compile(r'\bf_[0-9a-f]+\(c\)')
+STORE = re.compile(r'\{  uint64_t a = c->x\[(\d+)\] \+ (\d+)ULL; wr(?:32\(a, \(uint32_t\)c->x\[\d+\]\)|v\(a, &c->v\[(\d+)\], 4\));  \}')
+LOADX = lambda r, b, off: re.compile(r'^L_[0-9a-f]+: \{  uint64_t a = c->x\[%s\] \+ %sULL; c->x\[%s\] = \(uint64_t\)\(rd32\(a\)\);  \}' % (b, off, r))
+LOADV = lambda r, b, off: re.compile(r'^L_[0-9a-f]+: \{  uint64_t a = c->x\[%s\] \+ %sULL; c->v\[%s\] = rdv\(a, 4\);  \}' % (b, off, r))
 
 
-def patch_int(lines, lo, i):
+def store_field(line):
+    """(base register, offset) of a counter's store: its field is c->x[base] + offset"""
+    m = STORE.search(line)
+    if not m:
+        raise SystemExit('not a store to c->x[n] + imm: %s' % line.strip())
+    return m.group(1), m.group(2)
+
+
+def check_base(lines, a, b, base, what):
+    """the field's base register keeps its value over lines a..b (the field is computed at the patched line)"""
+    for k in range(a, b):
+        if ASSIGN(base).match(lines[k]) or CALL.search(lines[k]):
+            raise SystemExit('%s: x%s changes between the patched line and the store: %s' % (what, base, lines[k].strip()))
+
+
+def check_load(lines, lo, k, regex, what):
+    """the value the counter steps was loaded from its own field (load; step; store)"""
+    for j in range(k - 1, max(lo, k - 12), -1):
+        if regex.match(lines[j]):
+            return
+    raise SystemExit('%s: the stepped value is not loaded from the stored field before it' % what)
+
+
+def patch_int(lines, lo, i, key):
+    """the counter's +/- k becomes recomps_fps_ci(...) (finding 134): key = its store's address"""
     m = re.search(r'wr(?:8|16|32|64)\(a, \(uint\d+_t\)c->x\[(\d+)\]\)', lines[i])
     reg = m.group(1)
+    base, off = store_field(lines[i])
     for k in range(i - 1, max(lo, i - 14), -1):
         if not ASSIGN(reg).match(lines[k]):
             continue
         mv = MOV.search(lines[k])
         if mv:
             reg = mv.group(1); continue
-        for rx, rep in INT_OP:
-            new, n = rx.subn(rep, lines[k], count=1)
-            if n:
-                lines[k] = new
-                return k
+        for rx, sign in INT_OP:
+            mm = rx.search(lines[k])
+            if not mm:
+                continue
+            src, imm = mm.group(1), mm.group(2)
+            if reg == base:
+                raise SystemExit('%s: the counter is its own base register' % lines[i][:16])
+            check_base(lines, k + 1, i, base, lines[i][:16])
+            check_load(lines, lo, k, LOADX(src, base, off), lines[i][:16])
+            call = 'recomps_fps_ci(c, 0x%xULL, c->x[%s] + %sULL, (uint32_t)c->x[%s], %s, %d)' % (key, base, off, src, imm, sign)
+            a, b = mm.span()
+            old = lines[k][a:b]
+            new = old.replace('%sULL)' % imm, '(uint64_t)%s)' % call, 1) if sign > 0 and 'adds32' not in old else \
+                old.replace('- %sULL)' % imm, '- (uint64_t)%s)' % call, 1) if 'adds32' not in old else \
+                old.replace('(uint32_t)%sULL, ' % imm, '(uint32_t)%s, ' % call, 1)
+            assert new != old, old
+            lines[k] = lines[k][:a] + new + lines[k][b:]
+            return k
         raise SystemExit('no +/-1 on the line defining x%s for %s: %s' % (reg, lines[i][:16], lines[k].strip()))
     raise SystemExit('no definition of x%s found before %s' % (reg, lines[i][:16]))
 
 
-def patch_f1(lines, lo, i, op=False):
-    if op:
+def patch_f1(lines, lo, hi, i, key, op=False, slot=None):
+    """the 1.0 of a float counter's add is multiplied by recomps_fps_cf(...) (finding 134); slot (kind f1lin): x = a x + 1
+    made of a multiply and the add, a^d at the multiply and 1 + a + ... + a^(d-1) at the add"""
+    if op:                                                # the label names the add: its store follows (two paths may join there)
         j = i
+        d = re.search(r'fnan32\(.*?\); vzero\(&c->v\[(\d+)\]\);', lines[j]).group(1)
+        i = next(k for k in range(j + 1, min(hi, j + 8)) if re.search(r'wrv\(a, &c->v\[%s\], 4\)' % d, lines[k]))
     else:
         v = re.search(r'wrv\(a, &c->v\[(\d+)\]', lines[i]).group(1)
         j = next(k for k in range(i - 1, lo, -1) if VDEF(v).search(lines[k]))
+    base, off = store_field(lines[i])
     m = re.search(r'fnan32\(c->v\[(\d+)\]\.f\[0\] ([+-]) c->v\[(\d+)\]\.f\[0\]\)', lines[j])
     if not m:
         raise SystemExit('no float add at or before %s: %s' % (lines[i][:16], lines[j].strip()))
-    for r in (m.group(1), m.group(3)):
+    for r, other in ((m.group(1), m.group(3)), (m.group(3), m.group(1))):
         for k in range(j - 1, lo, -1):
             if int(r) < 8 and CALL.search(lines[k]):
                 break
             if VDEF(r).search(lines[k]):
-                if re.search(r'fnan32\(\(float\)-?1\.0\)', lines[k]):
-                    old = 'c->v[%s].f[0]' % r
-                    a, b = lines[j].split('fnan32(', 1)
-                    lines[j] = a + 'fnan32(' + b.replace(old, '(%s * (float)recomps_fps_tick)' % old, 1)
-                    return j
-                break
+                c1 = re.search(r'fnan32\(\(float\)(-?)1\.0\)', lines[k])
+                if not c1:
+                    break
+                sign = (-1 if c1.group(1) else 1) * (-1 if m.group(2) == '-' and r == m.group(3) else 1)
+                if m.group(2) == '-' and r == m.group(1):
+                    raise SystemExit('%s: 1.0 - x is not a counter' % lines[i][:16])
+                field = 'c->x[%s] + %sULL' % (base, off)
+                old = 'c->v[%s].f[0]' % r
+                if slot is None:
+                    check_base(lines, j, i, base, lines[i][:16])
+                    check_load(lines, lo, j, LOADV(other, base, off), lines[i][:16])
+                    rep = '(%s * (float)recomps_fps_cf(c, 0x%xULL, %s, c->v[%s].f[0], %d))' % (old, key, field, other, sign)
+                else:                                     # the other operand is x * a, made from the field's value
+                    mul = next(q for q in range(j - 1, lo, -1) if VDEF(other).search(lines[q]))
+                    mm = re.search(r'fnan32\(c->v\[%s\]\.f\[0\] \* c->v\[(\d+)\]\.f\[0\]\); vzero\(&c->v\[%s\]\);' % (other, other), lines[mul])
+                    if not mm or mm.group(1) == other:
+                        raise SystemExit('%s: f1lin, but no x = x * a before the add: %s' % (lines[i][:16], lines[mul].strip()))
+                    check_base(lines, mul, i, base, lines[i][:16])
+                    check_load(lines, lo, mul, LOADV(other, base, off), lines[i][:16])
+                    fa = 'c->v[%s].f[0]' % mm.group(1)
+                    a2, b2 = lines[mul].split('fnan32(', 1)
+                    lines[mul] = a2 + 'fnan32(' + b2.replace('* ' + fa, '* recomps_fps_lmul(c, %d, 0x%xULL, %s, %s)' % (slot, key, field, fa), 1)
+                    rep = '(%s * recomps_fps_lsum(%d))' % (old, slot)
+                a, b = lines[j].split('fnan32(', 1)
+                lines[j] = a + 'fnan32(' + b.replace(old, rep, 1)
+                return j
     raise SystemExit('the float add before %s has no constant 1.0 operand: %s' % (lines[i][:16], lines[j].strip()))
 
 
@@ -243,15 +494,25 @@ def main():
     for lab, hook in CINE_HOOKS:
         replace_once(ls, lab, hook + '\n' + lab)
     cine_file = name
-    # the counters
-    done = 0
+    # the counters (finding 134): each moves by the frames due to it; the key of its record is its store's address
+    done, slots = 0, 0
     for fn, lab, kind in sites:
         name, ls = lines_of(fn)
         lo, hi = func_range(ls, fn)
         i = next(k for k in range(lo, hi) if ls[k].startswith(lab + ':'))
-        k = patch_int(ls, lo, i) if kind == 'int' else patch_f1(ls, lo, i, kind == 'f1op')
-        print('%s %s %-4s %s' % (fn, lab, kind, ls[k][:150]))
+        key = int(lab[2:], 16)
+        if kind == 'int':
+            k = patch_int(ls, lo, i, key)
+        elif kind in ('f1', 'f1op'):
+            k = patch_f1(ls, lo, hi, i, key, op=kind == 'f1op')
+        elif kind == 'f1lin':
+            k = patch_f1(ls, lo, hi, i, key, slot=slots)
+            slots += 1
+        else:
+            raise SystemExit('%s %s: unknown kind %s' % (fn, lab, kind))
+        print('%s %s %-5s %s' % (fn, lab, kind, ls[k][:170]))
         done += 1
+    assert slots <= 4, 'more f1lin sites than fps_lin[] slots'
     # write: helpers after #include "funcs.h" in every patched file (in place: only files whose text changes, so the
     # compile's up-to-date check keeps the others)
     def write(path, text):
@@ -263,13 +524,14 @@ def main():
         src = os.path.join(gen, fname)
         if fname in files:
             text = '\n'.join(files[fname])
-            extra = HELP + (LIMIT if fname == present_file else '') + (TICK if fname == clock_file else '') + (CINE if fname == cine_file else '')
+            extra = HELP + (LIMIT if fname == present_file else '') + (TICK + SITES if fname == clock_file else '') + (CINE if fname == cine_file else '')
             assert text.count('#include "funcs.h"\n') == 1, fname
             write(os.path.join(out, fname), text.replace('#include "funcs.h"\n', '#include "funcs.h"\n' + extra, 1))
-        elif fname == 'funcs.h':
+        elif fname == 'funcs.h':                          # the sites' helpers (defined in the clock's file); older lists replaced
             h = open(src, encoding='utf-8').read()
-            if 'extern int recomps_fps_tick;' not in h:
-                h = h.replace('\n', '\nextern int recomps_fps_tick;\n', 1)
+            if PROTOS not in h:
+                h = '\n'.join(l for l in h.split('\n') if not l.startswith(('extern int recomps_fps_tick;', 'uint32_t recomps_fps_', 'int recomps_fps_', 'float recomps_fps_')))
+                h = h.replace('\n', '\n' + PROTOS, 1)
             write(os.path.join(out, fname), h)
         elif inplace:
             if fname.endswith('.c') and os.path.isfile(os.path.join(orig, fname)):      # patched before, no longer: the lifter's text
