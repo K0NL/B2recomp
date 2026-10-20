@@ -1,4 +1,4 @@
-"""Frame rate above 60 fps for Bayonetta 2: patches a copy of the lifted C (notes/fps-research.md, findings 107, 113, 114, 129, 134).
+"""Frame rate above 60 fps for Bayonetta 2: patches a copy of the lifted C (notes/fps-research.md, findings 107, 113, 114, 129, 134, 136).
 
     python scripts/fps_patch.py [--gen=build/gen_eh] --out=<dir> [--ticks=lifter/fps_ticks.txt]
     python scripts/fps_patch.py [--gen=build/gen_eh] --inplace      (the real build: setup.py's lift step runs this)
@@ -17,7 +17,11 @@ frame_rate (runtime/gfx_options.c sets the variables below for 61..120) or from 
     passes 0 in one visit, an up-counter never skips a value (both owe the rest to the next visit), a countdown at 0 with
     no frame due takes the stock step; the four float values x = 0.9 x + 1 of 0x710093caec run their recurrence once per
     frame due. With a step >= 1 every visit moves 1 or more, so 60 fps behaves as the original.
-    RECOMPS_FPS_SMART=0: finding 114's tick instead (1 when a frame is due, else 0, for every counter);
+  - finding 136: float timers that run out (x -= their time this update, then a constant P at or below 0) keep
+    their overshoot (P + r, found by their form in every lifted file: find_reloads), and the 48 smoothings
+    x += k (T - x) of lifter/fps_smooth.txt take the closed form T + (x - T)(1 - k)^f (f = the step when the site also ran
+    in the previous update, else 1);
+    RECOMPS_FPS_SMART=0: finding 114's tick instead (1 when a frame is due, else 0, for every counter; no reloads, no smoothing);
     RECOMPS_FPS_TICKS=0 keeps the counters per pass (for comparisons);
   - RECOMPS_UNCAP_LOG=1: a line per 600 clock updates (step mean / min / max, ticks; the counters' visits);
     RECOMPS_FPS_SITELOG=1: per counter site its visits every 6,000 clock updates, and where the first visits that ran off the
@@ -63,6 +67,7 @@ int recomps_fps_tick = 1;                  /* 1 when a whole 60 Hz frame of game
  * updates, a stage effect: finding 134), which read the clock while it moves: G of update n is kept at fps_gtab[n & 255]
  * before n is published, so a reader takes n, then its G. */
 static uint64_t recomps_fps_n, recomps_fps_g, fps_gtab[256];
+static float fps_stab[256];               /* the step of update n at [n & 255] (finding 136: smoothing) */
 static _Thread_local int recomps_fps_logic;
 static void fps_sites_log(long n);         /* the counters' visits (the sites' block) */
 static void uncap_tick(float step) {
@@ -78,6 +83,7 @@ static void uncap_tick(float step) {
     acc_g -= t; if (acc_g < 0) acc_g = 0;
     recomps_fps_g += (uint64_t)t;
     fps_gtab[(recomps_fps_n + 1) & 255] = recomps_fps_g;
+    fps_stab[(recomps_fps_n + 1) & 255] = step;
     __atomic_store_n(&recomps_fps_n, recomps_fps_n + 1, __ATOMIC_RELEASE);
     {   static int log = -1; if (log < 0) { const char *e = getenv("RECOMPS_UNCAP_LOG"); log = e && atoi(e); }
         if (log) { n++; ticks += recomps_fps_tick; due += t; sum += step; if (step < mn) mn = step; if (step > mx) mx = step;
@@ -90,7 +96,7 @@ static void uncap_tick(float step) {
 SITES = r'''
 /* One record per (counter site, field address): the update it last ran in (U), the frames due by then (S), the frames
  * this update gave it (now) and what a limit still owes it (carry, at most 8). */
-typedef struct { uint64_t key, field, S, U; int64_t now, carry; } FpsRec;
+typedef struct { uint64_t key, field, S, U; int64_t now, carry; float f; } FpsRec;
 #define FPS_RECS 4096
 static FpsRec fps_rec[FPS_RECS];
 static uint64_t fps_st[8];                 /* visits credited 0 / 1 / more frames, first visits (moved by 1), visits again in the same
@@ -225,12 +231,50 @@ float recomps_fps_lsum(int slot) {
     for (int64_t i = 0; i < fps_lin[slot].d; i++) { s += p; p *= fps_lin[slot].a; }
     return s;
 }
+/* finding 136: x += k (T - x) once per update with a constant k (lifter/fps_smooth.txt) settled twice as fast per
+ * second at 120 fps. The multiply e = (T - x) k takes the rate 1 - (1 - k)^f, f = the step (60 Hz frames) of this update
+ * when the site also ran in the previous update (a second visit in the same update: the same f), else 1: the closed form
+ * T + (x - T)(1 - k)^f. f = 1 returns k itself (the stock statement). Off: k. */
+static uint64_t fps_sm[2];                 /* smoothing visits, of them given the step */
+float recomps_fps_smk(Ctx *c, float k, uint64_t key, uint64_t field) {
+    (void)c;
+    if (!uncap_on() || !fps_smart_on() || !recomps_fps_n) return k;
+    uint64_t n = __atomic_load_n(&recomps_fps_n, __ATOMIC_ACQUIRE);
+    FpsRec *r = fps_find(key, field);
+    float f = r->U == n ? r->f : r->U == n - 1 ? fps_stab[n & 255] : 1.0f;
+    r->f = f; r->U = n; r->S = fps_gtab[n & 255];
+    fps_sm[0]++;
+    if (f == 1.0f || !(k > 0.0f && k < 1.0f) || !(f > 0.0f)) return k;
+    fps_sm[1]++;
+    return 1.0f - powf(1.0f - k, f);
+}
+/* finding 136: a float timer that ran out (s_X = x - its time this update, r <= 0) and gets its constant P again
+ * (the bits in w_C, stored next): P + r keeps the overshoot, which stock drops, so whenever the step varies each period
+ * lasted up to one step longer (P = 1 frame: about 20 % at 120 fps); at or below -P the phase is kept (the expiries in
+ * between are not run). Off: P. */
+static uint64_t fps_rl[2];                 /* reloads given their overshoot, of them a whole period or more behind */
+void recomps_fps_reload(Ctx *c, int C, int X) {
+    if (!uncap_on() || !fps_smart_on()) return;
+    uint32_t b = (uint32_t)c->x[C];
+    float p, r = c->v[X].f[0], v;
+    memcpy(&p, &b, 4);
+    if (!(p > 0.0f && r < 0.0f)) return;
+    if (r > -p) v = p + r;
+    else { v = p + fmodf(r, p); if (!(v > 0.0f && v <= p)) v = p; fps_rl[1]++; }
+    memcpy(&b, &v, 4);
+    c->x[C] = b;
+    fps_rl[0]++;
+}
 static void fps_sites_log(long n) {
     printf("uncap: counters: visits credited 0 / 1 / more frames %llu / %llu / %llu, first visits %llu, again in the same update %llu, "
            "off the clock's thread %llu, records given way %llu, held back by a limit %llu\n", (unsigned long long)fps_st[0], (unsigned long long)fps_st[1],
            (unsigned long long)fps_st[2], (unsigned long long)fps_st[3], (unsigned long long)fps_st[4], (unsigned long long)fps_st[5], (unsigned long long)fps_st[6],
            (unsigned long long)fps_st[7]);
     memset(fps_st, 0, sizeof fps_st);
+    printf("uncap: reloads: %llu float timers kept their overshoot (%llu of them a period or more behind)\n", (unsigned long long)fps_rl[0], (unsigned long long)fps_rl[1]);
+    memset(fps_rl, 0, sizeof fps_rl);
+    printf("uncap: smoothing: %llu visits, %llu of them given the step\n", (unsigned long long)fps_sm[0], (unsigned long long)fps_sm[1]);
+    memset(fps_sm, 0, sizeof fps_sm);
     if (fps_sitelog_on() && n % 6000 == 0) {
         for (int i = 0; i < 64; i++)
             if (fps_sl[i].visits)
@@ -245,7 +289,9 @@ PROTOS = ('extern int recomps_fps_tick;\n'
           'uint32_t recomps_fps_ci(Ctx *c, uint64_t key, uint64_t field, uint32_t wb, int k, int sign);\n'
           'int recomps_fps_cf(Ctx *c, uint64_t key, uint64_t field, float w, int sign);\n'
           'float recomps_fps_lmul(Ctx *c, int slot, uint64_t key, uint64_t field, float a);\n'
-          'float recomps_fps_lsum(int slot);\n')
+          'float recomps_fps_lsum(int slot);\n'
+          'void recomps_fps_reload(Ctx *c, int C, int X);\n'
+          'float recomps_fps_smk(Ctx *c, float k, uint64_t key, uint64_t field);\n')
 CINE = r'''
 /* [fps_patch.py] finding 129: a cinematic's shots above 60 fps. 0x7100e322e8 moves the shot position (shot i, frame f)
  * by the step; at the end of a shot it holds f at length - k (k = 2 while the game asks for 30 fps) and switches to frame
@@ -312,6 +358,74 @@ def func_range(lines, fn):
     start = next(i for i, l in enumerate(lines) if l.startswith('void f_%s(' % fn))
     end = next(i for i in range(start, len(lines)) if lines[i].startswith('}'))
     return start, end
+
+
+# finding 136: float reloads, found in every lifted file by their form (B2 has no site table):
+#   x = [B + off]; s = x - b; fcmp s, 0 and str s, [B + off] (either order); b.hi / b.gt past the reload (the timer still
+#   above 0); then straight-line lines (no call, no goto, no direct jump into them, s not written) to str wC, [B + off]
+#   with wC a float constant P (mov, or mov + movk) in 0.01..100000. b is the timer's time this update (B2: mostly the
+#   per-object time the getter 0x7100dd1914 left at [obj + 3916] / [obj + 3108]).
+RL_FSUB = re.compile(r'^L_([0-9a-f]+): \{ float t = fnan32\(c->v\[(\d+)\]\.f\[0\] - c->v\[(\d+)\]\.f\[0\]\); vzero\(&c->v\[(\d+)\]\); c->v\[\4\]\.f\[0\] = t; \}$')
+RL_FCMP0 = lambda s: re.compile(r'^L_[0-9a-f]+: fcmp(?:e)?\(c, \(double\)c->v\[%s\]\.f\[0\], \(double\)0\);$' % s)
+RL_STV = lambda s: re.compile(r'^L_[0-9a-f]+: \{  uint64_t a = c->x\[(\d+)\] \+ (\d+)ULL; wrv\(a, &c->v\[%s\], 4\);  \}$' % s)
+RL_LDV = lambda b, off, r: re.compile(r'^L_[0-9a-f]+: \{  uint64_t a = c->x\[%s\] \+ %sULL; c->v\[%s\] = rdv\(a, 4\);  \}$' % (b, off, r))
+RL_BR = re.compile(r'^L_([0-9a-f]+): if \(cond\(c, (8|12)\)\) goto L_([0-9a-f]+);$')
+RL_MOVW = re.compile(r'^L_[0-9a-f]+: c->x\[(\d+)\] = \(uint32_t\)\((?:0U \| )?(0x[0-9a-f]+)ULL\);$')
+RL_MOVK = lambda r: re.compile(r'^L_[0-9a-f]+: c->x\[%s\] = \(uint32_t\)\(\(\(uint32_t\)c->x\[%s\] & ~0xffffULL\) \| (0x[0-9a-f]+)ULL\);$' % (r, r))
+RL_STW = lambda b, off, r: re.compile(r'^L_([0-9a-f]+): \{  uint64_t a = c->x\[%s\] \+ %sULL; wr32\(a, \(uint32_t\)c->x\[%s\]\);  \}$' % (b, off, r))
+RL_DEF = re.compile(r'^(?:static )?void f_([0-9a-f]+)\(')
+RL_STOP = re.compile(r'\bf_[0-9a-f]+\(c\)|call_indirect|return|goto ')
+
+
+def find_reloads(lines):
+    """[(store line index, w register, s register, P)] of one file's pristine lines"""
+    import struct
+    jumped = set()                                        # labels a direct goto reaches (the dispatch switch's cases do not count)
+    for l in lines:
+        if not l.lstrip().startswith('case 0x'):
+            jumped.update(re.findall(r'goto L_([0-9a-f]+);', l))
+    out, fstart = [], 0
+    for i, l in enumerate(lines):
+        if RL_DEF.match(l):
+            fstart = i
+        m = RL_FSUB.match(l)
+        if not m:
+            continue
+        a_, s_ = m.group(2), m.group(4)
+        k, cmp_, st, base, off = i + 1, False, False, None, None
+        while k < min(len(lines), i + 3) and not (cmp_ and st):
+            if RL_FCMP0(s_).match(lines[k]):
+                cmp_ = True
+            elif RL_STV(s_).match(lines[k]):
+                base, off = RL_STV(s_).match(lines[k]).groups(); st = True
+            else:
+                break
+            k += 1
+        if not (cmp_ and st) or k >= len(lines) or not RL_BR.match(lines[k]):
+            continue
+        if not any(RL_LDV(base, off, a_).match(lines[j]) for j in range(max(fstart, i - 10), i)):
+            continue                                      # not x = x - b on the stored field
+        found = None
+        for j in range(k + 1, min(len(lines), k + 9)):
+            lab = lines[j].split(':', 1)[0][2:] if lines[j].startswith('L_') else None
+            if lab is None or lab in jumped or RL_STOP.search(lines[j]):
+                break
+            if re.search(r'c->v\[%s\]' % s_, lines[j]):
+                break                                     # s read or written in between: not the plain form
+            mw = RL_MOVW.match(lines[j])
+            if mw and not found:
+                r, v = mw.group(1), int(mw.group(2), 16)
+                if j + 1 < len(lines) and RL_MOVK(r).match(lines[j + 1]):
+                    v = (v & 0xffff0000) | int(RL_MOVK(r).match(lines[j + 1]).group(1), 16)
+                found = (r, struct.unpack('<f', struct.pack('<I', v & 0xffffffff))[0])
+                continue
+            if found and RL_STW(base, off, found[0]).match(lines[j]):
+                if 0.01 <= found[1] <= 100000.0:
+                    out.append((j, found[0], s_, found[1]))
+                break
+            if found and re.search(r'c->x\[%s\] =' % found[0], lines[j]) and not RL_MOVK(found[0]).match(lines[j]):
+                break                                     # w register rewritten before the store
+    return out
 
 
 INT_OP = [  # the +/- 1 or 2 of a counter as the lifter writes it: (regex, sign); groups: source register, the immediate
@@ -448,8 +562,8 @@ def main():
     orig = os.path.join(gen, 'fps_orig')
     sites = [l.split()[:3] for l in open(ticks) if l.strip() and not l.startswith('#')]
     files = {}                                            # file -> lines
-    def lines_of(fn):
-        name = find_file(gen, fn)
+    def lines_of(fn, name=None):
+        name = name or find_file(gen, fn)
         if name not in files:
             text = open(os.path.join(gen, name), encoding='utf-8').read()
             if inplace:
@@ -466,6 +580,23 @@ def main():
         hits = [k for k, l in enumerate(lines) if l.startswith(old)]
         assert len(hits) == 1, old
         lines[hits[0]] = new + lines[hits[0]][len(old):]
+
+    # finding 136: float reloads in every lifted file (found by their form, before the other patches touch a line)
+    nrl, rl_files = 0, 0
+    for name in sorted(n for n in os.listdir(gen) if n.startswith('c_') and n.endswith('.c')):
+        text = open(os.path.join(gen, name), encoding='utf-8').read()
+        if inplace and MARK in text:
+            text = open(os.path.join(orig, name), encoding='utf-8').read()
+        found = find_reloads(text.split('\n'))
+        if not found:
+            continue
+        rl_files += 1
+        name, ls = lines_of('', name)
+        for j, w, sreg, p in found:
+            lab = ls[j].split(':', 1)[0]
+            ls[j] = lab + ': recomps_fps_reload(c, %s, %s); ' % (w, sreg) + ls[j][len(lab) + 1:].lstrip(' ')
+            nrl += 1
+    print('reloads: %d float timers in %d files keep their overshoot' % (nrl, rl_files))
 
     # the clock: measured step always, floor RECOMPS_UNCAP_MIN, tick after the step is known
     name, ls = lines_of('7100dd1d60')
@@ -506,6 +637,26 @@ def main():
         print('%s %s %-5s %s' % (fn, lab, kind, ls[k][:170]))
         done += 1
     assert slots <= 4, 'more f1lin sites than fps_lin[] slots'
+    # finding 136: the reviewed smoothing sites (lifter/fps_smooth.txt): the multiply's constant k becomes recomps_fps_smk(...)
+    smooth = opt.get('smooth', os.path.join(ROOT, 'lifter', 'fps_smooth.txt'))
+    nsm = 0
+    for row in ([l.split() for l in open(smooth) if l.strip() and not l.startswith('#')] if os.path.isfile(smooth) else []):
+        fn, stl, mul, kreg, kval = row[:5]
+        name, ls = lines_of(fn)
+        lo, hi = func_range(ls, fn)
+        mi = next(k for k in range(lo, hi) if ls[k].startswith(mul + ':'))
+        si = next(k for k in range(lo, hi) if ls[k].startswith(stl + ':'))
+        base, off = store_field(ls[si])
+        kr = kreg[1:]
+        m = re.search(r'fnan32\(c->v\[(\d+)\]\.f\[0\] \* c->v\[(\d+)\]\.f\[0\]\)', ls[mi])
+        if not m or kr not in (m.group(1), m.group(2)) or m.group(1) == m.group(2):
+            raise SystemExit('%s %s: not the multiply by v%s: %s' % (fn, mul, kr, ls[mi].strip()))
+        check_base(ls, mi, si, base, mul)
+        old_k = 'c->v[%s].f[0]' % kr
+        a, b = ls[mi].split('fnan32(', 1)
+        ls[mi] = a + 'fnan32(' + b.replace(old_k, 'recomps_fps_smk(c, %s, 0x%sULL, c->x[%s] + %sULL)' % (old_k, stl[2:], base, off), 1)
+        nsm += 1
+    print('smoothing: %d sites take the closed form' % nsm)
     # write: helpers after #include "funcs.h" in every patched file (in place: only files whose text changes, so the
     # compile's up-to-date check keeps the others)
     def write(path, text):
@@ -522,9 +673,8 @@ def main():
             write(os.path.join(out, fname), text.replace('#include "funcs.h"\n', '#include "funcs.h"\n' + extra, 1))
         elif fname == 'funcs.h':                          # the sites' helpers (defined in the clock's file); older lists replaced
             h = open(src, encoding='utf-8').read()
-            if PROTOS not in h:
-                h = '\n'.join(l for l in h.split('\n') if not l.startswith(('extern int recomps_fps_tick;', 'uint32_t recomps_fps_', 'int recomps_fps_', 'float recomps_fps_')))
-                h = h.replace('\n', '\n' + PROTOS, 1)
+            h = '\n'.join(l for l in h.split('\n') if not l.startswith(('extern int recomps_fps_tick;', 'uint32_t recomps_fps_', 'int recomps_fps_', 'float recomps_fps_', 'void recomps_fps_')))
+            h = h.replace('\n', '\n' + PROTOS, 1)         # always: earlier lists and duplicates go
             write(os.path.join(out, fname), h)
         elif inplace:
             if fname.endswith('.c') and os.path.isfile(os.path.join(orig, fname)):      # patched before, no longer: the lifter's text
