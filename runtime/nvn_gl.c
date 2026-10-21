@@ -676,7 +676,7 @@ static uint64_t mem_hash(const uint8_t *p, size_t n, int full) {
 static struct { uint64_t page; uint64_t stamp; } *g_ww_tab;
 static uint64_t g_ww_stamp, g_ww_used, g_ww_floor;       /* g_ww_floor: stamp given to every page when the table had to be emptied */
 static int g_ww_off = -1;
-static LONG64 g_ww_clean, g_ww_dirty, g_ww_unwatched, g_ww_tm[4];
+static LONG64 g_ww_clean, g_ww_dirty, g_ww_unwatched, g_ww_tm[10];     /* [4..8]: ww_tex_newest's counts (SSBU_VK_PREPTIME) */
 static uint64_t *ww_slot(uint64_t page, int insert) {
     for (unsigned h = (unsigned)((page * 0x9E3779B97F4A7C15ULL) >> 44);; h = (h + 1) & (WW_SLOTS - 1)) {
         if (g_ww_tab[h].page == page) return &g_ww_tab[h].stamp;
@@ -690,13 +690,15 @@ static uint64_t *ww_slot(uint64_t page, int insert) {
 /* [Recomps#1] finding 140: a page's stamp is also given to its 4 MB region, a key of its own in the same table (the vertex
  * buffers kept on the GPU, nvn_vk_draw.c, ask once per region for all the buffers in it) */
 #define WW_REGION(pg) ((pg) >> 10 | 1ull << 62)
+#define WW_BLOCK(pg) ((pg) >> 4 | 1ull << 61)      /* [Recomps#1] finding 145: and to its 64 KB block (ww_tex_newest) */
 static int g_ww_tmon = -1;
+static ULONG_PTR g_ww_found;                       /* the pages the last question found written */
 static void ww_init(void) {
     if (g_ww_off < 0) { g_ww_off = getenv("SSBU_NO_WRITEWATCH") != NULL; g_ww_tab = calloc(WW_SLOTS, sizeof *g_ww_tab); g_ww_stamp = 1; }
     if (g_ww_tmon < 0) g_ww_tmon = getenv("SSBU_VK_PREPTIME") && atoi(getenv("SSBU_VK_PREPTIME"));
 }
-/* Asks Windows which pages of [p, p+n) were written since the last question; they (and their regions) get a new stamp.
- * 0 = the memory is not write-watched. */
+/* Asks Windows which pages of [p, p+n) were written since the last question; they (and their blocks and regions) get a new
+ * stamp. 0 = the memory is not write-watched. */
 static int ww_ask(const uint8_t *p, size_t n) {
     static void *pages[16384];
     ULONG_PTR count, cap;
@@ -717,16 +719,19 @@ static int ww_ask(const uint8_t *p, size_t n) {
         if (count == cap) {                        /* more written pages than the list holds (or every page of the range): stamp the whole range */
             ResetWriteWatch((void *)p, n);
             for (uint64_t pg = first; pg <= last; pg++) *ww_slot(pg, 1) = stamp;
+            for (uint64_t bk = first >> 4; bk <= last >> 4; bk++) *ww_slot(bk | 1ull << 61, 1) = stamp;
             for (uint64_t rg = first >> 10; rg <= last >> 10; rg++) *ww_slot(rg | 1ull << 62, 1) = stamp;
         } else {
-            uint64_t rl = ~0ull;                   /* the list is in address order: a region once per run of its pages */
+            uint64_t rl = ~0ull, bl = ~0ull;       /* the list is in address order: a block / region once per run of its pages */
             for (ULONG_PTR i = 0; i < count; i++) {
                 uint64_t pg = (uint64_t)(uintptr_t)pages[i] >> 12;
                 *ww_slot(pg, 1) = stamp;
+                if (pg >> 4 != bl) { bl = pg >> 4; *ww_slot(WW_BLOCK(pg), 1) = stamp; }
                 if (pg >> 10 != rl) { rl = pg >> 10; *ww_slot(WW_REGION(pg), 1) = stamp; }
             }
         }
     }
+    g_ww_found = count;
     if (g_ww_tmon) g_ww_tm[1] += pf_now() - t0;
     return 1;
 }
@@ -745,7 +750,9 @@ static uint64_t ww_newest(const uint8_t *p, size_t n) {
     if (g_ww_tmon) g_ww_tm[1] += pf_now() - t0;
     return newest;
 }
-/* SSBU_VK_PREPTIME: ticks in GetWriteWatch, ticks in the stamp table, questions, pages asked about */
+/* SSBU_VK_PREPTIME: ticks in GetWriteWatch, ticks in the stamp table, questions, pages asked about; [4..8] (finding 145,
+ * ww_tex_newest below): cluster questions, texture checks answered by their blocks' stamps, by their pages', textures that
+ * asked for themselves, written pages the cluster questions found */
 const LONG64 *nvn_front_ww_times(void) { return g_ww_tm; }
 /* Round 16 (nvn_vk_draw.c, SSBU_VK_CBKEEP): the same question for any guest range: has the CPU written a page of it since
  * the stamp the caller remembers? 0 = the memory is not write-watched. Render thread only. */
@@ -765,6 +772,69 @@ uint64_t nvn_front_mem_stamp(const void *p, size_t n) {
     return g_ww_off || !n ? 0 : ww_stamps((uint64_t)(uintptr_t)p >> 12, ((uint64_t)(uintptr_t)p + n - 1) >> 12, 0);
 }
 uint64_t nvn_front_mem_now(void) { ww_init(); return g_ww_stamp; }
+/* [Recomps#1] finding 145 (cut C of finding 142): the textures a batch draws with were asked about one by one: ~340 questions a
+ * fight frame at 120 fps (one batch a frame), each a GetWriteWatch of ~0.6 us + ~5 ns a page, then a walk over the texture's
+ * pages in the stamp table, 0.4-0.5 ms of the render thread a frame. Two changes; SSBU_VK_TEXCLUSTER=0: both off.
+ * 1. Clusters: the ranges the previous batch checked (98.6 % of a frame's textures were checked the frame before), sorted and
+ *    joined where less than 256 KB apart (~50 clusters for ~340 textures), are asked about whole, once per batch and again
+ *    after each of our own writes into guest memory (gen = nvn_vk_draw.c's R.gen): one question for every texture inside
+ *    one. The question stamps every written page of the cluster, so a texture checked later in the batch reads the table as
+ *    after its own question. Writes the game makes after the question are seen at the next batch, as writes after a
+ *    texture's own question were. A texture in no cluster (new in this batch), or in one Windows cannot be asked about whole
+ *    (the edge of an allocation), asks for itself as before.
+ * 2. A page's stamp is also its 64 KB block's (ww_ask): when no block of the texture has a stamp newer than the newest one
+ *    given out at its last look (*at, Tex.ww_at), none of its pages has one: unchanged without the walk. Otherwise (and with
+ *    seen = 0) the walk, as before. (Asking whole 4 MB regions was measured slower: ~6 us a question; and a 4 MB region of a
+ *    texture had a newer stamp than the texture had seen in 96 % of the checks.) */
+#define TCL_N 4096
+#define TCL_GAP (256u << 10)
+static struct { uint64_t lo, hi; } g_tcl_seen[TCL_N], g_tcl[TCL_N];      /* the ranges this batch checked; the clusters of the last batch's */
+static struct { uint32_t serial, gen; int bad; } g_tcl_q[TCL_N];        /* a cluster's last question; bad: Windows refused it */
+static int g_tcl_nseen, g_tcl_n, g_tcl_on = -1;
+static uint32_t g_tcl_serial;
+int nvn_vk_cutc_live(void);                        /* nvn_vk_draw.c: TEST ONLY SSBU_VK_CUTC_ALT */
+static int tcl_cmp(const void *a, const void *b) { uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b; return x < y ? -1 : x > y; }
+static void tcl_build(void) {                      /* a new batch: the clusters of the ranges the last one checked */
+    qsort(g_tcl_seen, (size_t)g_tcl_nseen, sizeof g_tcl_seen[0], tcl_cmp);
+    g_tcl_n = 0;
+    for (int i = 0; i < g_tcl_nseen; i++) {
+        if (g_tcl_n && g_tcl_seen[i].lo <= g_tcl[g_tcl_n - 1].hi + TCL_GAP) { if (g_tcl_seen[i].hi > g_tcl[g_tcl_n - 1].hi) g_tcl[g_tcl_n - 1].hi = g_tcl_seen[i].hi; }
+        else g_tcl[g_tcl_n++] = g_tcl_seen[i];
+    }
+    memset(g_tcl_q, 0, sizeof g_tcl_q[0] * (size_t)g_tcl_n);      /* serial 0: never asked (g_serial starts at 1) */
+    g_tcl_nseen = 0;
+}
+static int tcl_find(uint64_t lo, uint64_t hi) {   /* the cluster holding [lo, hi), -1 = none */
+    int a = 0, b = g_tcl_n - 1, r = -1;
+    while (a <= b) { int m = (a + b) / 2; if (g_tcl[m].lo <= lo) { r = m; a = m + 1; } else b = m - 1; }
+    return r >= 0 && hi <= g_tcl[r].hi ? r : -1;
+}
+static uint64_t ww_tex_newest(const uint8_t *p, size_t n, uint64_t seen, uint64_t *at, uint32_t gen) {
+    ww_init();
+    if (g_tcl_on < 0) g_tcl_on = !(getenv("SSBU_VK_TEXCLUSTER") && !atoi(getenv("SSBU_VK_TEXCLUSTER")));
+    if (!g_tcl_on || !nvn_vk_cutc_live()) { *at = 0; return ww_newest(p, n); }
+    if (g_ww_off || !n) return 0;
+    uint64_t lo = (uint64_t)(uintptr_t)p, hi = lo + n;
+    int c, asked = 0;
+    if (g_tcl_serial != g_serial) { tcl_build(); g_tcl_serial = g_serial; }
+    if (g_tcl_nseen < TCL_N) { g_tcl_seen[g_tcl_nseen].lo = lo; g_tcl_seen[g_tcl_nseen++].hi = hi; }
+    if ((c = tcl_find(lo, hi)) >= 0 && !g_tcl_q[c].bad) {
+        if (g_tcl_q[c].serial != g_serial || g_tcl_q[c].gen != gen) {
+            g_tcl_q[c].serial = g_serial; g_tcl_q[c].gen = gen;
+            if (ww_ask((const uint8_t *)(uintptr_t)g_tcl[c].lo, (size_t)(g_tcl[c].hi - g_tcl[c].lo))) { g_ww_tm[4]++; g_ww_tm[8] += (LONG64)g_ww_found; }
+            else g_tcl_q[c].bad = 1;
+        }
+        asked = !g_tcl_q[c].bad;
+    }
+    if (!asked) { if (!ww_ask(p, n)) { *at = 0; return 0; } g_ww_tm[7]++; }
+    LONG64 t0 = g_ww_tmon ? pf_now() : 0;
+    uint64_t newest;
+    if (seen && *at && ww_stamps(lo >> 16, (hi - 1) >> 16, 1ull << 61) <= *at) { newest = seen; g_ww_tm[5]++; }
+    else { newest = ww_stamps(lo >> 12, (hi - 1) >> 12, 0); g_ww_tm[6]++; }
+    *at = g_ww_stamp;
+    if (g_ww_tmon) g_ww_tm[1] += pf_now() - t0;
+    return newest;
+}
 
 static void tex_upload_memory(Tex *t, const Fmt *f) {
     static uint8_t *tmp;
@@ -5592,8 +5662,33 @@ int nvn_front_tex_levels(const Tex *t) {
     while ((maxdim >> maxl) > 0) maxl++;
     return b->samples > 1 ? 1 : levels > maxl ? maxl : levels;
 }
-/* The decision of tex_sync without its OpenGL calls (the same rule, the same fields of Tex). */
-int nvn_front_tex_changed(Tex *t) {
+/* [Recomps#1] finding 145, TEST ONLY: SSBU_VK_TEXLOG=<first>,<last>[,<file>]: every texture check that asks write-watch in
+ * those frames (frame, batch serial, gen, address, bytes, result: 0 unchanged, 1 written with the same hash, 2 changed;
+ * +4 memory not write-watched), written to <file> (texlog.txt) after the last frame */
+static void texlog(const uint8_t *src, size_t n, uint32_t gen, int res) {
+    static long long a = -2, b;
+    static char path[260];
+    static struct { long long f; uint32_t s, g; uint64_t addr, n; int res; } *rec;
+    static int nrec, done;
+    if (a == -2) {
+        const char *e = getenv("SSBU_VK_TEXLOG"), *c;
+        a = -1;
+        if (e) { a = atoll(e); c = strchr(e, ','); b = c ? atoll(c + 1) : a; c = c ? strchr(c + 1, ',') : NULL; snprintf(path, sizeof path, "%s", c ? c + 1 : "texlog.txt"); rec = malloc(sizeof *rec * 200000); }
+    }
+    if (a < 0 || done || !rec) return;
+    long long f = (long long)g_st.frames + 1;
+    if (f < a) return;
+    if (f > b || nrec == 200000) {
+        FILE *fp = fopen(path, "w");
+        if (fp) { for (int i = 0; i < nrec; i++) fprintf(fp, "%lld %u %u %llx %llu %d\n", rec[i].f, rec[i].s, rec[i].g, (unsigned long long)rec[i].addr, (unsigned long long)rec[i].n, rec[i].res); fclose(fp); }
+        done = 1;
+        return;
+    }
+    rec[nrec].f = f; rec[nrec].s = g_serial; rec[nrec].g = gen; rec[nrec].addr = (uint64_t)(uintptr_t)src; rec[nrec].n = n; rec[nrec].res = res; nrec++;
+}
+/* The decision of tex_sync without its OpenGL calls (the same rule, the same fields of Tex). gen: the back end's count of
+ * its own writes into guest memory (finding 145: a texture's region is asked again after each). */
+int nvn_front_tex_changed(Tex *t, uint32_t gen) {
     Fmt f;
     if (t->checked == g_serial) return 0;
     t->checked = g_serial;
@@ -5602,9 +5697,9 @@ int nvn_front_tex_changed(Tex *t) {
     if (!t->b.packaged && t->limit && src + t->data_size > t->limit) return 0;
     if (t->b.packaged && t->uploaded) return 0;
     LONG64 pf0 = pf_now();
-    uint64_t newest = ww_newest(src, t->data_size);
+    uint64_t newest = ww_tex_newest(src, t->data_size, t->uploaded && !t->dirty && t->ww_hashed ? t->ww_seen : 0, &t->ww_at, gen);
     if (newest) {
-        if (t->uploaded && !t->dirty && t->ww_hashed && newest <= t->ww_seen) { g_ww_clean++; pf_add(PF_TEXHASH, pf0); return 0; }
+        if (t->uploaded && !t->dirty && t->ww_hashed && newest <= t->ww_seen) { g_ww_clean++; pf_add(PF_TEXHASH, pf0); texlog(src, t->data_size, gen, 0); return 0; }
         t->ww_seen = newest;
         g_ww_dirty++;
     } else g_ww_unwatched++;
@@ -5612,6 +5707,7 @@ int nvn_front_tex_changed(Tex *t) {
     int same = t->uploaded && !t->dirty && h == t->hash && (!newest || t->ww_hashed);
     t->ww_hashed = newest != 0;
     pf_add(PF_TEXHASH, pf0); g_pf_hash_bytes += (LONG64)t->data_size;
+    texlog(src, t->data_size, gen, (same ? 1 : 2) | (newest ? 0 : 4));
     if (same) return 0;
     t->hash = h; t->uploaded = 1; t->dirty = 0;
     g_st.tex_uploads++;

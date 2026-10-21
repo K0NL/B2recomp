@@ -42,6 +42,7 @@ typedef struct Tex {
     struct Tex *all_next;                  /* every texture ever made (g_all_tex) */
     uint64_t hash;
     uint64_t ww_seen; int ww_hashed;       /* write-watch stamp seen at the last look; hash is a full hash (see ww_newest) */
+    uint64_t ww_at;                        /* [Recomps#1] finding 145: the newest stamp given out at the last look (ww_tex_newest) */
     uint32_t checked;
     TexObj o;
     VNode *views;
@@ -125,8 +126,9 @@ void nvn_front_barrier_texmem(void);                                        /* n
 int nvn_front_tex_layers(const Tex *t);
 int nvn_front_tex_levels(const Tex *t);                                     /* levels the host image has (builder levels clamped to the size) */
 /* 1 when the guest memory of the texture must be read (again): first use, or written since the last look. `commit` = the
- * caller uploads now (the texture's hash and stamps are then updated). */
-int nvn_front_tex_changed(Tex *t);
+ * caller uploads now (the texture's hash and stamps are then updated). gen: the back end's count of its own writes into
+ * guest memory (finding 145: the texture's 4 MB regions are asked about again once it changes). */
+int nvn_front_tex_changed(Tex *t, uint32_t gen);
 /* Calls put() once per (level, layer) with tightly packed texels de-swizzled from the texture's memory; decode != 0 turns
  * every level into RGBA8 with tex_decode_rgba8 (rgba8 = 1 in the call). Returns 0 when the memory is not readable. */
 typedef void nvn_front_put_fn(Tex *t, int level, int layer, int w, int h, int d, const void *data, size_t size, int rgba8, int64_t row_stride);
