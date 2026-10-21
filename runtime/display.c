@@ -339,6 +339,7 @@ static void adjust_rect(RECT *r, DWORD style, UINT dpi) {   /* the frame around 
     if (!af || !af(r, style, FALSE, 0, dpi)) AdjustWindowRect(r, style, FALSE);
 }
 static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    { int menu_wndmsg(HWND, UINT, WPARAM, LPARAM); if (menu_wndmsg(h, m, w, l)) return 0; }      /* edición mejorada: the open menu takes clicks and the wheel */
     if (m == 0x02E0) {                               /* WM_DPICHANGED (finding 131): a window moved to a monitor of another scaling */
         if (!gfx_options()->window_mode) { const RECT *s = (const RECT *)l; SetWindowPos(h, NULL, s->left, s->top, s->right - s->left, s->bottom - s->top, SWP_NOZORDER | SWP_NOACTIVATE); }
         return 0;                                    /* borderless / fullscreen: the monitor's pixels did not change */

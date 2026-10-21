@@ -24,6 +24,10 @@ typedef struct {
 
 static GameHost host;
 
+/* edición mejorada: the switches of the cheats scripts/cheats_patch.py puts into the lifted code; the exe's menu
+   (menu_vk.c) finds them with GetProcAddress. 0 witch time mode (0..3), 1 infinite health, 2 invincible 1P. */
+__declspec(dllexport) volatile int recomps_cheat[16];
+
 void call_indirect(Ctx *c, uint64_t addr) { host.call_indirect(c, addr); }
 void host_import(Ctx *c, int sym) { host.host_import(c, sym); }
 void guest_trap(const char *what, uint64_t addr) { host.guest_trap(what, addr); }

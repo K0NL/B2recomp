@@ -437,6 +437,8 @@ def step_lift(cx):
     # the frame-rate patch (graphics.ini frame_rate above 60; off at 60): the clock, the present and the timers of
     # lifter/fps_ticks.txt, patched into the lifted C in place (scripts/fps_patch.py)
     cx.run('lift', [sys.executable, os.path.join(REPO, 'scripts', 'fps_patch.py'), '--gen=' + os.path.join(cx.build, 'gen_eh'), '--inplace'])
+    # edición mejorada: the in-game menu's cheats as run-time switches (scripts/cheats_patch.py; all off = the game as lifted)
+    cx.run('lift', [sys.executable, os.path.join(REPO, 'scripts', 'cheats_patch.py'), '--gen=' + os.path.join(cx.build, 'gen_eh')])
 
 
 def step_compile(cx):

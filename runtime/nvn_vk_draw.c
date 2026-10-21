@@ -3547,6 +3547,7 @@ static void overlay_draw(uint32_t index) {
     }
 }
 static void vk_present2(void *arg, int progress);
+static void menu_vk_draw(uint32_t index);          /* edición mejorada: the Insert menu (menu_vk.c, included further down) */
 /* Session 14: THE KEPT PRESENT. vk_present2 has blitted and submitted the frame; when display.c says the frame is to be shown
  * at the next tick, vkQueuePresentKHR is not called there: what it needs is kept here and the vsync thread posts
  * nvn_vk_present_flush_job at the tick (render thread, between two other jobs). An out-of-date swapchain found here is
@@ -3803,6 +3804,7 @@ swap: ;
         } else { VkClearColorValue z; memset(&z, 0, sizeof z); z.float32[3] = 1.0f; vkCmdClearColorImage(R.cmd, V.images[index], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &z, 1, &sr); }
         fl_capture(vt, fl_s4, frame, fl_layout);      /* session 13: 16x9 copy of what is presented, for the flash detector */
         overlay_draw(index);
+        if (!progress) menu_vk_draw(index);
         image_barrier(V.images[index], VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
         tp[3] = tk();
         cmd_submit(acq, rend);
@@ -4101,6 +4103,7 @@ static void pcache_save(void) {
 }
 #endif
 #include "nvn_vk_wd.c"                             /* session 12: the freeze watchdog (wd_start / wd_stop) */
+#include "menu_vk.c"                               /* edición mejorada: the in-game menu (Insert) and the cheats */
 static void vkd_init(void) {
 #define X(n) n = (PFN_##n)vkGetDeviceProcAddr(V.device, #n); if (!n) vkd_fail("the device has no " #n);
     VKD(X)

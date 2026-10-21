@@ -57,6 +57,7 @@
 !/scripts/setup.py
 !/scripts/pchtxt.py
 !/scripts/fps_patch.py
+!/scripts/cheats_patch.py
 !/scripts/bench.py
 !/scripts/make_package.py
 !/scripts/package/build.bat

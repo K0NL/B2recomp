@@ -241,6 +241,7 @@ static int keyboard_ours(void) {
     static int ours;
     if (mode < 0) mode = (getenv("SSBU_SEQ") || getenv("SSBU_PLAY")) && !getenv("SSBU_SEQ_KEYBOARD") ? 0 : 1;
     if (!mode) return 0;
+    { int menu_captures_input(void); if (menu_captures_input()) return 0; }      /* edición mejorada: the open menu has the keyboard and frees the mouse */
     if (checked_at != g_sampling) {                       /* once per poll */
         DWORD pid = 0;
         HWND fg = GetForegroundWindow();
@@ -639,6 +640,11 @@ static void fill_pad(uint64_t out, uint32_t id, int style_is_fullkey) {
         rx = g->rx < -STICK_MAX ? -STICK_MAX : g->rx;
         ry = g->ry < -STICK_MAX ? -STICK_MAX : g->ry;
         wired = !g_x[slot].wireless;
+    }
+    {   /* edición mejorada: player 1's pad also drives the menu (L3+R3 opens it); while it is open the game gets a released pad */
+        void menu_pad(uint64_t, int, int); int menu_captures_input(void);
+        if (id == 0) menu_pad(buttons, lx, ly);
+        if (menu_captures_input()) { buttons = 0; lx = ly = rx = ry = 0; }
     }
     if (id == 0) record_or_replay(&buttons, &lx, &ly);
     if (id == 0 && r1_on()) r1_pad(&buttons, &lx, &ly, &rx, &ry);
