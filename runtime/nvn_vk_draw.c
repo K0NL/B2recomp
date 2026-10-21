@@ -12,6 +12,7 @@
 #include <stdarg.h>
 #include <math.h>
 #include "tex_decode.h"
+void rpt_begin(void); void rpt_end(void); int rpt_printf(const char *fmt, ...);     /* hostrt.c: [Recomps#1] the reports in one write each */
 static int have_targets_live(void);
 
 #define VKD(X) X(vkCreateBuffer) X(vkDestroyBuffer) X(vkGetBufferMemoryRequirements) X(vkAllocateMemory) X(vkFreeMemory) X(vkBindBufferMemory) X(vkMapMemory) \
@@ -4062,6 +4063,8 @@ swap: ;
         g_up_fr_tk = g_up_fr_bytes = 0; g_up_fr_n = 0;
         tex_ahead(frame);
     }
+    rpt_begin();                                 /* [Recomps#1] to rpt_end below: the reports of this frame in one write */
+#define printf rpt_printf
     if (frame % 300 == 0) {                      /* where the render thread's time went, per frame, in the last 300 frames */
         static LONG64 last[12], last_sets, last_flush, last_reused, last_disp;
         LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
@@ -4146,6 +4149,8 @@ swap: ;
                (long long)R.cb_guest_words, (long long)R.cb_conflict_words);
     }
     if (frame % 600 == 0) { printf("nvn_vk: images made per NVN texture format (format:count):"); for (int i = 0; i < 256; i++) if (g_fmt_hist[i]) printf(" 0x%x:%u", i, g_fmt_hist[i]); printf("\n"); }
+#undef printf
+    rpt_end();
     R.frame_draws = R.frame_skipped = R.frame_clears = 0;
     {   /* Round 17: a present job that took long, in parts (default: 4 ms and more, at most 400 lines a run;
          * SSBU_VK_PRESENTLOG=<ms>, 0 = off). tp[3] is 0 when no swapchain image could be acquired. */

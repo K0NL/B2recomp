@@ -1888,7 +1888,9 @@ static void prewarm_wait(void) {                   /* render thread, before its 
     fflush(stdout);
     free(g_pw_rec); g_pw_rec = NULL;
 }
+#define printf rpt_printf                  /* [Recomps#1] to the #undef after m4_report: its lines in one write (hostrt.c rpt_begin) */
 static void m4_report(void) {
+    rpt_begin();
     LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
     if (!D.has_vids) printf("nvn_vk_vlay: no dynamic vertex input: %ld vertex layouts (%lld from ../cache/vk/vlayouts.bin, %lld new in this run), %lld looked up in the table (the draw before had another)\n",
                             (long)g_nvlay, (long long)g_vlay_loaded, (long long)g_vlay_new, (long long)g_vlay_lookups);
@@ -1932,7 +1934,9 @@ static void m4_report(void) {
     printf("nvn_vk_cscan: searches for a container header: %lld made (%lld given up at their time budget); answered by an interval a failed search had proved empty: %lld at once, %lld after looking at the steps above it\n", (long long)g_cs_search, (long long)g_cs_gaveup, (long long)g_cs_neg_hit, (long long)g_cs_neg_ext);
     printf("nvn_vk_cscan: container scan %s: %lld containers scanned (%d known), %lld variations, %lld handed to the workers (%lld KB of code copied), %lld pairs found, %.0f ms of the guest threads' time; pipelines made for a container's pass signatures: %lld (counted in the keys above), background jobs %lld queued / %lld done\n",
            g_cscan ? "on" : "off (SSBU_VK_CSCAN=0)", (long long)g_cs_scans, g_ncont, (long long)g_cs_vars, (long long)g_cs_jobs, (long long)(g_cs_bytes >> 10), (long long)g_cs_pairs, (double)g_cs_tk * k, (long long)g_cs_pred, (long long)g_bq_queued, (long long)g_bq_done);
+    rpt_end();
 }
+#undef printf
 static void m4_stop(void) {
     if (!g_pw_nthread) return;
     prewarm_wait();
@@ -2414,6 +2418,7 @@ static void pcache_save(void);
 static volatile int g_store_pct;
 #include "nvn_vk_store.c"                          /* session 11: the container store made by the host from data.arc */
 static int prepfile_cmp(const void *a, const void *b) { const PrepFile *x = a, *y = b; return x->size < y->size ? 1 : x->size > y->size ? -1 : strcmp(x->name, y->name); }
+#define printf rpt_printf                  /* [Recomps#1] m4_report calls it inside its report: in order there, at once elsewhere */
 static void prep_line(const char *what) {
     PROCESS_MEMORY_COUNTERS_EX pm;
     LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
@@ -2429,6 +2434,7 @@ static void prep_line(const char *what) {
            made, libs, (unsigned long long)(pm.PrivateUsage >> 20), (unsigned long long)(pm.WorkingSetSize >> 20));
     fflush(stdout);
 }
+#undef printf
 static int prep_list(const char *dir) {
     char pat[300];
     WIN32_FIND_DATAA fd;

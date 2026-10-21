@@ -209,10 +209,14 @@ void hitch_frame(long long frame, double ms, int battle) {
     g_hitch_frames++; g_hitch_total_ms += ms;
     if (said < 4000) {
         said++;
+        rpt_begin();                              /* [Recomps#1] the line in one write (hostrt.c): it is printed on the render thread */
+#define printf rpt_printf
         printf("hitch: frame %lld%s %.1f ms | system CPU %.0f%% busy, this process %.0f%% of it | %lu page faults |", frame, battle ? " (battle)" : "", ms,
                d_all > 0 ? 100.0 * (d_all - d_idle) / d_all : 0.0, d_all - d_idle > 0 ? 100.0 * d_us / (d_all - d_idle) : 0.0, (unsigned long)d_faults);
         for (int i = 0, shown = 0; i < n && shown < 7; i++) { if (b[i].ms < 1.5 && shown) continue; printf(" [%.1f ms %s]", b[i].ms, b[i].key); shown++; }
         printf("\n");
+#undef printf
+        rpt_end();
     }
     for (int i = 0; i < n; i++) {
         if (!strcmp(b[i].key, "pace")) continue;

@@ -33,6 +33,11 @@ void call_guest(Ctx *c, uint64_t addr);
 uint64_t guest_function_of(uint64_t host_rip);
 void print_import_summary(FILE *out);
 void trace_printf(const char *fmt, ...);
+/* [Recomps#1] reports in one write (hostrt.c): printf calls between rpt_begin and rpt_end, in code that maps printf to
+ * rpt_printf, are written to stdout in one call at the outermost rpt_end */
+void rpt_begin(void);
+void rpt_end(void);
+int rpt_printf(const char *fmt, ...);
 /* nncxxrt.c (P3): regions of game-managed memory, and changes to guest memory, for the per-thread record of readable memory. */
 void cxxrt_guest_region(uint64_t base, uint64_t size);
 // PR #2 (jfb112697): shared prototype so a caller left with the old (void) form fails to build; size 0 = release of the region at base
