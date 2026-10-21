@@ -27,6 +27,33 @@ void trace_printf(const char *fmt, ...) {
     va_end(ap);
 }
 
+/* [Recomps#1] reports in one write (long frames at 120 fps, 2026-10-21): stdout is unbuffered (boot.c: nothing is lost at
+ * a crash), so every printf is a write of its own, ~50 us each on the owner's PC; the report every 300 frames was 35-70 of
+ * them, 5-8 ms of the render thread's present job, and the next frame came late (over 10 ms at 120 fps in nearly every
+ * stretch of 300 frames). Between rpt_begin() and rpt_end() the printf calls of code that maps printf to rpt_printf (the
+ * periodic reports) go into a buffer of this thread, written in one call at the outermost rpt_end(); outside, rpt_printf
+ * prints at once, as printf. A crash inside a report loses that report's lines. */
+#define RPT_CAP 32768
+static _Thread_local char *t_rpt;
+static _Thread_local int t_rpt_len, t_rpt_depth;
+static void rpt_write(void) { if (t_rpt_len) { fwrite(t_rpt, 1, (size_t)t_rpt_len, stdout); t_rpt_len = 0; } }
+void rpt_begin(void) { t_rpt_depth++; }
+void rpt_end(void) { if (t_rpt_depth > 0 && --t_rpt_depth == 0) { rpt_write(); fflush(stdout); } }
+int rpt_printf(const char *fmt, ...) {
+    va_list ap;
+    int n;
+    if (t_rpt_depth > 0 && !t_rpt) t_rpt = malloc(RPT_CAP);
+    if (t_rpt_depth <= 0 || !t_rpt) { va_start(ap, fmt); n = vprintf(fmt, ap); va_end(ap); return n; }
+    va_start(ap, fmt); n = vsnprintf(t_rpt + t_rpt_len, (size_t)(RPT_CAP - t_rpt_len), fmt, ap); va_end(ap);
+    if (n >= 0 && n < RPT_CAP - t_rpt_len) { t_rpt_len += n; return n; }
+    rpt_write();                                   /* full: what is there goes out first, then this line again */
+    va_start(ap, fmt); n = vsnprintf(t_rpt, RPT_CAP, fmt, ap); va_end(ap);
+    if (n >= 0 && n < RPT_CAP) { t_rpt_len = n; return n; }
+    t_rpt_len = 0;
+    va_start(ap, fmt); n = vprintf(fmt, ap); va_end(ap);      /* longer than the buffer: at once, as before */
+    return n;
+}
+
 /* ---------------------------------------------------------------- lookup */
 /* P3: guest address -> lifted function through a hash table built in runtime_init (open addressing, load below 1/2);
  * before that, and as the reference, the binary search over fn_table (sorted by address). Same answer either way. */

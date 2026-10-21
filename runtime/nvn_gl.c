@@ -3547,6 +3547,7 @@ static int g_pf_nthr;
 static DWORD g_pf_main_tid;
 const char *guest_thread_name_of(DWORD tid);                             /* os_threads.c */
 static int pf_cmp_d(const void *a, const void *b) { double x = *(const double *)a, y = *(const double *)b; return x < y ? -1 : x > y; }
+#define printf rpt_printf                  /* [Recomps#1] to the #undef below: the reports go out in one write each (hostrt.c rpt_begin) */
 static void pf_threads(double frames) {
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
     THREADENTRY32 te;
@@ -3572,6 +3573,7 @@ static void pf_threads(double frames) {
         CloseHandle(h);
     }
     CloseHandle(snap);
+    rpt_begin();
     printf("nvn_perf: cpu ms/frame by thread (all %.1f):", total);
     for (int k = 0; k < 10; k++) {
         int best = -1;
@@ -3582,6 +3584,7 @@ static void pf_threads(double frames) {
         top[best].ms = 0;
     }
     printf("\n");
+    rpt_end();
 }
 static DWORD WINAPI pf_threads_thread(LPVOID arg) { for (;;) { WaitForSingleObject((HANDLE)arg, INFINITE); pf_threads(300.0); } }
 static void pf_frame_mark(LONG64 frame) {
@@ -3593,6 +3596,7 @@ static void pf_frame_mark(LONG64 frame) {
     last = now;
     if (g_joblog_frame > 0 && frame == g_joblog_frame + g_joblog_frames) joblog_print();      /* SSBU_JOBLOG */
     if (frame % 300) return;
+    rpt_begin();
     double ft[300], sum = 0;
     memcpy(ft, g_pf_ft, sizeof ft);
     qsort(ft, 300, sizeof ft[0], pf_cmp_d);
@@ -3645,6 +3649,7 @@ static void pf_frame_mark(LONG64 frame) {
                    d[15], d[14], d[6], d[7], d[8], d[9], d[10], d[11], d[12], d[13], d[0], d[1], d[2], d[3], d[4], d[5]);
         }
     }
+    rpt_end();                                   /* before the helper thread prints its line (below), as before */
     {   /* P3 round 2: the snapshot of all threads (CreateToolhelp32Snapshot) took 30-70 ms on the render thread: one long
          * frame in every 300 (hitch log, "present" scope). It is taken by a helper thread now. */
         static HANDLE ev;
@@ -3700,6 +3705,7 @@ static void joblog_print_from(LONG64 from, LONG64 to) {     /* the events from..
     int n = g_jl_slow_ms || g_jl_n > JL_MAX ? JL_MAX : (int)g_jl_n, shown = 0;
     LONG64 t0 = to;
     for (int i = 0; i < n; i++) { taken[i] = !g_jl[i].ev || g_jl[i].t < from || g_jl[i].t > to; if (!taken[i] && g_jl[i].t < t0) t0 = g_jl[i].t; }
+    rpt_begin();                                       /* [Recomps#1] the 8,192 events were ~30,000 writes: a 1.4 s stall at 120 fps */
     for (;;) {                                         /* a few hundred events: selection */
         int b = -1;
         for (int i = 0; i < n; i++) if (!taken[i] && (b < 0 || g_jl[i].t < g_jl[b].t)) b = i;
@@ -3711,6 +3717,7 @@ static void joblog_print_from(LONG64 from, LONG64 to) {     /* the events from..
         printf("\n");
     }
     printf("joblog: %d events\n", shown);
+    rpt_end();
 }
 static void joblog_print(void) { if (!g_jl_slow_ms) joblog_print_from(0, 0x7fffffffffffffffll); }      /* render thread, at the frame mark after the window */
 static void joblog_slow(LONG64 t0, LONG64 now) {      /* game thread: its wait from t0 took long */
@@ -3723,6 +3730,7 @@ static void joblog_slow(LONG64 t0, LONG64 now) {      /* game thread: its wait f
     joblog_print_from(now - freq / 40, now);
     InterlockedExchange(&busy, 0);
 }
+#undef printf
 static void job_present(void *arg) {
     pair_off();
     pw_gate();
