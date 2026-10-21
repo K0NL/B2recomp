@@ -24,9 +24,10 @@ Measured on the developer's PC (Windows 11, 16 threads, a Vulkan 1.3 GPU):
 | Title screen, attract sequence, new game | runs |
 | Prologue (cutscenes, chapter card, first fights) | played through: 900 s, no crash, every system call the game makes handled |
 | Chapter 1 with a controller (DualSense, Xbox, Switch Pro and other SDL3 pads) | played by hand past the first part |
-| Standard test run (`scripts/bench.py`: tutorial and the first fight, scripted) | 59.5 fps (the display rate), 0 faults |
+| Standard test run (`scripts/bench.py`: tutorial and the first fight, scripted) | 59.5 fps at 60 and 119 fps at 120 (the display rate), 0 faults |
+| Frame rate 120 (beta) | the test fight at 119 fps on a 238 Hz monitor, each frame shown for two refreshes; combos, hit-stop, Witch Time and slow motions keep their 60 fps timing |
 | Later chapters | being played and tested |
-| Other PCs, GPUs, Windows 10 | not tested yet |
+| Other PCs and GPUs | run by players on AMD Radeon cards (RX 560 to RX 9070 XT) and on Windows 10; fixes for their reports are in v0.2.1 to v0.2.6 |
 
 Expect bugs. Builds are compared with a scripted test run (`python scripts/bench.py`, see [BUILDING.md](BUILDING.md)).
 
@@ -77,7 +78,7 @@ details.
 | Window mode | **Borderless window** or **Fullscreen** to fill the screen; Windowed with a size you like |
 | Resolution scale | **1.5** for a 1080p screen, **2.0** for 1440p, **3.0** for 4K (strong graphics cards only) |
 | Aspect ratio | **Keep 16:9** (black bars on an ultrawide screen) or **Stretch** |
-| Frame rate (beta) | **60** is the game as made. Up to **120** for a high-refresh screen: experimental, some effects and menus may run faster |
+| Frame rate (beta) | **60** is the game as made. Up to **120** for a high-refresh screen: timers, combos and slow motions keep their 60 fps timing, and on Windows a 120 Hz or 240 Hz screen shows every frame evenly. Still a beta: some effects and menus may run faster |
 | Preset | **Low** only for a weak or laptop graphics chip |
 | Vertical sync, Input latency | leave them as they are |
 
