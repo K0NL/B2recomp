@@ -129,6 +129,11 @@ Code mods (`.pchtxt`, `.ips`) need **Apply (rebuild)**: about a minute, with the
 - The build says the version is wrong: extract again with update 1.2 (v131072) applied.
 - "File in use" during a rebuild: close the game and press the button again.
 - More: [BUILDING.md, Troubleshooting](BUILDING.md#troubleshooting).
+- **To ask for help:** press **Report...** in the launcher (on Linux also `sh scripts/report.sh` in the B2recomp
+  folder). It makes `b2recomp-report.zip` (Windows) or `b2recomp-report.tar.gz` (Linux) with the logs and your PC's
+  details, nothing of the game. Attach it to an issue with a few words on what happened.
+- **Rules for issues:** write the issue **in English** and **attach the report**. An issue that is not in English or
+  has no report attached is closed promptly. (This does not apply to notices from rights holders; see [Legal](#legal).)
 
 ## Building from the source
 
