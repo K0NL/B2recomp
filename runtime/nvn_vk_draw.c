@@ -210,7 +210,7 @@ static VkBuffer vbuf_new(uint64_t size, VkFlags usage, VMem *mem) {
 
 /* ---------------------------------------------------------------- command buffers in flight */
 #define NSLOT 8
-typedef struct { VkCommandBuffer cmd; VkFence fence; VkDescriptorPool pool[16]; int npool, ipool, pending; uint64_t serial; LONG64 ts_frame; } Slot;
+typedef struct { VkCommandBuffer cmd, up; VkFence fence; VkDescriptorPool pool[16]; int npool, ipool, pending, up_rec; uint64_t serial; LONG64 ts_frame; } Slot;      /* up: finding 140, copies submitted before cmd */
 typedef struct VTex VTex;
 static struct {
     Slot slot[NSLOT]; int cur, recording; uint64_t serial, done;      /* serial: number of the last submission; done: every submission up to here has finished */
@@ -489,11 +489,21 @@ static uint64_t cmd_submit(VkSemaphore wait, VkSemaphore signal) {
     if (g_pt_on > 0 && g_pt_slot[R.cur].n) g_pt_draws[g_pt_slot[R.cur].kind[g_pt_slot[R.cur].n - 1]] += g_cmd_draws - g_pt_slot[R.cur].d0;
     if (g_tl_t0) { LONG64 now = tk(); if (!g_tl_first) g_tl_first = now; g_tl_last = now; }
     VKC(vkEndCommandBuffer(s->cmd));
+    VkCommandBuffer cbs[2];
+    uint32_t ncb = 0;
+    if (s->up_rec) {                               /* [Recomps#1] finding 140: the copies into vertex buffers kept on the GPU, before the draws that read them */
+        VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; mb.dstAccessMask = VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_INDEX_READ_BIT;
+        vkCmdPipelineBarrier(s->up, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_VERTEX_INPUT_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+        VKC(vkEndCommandBuffer(s->up));
+        cbs[ncb++] = s->up; s->up_rec = 0;
+    }
+    cbs[ncb++] = s->cmd;
     VkFlags stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
     VkSubmitInfo sb = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
     if (wait) { sb.waitSemaphoreCount = 1; sb.pWaitSemaphores = &wait; sb.pWaitDstStageMask = &stage; }
     if (signal) { sb.signalSemaphoreCount = 1; sb.pSignalSemaphores = &signal; }
-    sb.commandBufferCount = 1; sb.pCommandBuffers = &s->cmd;
+    sb.commandBufferCount = ncb; sb.pCommandBuffers = cbs;
     VKC(vkQueueSubmit(V.queue, 1, &sb, s->fence));
     s->pending = 1; s->serial = ++R.serial;
     R.recording = 0; R.cmd = NULL; R.flushes++;
@@ -2216,6 +2226,186 @@ static int buf_ref(uint64_t addr, uint64_t size, uint64_t align, BufRef *b) {
     b->off = ring_put(addr, size); b->buf = R.ring;      /* in this order: a ring wrap submits */
     return 0;
 }
+/* ---------------------------------------------------------------- [Recomps#1] finding 140: vertex buffers kept on the GPU
+ * A draw's vertex streams went into the stream ring once per batch (the ring's range cache lives for one batch): 25-36 MB a
+ * frame in a fight, 98 % of it the same bytes as the copy before (meshes nobody changes), 1-2.8 ms of the render thread a
+ * frame at 120 fps. Now a stream of at least SSBU_VK_VRC_MIN bytes (4096) whose pages nobody wrote for two frames gets a
+ * buffer of its own in video memory, filled once by the GPU from the ring (in the slot's command buffer `up`, submitted just
+ * before the one being recorded, with a barrier at its end), and draws read it there while none of its pages is written.
+ * Whether a page was written is asked once per batch, where the ring would have copied the stream again: write-watch
+ * (nvn_gl.c), one question per 4 MB region for all the buffers in it, and the stamps of a buffer's own pages only when its
+ * region had a write. A written stream goes back to the ring (its buffer is freed once the GPU is done with it) until it is
+ * calm again; memory that is not write-watched stays on the ring. A buffer not drawn for 600 frames is freed.
+ * SSBU_VK_VRC=0: every stream from the ring as before; =2 (test): the kept buffers in the ring's own memory type, filled by
+ * the CPU, the path taken when the CPU can map video memory (resizable BAR, integrated GPUs); SSBU_VK_VRC_MB: the most memory
+ * kept (512). Not used while compute buffers are live (buf_ref decides then) or for a draw tagged by SSBU_DRAWTAG. */
+uint64_t nvn_front_mem_region(const void *p, size_t n, int ask); uint64_t nvn_front_mem_stamp(const void *p, size_t n); uint64_t nvn_front_mem_now(void);      /* nvn_gl.c */
+int nvn_front_draw_tag(void);
+typedef struct { uint64_t addr, size, stamp, busy; LONG64 seen, used; VkBuffer buf; VMem mem; uint32_t gen; uint8_t state; } VRes;
+enum { VR_FREE, VR_WATCH, VR_KEPT, VR_RING };       /* VR_WATCH: from the ring, its pages watched; VR_KEPT: from its own buffer; VR_RING: not write-watched */
+#define VRC_N 16384
+#define VRC_REG 4096
+static VRes *g_vrc;
+static struct { uint64_t key; uint32_t gen; int each; } g_vreg[VRC_REG];      /* key: region + 1; each: Windows cannot be asked about the region as a whole (the edge of an allocation): its buffers ask for themselves */
+static struct { VkBuffer buf; VMem mem; uint64_t busy; } *g_vgar;
+static int g_vrc_on = -1, g_vrc_direct, g_vrc_n, g_vrc_kept, g_nvgar, g_vgar_cap;
+static uint64_t g_vrc_min, g_vrc_cap, g_vrc_bytes;
+static LONG64 g_vrc_frame = -1, g_vrc_next, g_vs[16];
+/* g_vs: 0/1 streams from kept buffers / the bytes the ring would have copied for them, 2/3 from the ring (watched), 4/5 from the ring (below the minimum), 6/7 from the
+ * ring (not write-watched), 8 regions asked, 9 buffers asked page by page, 10 found written, 11/12 buffers / bytes made,
+ * 13 freed after a write, 14 freed unused, 15 refused (memory cap, full table) */
+static void vrc_init(void) {
+    const char *e = getenv("SSBU_VK_VRC");
+    g_vrc_on = e ? atoi(e) : 1;
+    e = getenv("SSBU_VK_VRC_MIN"); g_vrc_min = e ? strtoull(e, NULL, 10) : 4096;
+    e = getenv("SSBU_VK_VRC_MB"); g_vrc_cap = (e ? strtoull(e, NULL, 10) : 512) << 20;
+    if (g_vrc_on <= 0) { g_vrc_on = 0; printf("nvn_vk_vrc: vertex buffers kept on the GPU: OFF (SSBU_VK_VRC=0), every stream from the stream ring\n"); return; }
+    g_vrc_direct = g_vrc_on == 2 || (D.mp.memoryTypes[g_blk[R.ring_mem.block]->type].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    g_vrc = calloc(VRC_N, sizeof *g_vrc);
+    printf("nvn_vk_vrc: vertex buffers kept on the GPU (finding 140): streams of %llu bytes and more, at most %llu MB, %s; SSBU_VK_VRC=0 = all from the stream ring\n",
+           (unsigned long long)g_vrc_min, (unsigned long long)(g_vrc_cap >> 20), g_vrc_on == 2 ? "in the stream ring's memory type, filled by the CPU (SSBU_VK_VRC=2, a test)" :
+           g_vrc_direct ? "in video memory the CPU can map (the stream ring's type), filled by the CPU" : "in video memory, filled by the GPU from the stream ring");
+}
+static VRes *vrc_find(uint64_t addr, uint64_t size) {      /* inserts a new key (VR_WATCH, never checked) */
+    unsigned h = (unsigned)(((addr >> 4) ^ (size * 0x9E3779B1u)) * 2654435761u) >> 18;
+    for (int probe = 0; probe < 32; probe++) {
+        VRes *e = &g_vrc[(h + (unsigned)probe) & (VRC_N - 1)];
+        if (e->state == VR_FREE) {
+            if (g_vrc_n >= VRC_N * 3 / 4) return NULL;
+            memset(e, 0, sizeof *e); e->addr = addr; e->size = size; e->state = VR_WATCH; e->seen = g_cur_frame; g_vrc_n++;
+            return e;
+        }
+        if (e->addr == addr && e->size == size) return e;
+    }
+    return NULL;
+}
+static void vrc_drop(VRes *e) {                    /* the buffer is freed once the GPU no longer reads it (vrc_collect) */
+    if (g_nvgar == g_vgar_cap) { g_vgar_cap = g_vgar_cap ? g_vgar_cap * 2 : 256; g_vgar = realloc(g_vgar, sizeof *g_vgar * (size_t)g_vgar_cap); }
+    g_vgar[g_nvgar].buf = e->buf; g_vgar[g_nvgar].mem = e->mem; g_vgar[g_nvgar++].busy = e->busy;
+    g_vrc_bytes -= e->size; g_vrc_kept--;
+    e->buf = VK_NULL_HANDLE; e->state = VR_WATCH;
+}
+static void vrc_collect(void) {
+    int n = 0;
+    for (int i = 0; i < g_nvgar; i++) if (g_vgar[i].busy <= R.done) { vkDestroyBuffer(V.device, g_vgar[i].buf, NULL); vmem_free(g_vgar[i].mem); } else g_vgar[n++] = g_vgar[i];
+    g_nvgar = n;
+}
+static void vrc_frame(void) {                      /* once a frame: frees; every 60 frames: buffers not drawn for 600 frames, the table */
+    g_vrc_frame = g_cur_frame;
+    if (g_nvgar) vrc_collect();
+    if (g_cur_frame < g_vrc_next) return;
+    g_vrc_next = g_cur_frame + 60;
+    for (int i = 0; i < VRC_N; i++) if (g_vrc[i].state == VR_KEPT && g_cur_frame - g_vrc[i].used > 600) { vrc_drop(&g_vrc[i]); g_vs[14]++; }
+    if (g_vrc_n > VRC_N / 2) {                     /* keys not used for 600 frames are forgotten */
+        VRes *old = g_vrc;
+        g_vrc = calloc(VRC_N, sizeof *g_vrc); g_vrc_n = 0;
+        for (int i = 0; i < VRC_N; i++) {
+            VRes *o = &old[i], *e;
+            if (o->state == VR_FREE || (o->state != VR_KEPT && g_cur_frame - o->used > 600)) continue;
+            if ((e = vrc_find(o->addr, o->size))) *e = *o; else if (o->state == VR_KEPT) vrc_drop(o);
+        }
+        free(old);
+    }
+}
+/* 1 = a page of the stream was written since its stamp, 0 = not, -1 = the memory is not write-watched */
+static int vrc_written(VRes *e) {
+    uint64_t lo = e->addr, hi = e->addr + e->size - 1;
+    int pages = 0;
+    for (uint64_t r = lo >> 22; r <= hi >> 22 && pages < 2; r++) {
+        unsigned h = (unsigned)((r * 0x9E3779B97F4A7C15ull) >> 52), i = 0;
+        int probe;
+        for (probe = 0; probe < 64; probe++) {
+            i = (h + (unsigned)probe) & (VRC_REG - 1);
+            if (g_vreg[i].key == r + 1) break;
+            if (!g_vreg[i].key) { g_vreg[i].key = r + 1; break; }
+        }
+        if (probe == 64 || g_vreg[i].each) { pages = 2; break; }
+        if (g_vreg[i].gen != R.gen) {              /* the region's first question in this batch */
+            g_vs[8]++;
+            if (!nvn_front_mem_region((void *)(uintptr_t)(r << 22), (size_t)4 << 20, 1)) { g_vreg[i].each = 1; pages = 2; break; }
+            g_vreg[i].gen = R.gen;
+        }
+        if (nvn_front_mem_region((void *)(uintptr_t)(r << 22), (size_t)4 << 20, 0) > e->stamp) pages = 1;      /* the table: also what other questions found since */
+    }
+    if (!pages) return 0;
+    g_vs[9]++;
+    if (pages == 2) { uint64_t s = nvn_front_mem_newest(P(e->addr), (size_t)e->size); return !s ? -1 : s > e->stamp; }
+    return nvn_front_mem_stamp(P(e->addr), (size_t)e->size) > e->stamp;
+}
+static VkCommandBuffer up_cmd(void) {              /* the copies of the slot being recorded, submitted before its command buffer */
+    if (!R.recording) cmd_begin();
+    Slot *s = &R.slot[R.cur];
+    if (!s->up_rec) {
+        VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        VKC(vkResetCommandBuffer(s->up, 0));
+        VKC(vkBeginCommandBuffer(s->up, &bi));
+        s->up_rec = 1;
+    }
+    return s->up;
+}
+static void vrc_fill(VRes *e) {
+    if (g_vrc_bytes + e->size > g_vrc_cap) { g_vs[15]++; return; }
+    uint64_t now = nvn_front_mem_now();            /* after the questions, before the copy: a page written from here on gets a newer stamp */
+    VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    VkMemoryRequirements rq;
+    VkFlags want = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+    bi.size = e->size; bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    bi.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | (g_vrc_direct ? 0 : VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    VKC(vkCreateBuffer(V.device, &bi, NULL, &e->buf));
+    vkGetBufferMemoryRequirements(V.device, e->buf, &rq);
+    if (g_vrc_direct) {
+        uint32_t t = g_blk[R.ring_mem.block]->type;
+        want = D.mp.memoryTypes[t].propertyFlags & (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        if (rq.memoryTypeBits >> t & 1) rq.memoryTypeBits = 1u << t;
+    } else
+        for (uint32_t i = 0; i < D.mp.memoryTypeCount; i++)      /* video memory the CPU cannot map (not the 256 MB window) */
+            if ((rq.memoryTypeBits >> i & 1) && (D.mp.memoryTypes[i].propertyFlags & (VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) == VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) { rq.memoryTypeBits = 1u << i; break; }
+    e->mem = vmem_alloc(rq, want, 4);
+    VKC(vkBindBufferMemory(V.device, e->buf, e->mem.mem, e->mem.off));
+    if (g_vrc_direct) memcpy(e->mem.map, P(e->addr), (size_t)e->size);
+    else {
+        uint64_t off = ring_raw(P(e->addr), e->size);      /* first: a ring wrap submits */
+        VkBufferCopy c = {off, 0, e->size};
+        vkCmdCopyBuffer(up_cmd(), R.ring, e->buf, 1, &c);
+    }
+    e->busy = R.serial + 1;                        /* the submission the copy goes with */
+    e->stamp = now; e->state = VR_KEPT;
+    g_vrc_bytes += e->size; g_vrc_kept++; g_vs[11]++; g_vs[12] += (LONG64)e->size;
+}
+static int vrc_use(void) {
+    if (g_vrc_on < 0) vrc_init();
+    return g_vrc_on > 0 && !g_cb_live && !g_cb_nkept && !nvn_front_draw_tag();
+}
+/* The vertex stream [addr, addr + size) of a draw: its kept buffer, else the ring. Returns the kept entry (NULL: the ring). */
+static VRes *vrc_ref(uint64_t addr, uint64_t size, BufRef *b) {
+    int first = 0;
+    if (g_vrc_frame != g_cur_frame) vrc_frame();
+    VRes *e = size >= g_vrc_min ? vrc_find(addr, size) : NULL;
+    if (!e) { if (size < g_vrc_min) { g_vs[4]++; g_vs[5] += (LONG64)size; } else g_vs[15]++; }
+    else if (e->state == VR_RING) { e->used = g_cur_frame; e = NULL; g_vs[6]++; g_vs[7] += (LONG64)size; }
+    else {
+        e->used = g_cur_frame;
+        first = e->gen != R.gen;
+        if (first) {                               /* its first use in this batch, where the ring would copy it again */
+            int w = vrc_written(e);
+            e->gen = R.gen;
+            if (w < 0) { if (e->state == VR_KEPT) vrc_drop(e); e->state = VR_RING; }
+            else if (w) {
+                if (e->stamp) g_vs[10]++;
+                if (e->state == VR_KEPT) { vrc_drop(e); g_vs[13]++; }
+                e->seen = g_cur_frame; e->stamp = nvn_front_mem_now();
+            } else if (e->state == VR_WATCH && g_cur_frame - e->seen >= 2) vrc_fill(e);
+        }
+        if (e->state == VR_RING) { e = NULL; g_vs[6]++; g_vs[7] += (LONG64)size; }
+        else if (e->state != VR_KEPT) { e = NULL; g_vs[2]++; g_vs[3] += (LONG64)size; }
+    }
+    b->zero = 0; b->size = size;
+    if (!e) { b->off = ring_put(addr, size); b->buf = R.ring; return NULL; }
+    b->off = 0; b->buf = e->buf;
+    g_vs[0]++; if (first) g_vs[1] += (LONG64)size;      /* bytes: what the ring would have copied (once per batch) */
+    return e;
+}
 static void compute_pipe_make(VStage *v);
 static void compute_dispatch_run(Prog *p, Stage *st, VStage *v, uint32_t gx, uint32_t gy, uint32_t gz);
 static void compute_dispatch(uint32_t gx, uint32_t gy, uint32_t gz) {
@@ -2411,14 +2601,16 @@ static int draw_prepare(unsigned prim) {
     /* vertex streams: only the ones an attribute names (a stale binding of another mesh is not read, and is not copied) */
     uint64_t voff[16];
     VkBuffer vbufs[16];
+    VRes *vkept[16];                               /* finding 140: the streams read from kept buffers */
     uint32_t streams = 0;
-    int from_cb = 0;
+    int from_cb = 0, vrc = vrc_use();
     for (int i = 0; i < 16 && i < R.nattr; i++) if (R.vattr[i] & 0xff) streams |= 1u << ((R.vattr[i] >> 8) & 31);
     for (int i = 0; i < 16; i++) {
         BufRef b;
-        voff[i] = ~0ull; vbufs[i] = R.ring;
+        voff[i] = ~0ull; vbufs[i] = R.ring; vkept[i] = NULL;
         if (!(streams >> i & 1) || !R.vbuf[i].addr || !R.vbuf[i].size) continue;
-        from_cb |= buf_ref(R.vbuf[i].addr, R.vbuf[i].size, 1, &b);
+        if (vrc) vkept[i] = vrc_ref(R.vbuf[i].addr, R.vbuf[i].size, &b);
+        else from_cb |= buf_ref(R.vbuf[i].addr, R.vbuf[i].size, 1, &b);
         voff[i] = b.off; vbufs[i] = b.buf;
     }
     if (nvn_front_draw_tag()) { memcpy(g_dt_voff, voff, sizeof g_dt_voff); memcpy(g_dt_vb, vbufs, sizeof g_dt_vb); }      /* round 17, test (SSBU_DRAWTAG) */
@@ -2464,6 +2656,7 @@ static int draw_prepare(unsigned prim) {
         for (uint32_t b = 0; b < vnb; b++) { if (vbs[b] < 0) { vb[b] = R.zero; vo[b] = 65536; } else { vb[b] = vbufs[vbs[b]]; vo[b] = voff[vbs[b]]; } }
         if (D.has_vids) vkCmdSetVertexInputEXT(R.cmd, vnb, vbd, vna, vad);
         if (vnb) vkCmdBindVertexBuffers(R.cmd, 0, vnb, vb, vo);
+        for (int i = 0; i < 16; i++) if (vkept[i]) vkept[i]->busy = R.serial + 1;      /* finding 140: freed only after this command buffer */
     }
     PT(7);
     /* 5. descriptors */
@@ -3907,6 +4100,16 @@ swap: ;
                    (double)(g_sp_calls - lc) / 300.0, (double)(g_sp_tk - lt) * 1000.0 / (double)fq.QuadPart / 300.0, (double)(g_sp_landed - ll) / 300.0);
             la = g_rp_asked; lh = g_rp_hits; lb = g_rp_bytes; lg = R.gen; lc = g_sp_calls; ll = g_sp_landed; lt = g_sp_tk;
         }
+        if (g_vrc_on > 0) {   /* finding 140: the vertex buffers kept on the GPU */
+            static LONG64 l[16];
+            double d[16], mb = 1048576.0 * 300.0;
+            for (int i = 0; i < 16; i++) { d[i] = (double)(g_vs[i] - l[i]); l[i] = g_vs[i]; }
+            printf("nvn_vk_vrc: frames %lld..%lld per frame: streams %.0f from kept buffers (%.2f MB the ring would have copied), %.0f from the ring (%.2f MB asked: watched %.0f / %.2f MB, below %llu bytes %.0f / %.2f MB, not write-watched %.0f / %.2f MB) | "
+                   "regions asked %.1f, buffers asked page by page %.1f, found written %.2f | made %.2f (%.3f MB), freed after a write %.2f, unused %.2f, refused %.2f | kept %d buffers, %.1f MB\n",
+                   (long long)frame - 300, (long long)frame, d[0] / 300.0, d[1] / mb, (d[2] + d[4] + d[6]) / 300.0, (d[3] + d[5] + d[7]) / mb, d[2] / 300.0, d[3] / mb, (unsigned long long)g_vrc_min,
+                   d[4] / 300.0, d[5] / mb, d[6] / 300.0, d[7] / mb, d[8] / 300.0, d[9] / 300.0, d[10] / 300.0, d[11] / 300.0, d[12] / mb, d[13] / 300.0, d[14] / 300.0, d[15] / 300.0,
+                   g_vrc_kept, (double)g_vrc_bytes / 1048576.0);
+        }
         if (g_tl_n) {
             double q = 1000.0 / (double)fq.QuadPart / (double)g_tl_n;
             printf("nvn_vk_timeline: frames %lld..%lld, %lld frames with fighters, ms after the start of the batch replay: first submission to the GPU %.2f, last (the frame is complete on the GPU's queue) %.2f, present job begins %.2f | per frame %.2f submissions between passes (SSBU_VK_SPLIT=%d) | the game's fence waits that had to wait: %.2f per frame, %.2f ms each, ending %.2f ms after the batch start\n",
@@ -4120,6 +4323,7 @@ static void vkd_init(void) {
         VkFenceCreateInfo fi = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
         ai.commandPool = V.pool; ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; ai.commandBufferCount = 1;
         VKC(vkAllocateCommandBuffers(V.device, &ai, &R.slot[i].cmd));
+        VKC(vkAllocateCommandBuffers(V.device, &ai, &R.slot[i].up));      /* finding 140 */
         VKC(vkCreateFence(V.device, &fi, NULL, &R.slot[i].fence));
     }
     R.ring_size = 256ull << 20;
