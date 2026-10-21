@@ -10,7 +10,10 @@ B2recomp\\). Contents:
   B2recomp.exe                       the launcher (launcher/launcher.c, built here with --no-icon): its first start shows the
                                      build screen (dump folder, Build: scripts/setup.py), then the settings and Play
   Build B2recomp.bat                 scripts/package/build.bat: the same build from a console (fallback), then the launcher
-  VERSION                            the short commit the package was made from (scripts/report.py names it)
+  VERSION                            the short commit the package was made from (scripts/report.py names it; the launcher
+                                     opens its build screen when it differs from the one the game was built with)
+  config\\defaults\\*.ini              the default settings, copied to config\\ by the launcher only when missing: a newer
+                                     package unpacked over an old folder keeps the player's settings (an in-place update)
   deps\\llvm-mingw                    llvm-mingw trimmed to the x86_64 build (notes/toolchain-mingw.md section 1)
   deps\\SDL3, deps\\Vulkan-Headers     headers, the x64 import library and SDL3.dll
   deps\\ssbu_glslang.dll              the shader-compiler shim (runtime/vk_glslang_shim.c + glslang), game-independent,
@@ -170,6 +173,13 @@ def main():
     lic = os.path.join(pkg, 'licenses')
     os.makedirs(lic)
     nsrc = source_tree(pkg)
+    # as main_linux: the default settings go to config\defaults (the launcher copies them to config\ when missing), so a
+    # newer package unpacked over an old folder keeps the player's own config\*.ini; VERSION tells the launcher an update
+    # arrived (launcher.c needs_update)
+    os.makedirs(os.path.join(pkg, 'config', 'defaults'))
+    for n in ('graphics.ini', 'controllers.ini'):
+        if os.path.isfile(os.path.join(pkg, 'config', n)):
+            os.replace(os.path.join(pkg, 'config', n), os.path.join(pkg, 'config', 'defaults', n))
     with open(os.path.join(pkg, 'VERSION'), 'w', encoding='utf-8', newline='\n') as f:     # as main_linux: report.py names it
         f.write(git('rev-parse', '--short', 'HEAD').strip() + '\n')                    # (finding 128; before: "source tree")
     with open(os.path.join(ROOT, 'scripts', 'package', 'build.bat'), 'rb') as f:

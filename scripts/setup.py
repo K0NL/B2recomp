@@ -475,6 +475,35 @@ def step_check(cx):
     say('  ' + (tail.strip().splitlines() or ['ok'])[-1])
 
 
+# ---------------------------------------------------------------------------------------------- updates
+# [Recomps#1] A newer B2recomp unpacked over a finished build: the files the later steps read have changed, so tables,
+# lift, compile, link and check run again (compile_main.py then compiles only the C files that changed; a runtime fix
+# costs about a minute). The fingerprint of these files is kept in build/setup_state.json after a complete run, with the
+# package's VERSION (the launcher compares that one to show its build screen after an update).
+SOURCE_GLOBS = ('lifter/*.py', 'lifter/*.txt', 'lifter/*.h', 'runtime/*.c', 'runtime/*.h', 'runtime/*.inc',
+                'runtime/gen/make_gen.py', 'runtime/linux/*.c', 'runtime/linux/*.h', 'runtime/linux/GL/*.h', 'scripts/*.py')
+REDO_ON_UPDATE = ('tables', 'lift', 'compile', 'link', 'check')
+
+
+def source_fingerprint():
+    import glob
+    h = hashlib.sha256()
+    for pat in SOURCE_GLOBS:
+        for p in sorted(glob.glob(os.path.join(REPO, *pat.split('/')))):
+            h.update(os.path.relpath(p, REPO).replace(os.sep, '/').encode('utf-8') + b'\0')
+            with open(p, 'rb') as f:
+                h.update(hashlib.sha256(f.read()).digest())
+    return h.hexdigest()[:20]
+
+
+def package_version():
+    try:
+        with open(os.path.join(REPO, 'VERSION'), encoding='utf-8') as f:
+            return f.read().strip() or None
+    except OSError:
+        return None
+
+
 # ---------------------------------------------------------------------------------------------- main
 def main():
     ap = argparse.ArgumentParser(description='Build the native port from your own extracted dump.')
@@ -502,6 +531,13 @@ def main():
     if a.dump and cx.state.get('dump') and os.path.normcase(cx.dump) != os.path.normcase(cx.state['dump']):
         done.clear()                                         # another dump: everything is made again
     todo = sorted(ALWAYS | {a.only}, key=STEPS.index) if a.only else STEPS
+    fp = source_fingerprint()
+    if not a.only and cx.state.get('source_fp') != fp and any(s in done for s in REDO_ON_UPDATE):
+        redo = [s for s in REDO_ON_UPDATE if s in done]
+        for s in redo:
+            done.pop(s)
+        say('B2recomp itself changed since the last build (an update): %s run again; compile redoes only the files '
+            'that changed' % ', '.join(redo))
     if a.from_step:
         for s in STEPS[STEPS.index(a.from_step):]:
             done.pop(s, None)
@@ -522,6 +558,10 @@ def main():
         say('[%d/%d] %s: ok  %s' % (i + 1, len(STEPS), s, fmt(done[s])))
     say('setup: %s this run' % fmt(time.time() - t_all))
     if all(s in done for s in STEPS):
+        cx.state['source_fp'] = fp                           # the build matches these files (and this package version)
+        if package_version():
+            cx.state['version'] = package_version()
+        cx.save()
         say('Start the game: build\\launcher.exe (Play), or scripts\\play.ps1')
     return 0
 

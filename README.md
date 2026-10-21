@@ -119,6 +119,11 @@ the game can hitch briefly while it prepares its graphics; this is saved, so it 
 
 **Next time:** start `B2recomp.exe` and press Play. Keep the dump folder where it was.
 
+**Updating to a newer version:** close B2recomp, then unzip the new `B2recomp-builder-<version>.zip` to the same place
+as the old one, so that its `B2recomp` folder goes over your old one (choose to replace the files when Windows asks).
+Your saves, settings and mods stay. Start `B2recomp.exe`: it sees the update and shows the build screen; press
+**Build** (a minute or two: only what changed is built again), then **Play**.
+
 **Mods (optional).** Put mods made for the Switch version (emulator mod folders) into a folder `mods\` beside
 `B2recomp.exe`, then click **Mods...** to switch them on or off. Texture, model and sound mods work at the next start.
 Code mods (`.pchtxt`, `.ips`) need **Apply (rebuild)**: about a minute, with the game closed. Details:
