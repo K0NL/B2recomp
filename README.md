@@ -132,6 +132,9 @@ Code mods (`.pchtxt`, `.ips`) need **Apply (rebuild)**: about a minute, with the
 - **To ask for help:** press **Report...** at the bottom of the launcher (or of the build screen). It makes
   `b2recomp-report.zip` in the B2recomp folder with the logs and your PC's details (Windows version, CPU, graphics card
   and driver), nothing of the game. Attach it to an issue with a few words on what happened.
+- **Rules for issues:** write the issue **in English** and **attach `b2recomp-report.zip`** (Linux:
+  `b2recomp-report.tar.gz`). An issue that is not in English or has no report attached is closed promptly. (This does
+  not apply to notices from rights holders; see [Legal](#legal).)
 
 ## Building from the source
 
