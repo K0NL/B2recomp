@@ -499,7 +499,7 @@ def patch_int(lines, lo, i, key):
     raise SystemExit('no definition of x%s found before %s' % (reg, lines[i][:16]))
 
 
-def patch_f1(lines, lo, hi, i, key, op=False, slot=None):
+def patch_f1(lines, lo, hi, i, key, op=False, slot=None, anystep=False):
     """the 1.0 of a float counter's add is multiplied by recomps_fps_cf(...) (finding 134); slot (kind f1lin): x = a x + 1
     made of a multiply and the add, a^d at the multiply and 1 + a + ... + a^(d-1) at the add"""
     if op:                                                # the label names the add: its store follows (two paths may join there)
@@ -513,6 +513,8 @@ def patch_f1(lines, lo, hi, i, key, op=False, slot=None):
     m = re.search(r'fnan32\(c->v\[(\d+)\]\.f\[0\] ([+-]) c->v\[(\d+)\]\.f\[0\]\)', lines[j])
     if not m:
         raise SystemExit('no float add at or before %s: %s' % (lines[i][:16], lines[j].strip()))
+    if anystep:                                           # finding 139, kind f1step: x + step, any step (a table value)
+        return patch_fstep(lines, lo, i, j, m, key, base, off)
     for r, other in ((m.group(1), m.group(3)), (m.group(3), m.group(1))):
         for k in range(j - 1, lo, -1):
             if int(r) < 8 and CALL.search(lines[k]):
@@ -545,6 +547,32 @@ def patch_f1(lines, lo, hi, i, key, op=False, slot=None):
                 lines[j] = a + 'fnan32(' + b.replace(old, rep, 1)
                 return j
     raise SystemExit('the float add before %s has no constant 1.0 operand: %s' % (lines[i][:16], lines[j].strip()))
+
+
+def patch_fstep(lines, lo, i, j, m, key, base, off):
+    """finding 139, kind f1step: x = x + step, the step any value the pass adds (B2's 0x71009ebf04: a per-difficulty table
+    entry). The step is multiplied by the visit's frames, at most one step a visit (the rest is owed, as an up-counter's).
+    The other operand must be the field's value: loaded from it with no other write of that register, and no call that
+    could change it (v0-v7), in between."""
+    if m.group(2) != '+':
+        raise SystemExit('%s: f1step takes x + step only: %s' % (lines[i][:16], lines[j].strip()))
+    for step, x in ((m.group(3), m.group(1)), (m.group(1), m.group(3))):
+        loaded = False
+        for k in range(j - 1, max(lo, j - 24), -1):
+            if LOADV(x, base, off).match(lines[k]):
+                loaded = True
+                break
+            if VDEF(x).search(lines[k]) or (int(x) < 8 and CALL.search(lines[k])) or ASSIGN(base).match(lines[k]):
+                break
+        if not loaded:
+            continue
+        check_base(lines, j, i, base, lines[i][:16])
+        old = 'c->v[%s].f[0]' % step
+        rep = '(%s * (float)recomps_fps_cf(c, 0x%xULL, c->x[%s] + %sULL, c->v[%s].f[0], 1))' % (old, key, base, off, x)
+        a, b = lines[j].split('fnan32(', 1)
+        lines[j] = a + 'fnan32(' + b.replace(old, rep, 1)
+        return j
+    raise SystemExit('%s: f1step, but neither operand of the add is the stored field\'s value: %s' % (lines[i][:16], lines[j].strip()))
 
 
 def main():
@@ -629,6 +657,8 @@ def main():
             k = patch_int(ls, lo, i, key)
         elif kind in ('f1', 'f1op'):
             k = patch_f1(ls, lo, hi, i, key, op=kind == 'f1op')
+        elif kind == 'f1step':
+            k = patch_f1(ls, lo, hi, i, key, anystep=True)
         elif kind == 'f1lin':
             k = patch_f1(ls, lo, hi, i, key, slot=slots)
             slots += 1

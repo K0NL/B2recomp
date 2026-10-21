@@ -53,3 +53,89 @@
 7100b09058 L_7100b093e4 f1   combo row 1: +244 timer, the same
 7100b09058 L_7100b09418 f1   combo row 2: +300 timer, the same; the combo ends when no row and no list entry is left
 7100b610f8 L_7100b61124 int  global countdown, tested
+
+# finding 139: timers that count once per pass, but only for a while after an event (a hit, a press, a state change);
+# the census filed them as "contradicted" or never ran them (the review of its sites, notes/fps-research.md section 13)
+# player
+7100027754 L_7100028068 f1   +0x55b0 input window after the action button or a dodge (30.0)
+7100027754 L_71000286a4 int  +0xee88 window after the action button is let go (30 while it is held)
+7100027754 L_7100027c7c int  +0x10240 input lock (5)
+7100027754 L_7100027e80 int  +0xffe8 hold-off of the TensionMax effect (30)
+71000579d0 L_7100057a20 int  direction array entry 1 (+0x4e44, 22 after a push; six entries since finding 114)
+71000579d0 L_7100057ac8 int  direction array entry 7 (+0x4e5c)
+71000579d0 L_7100057dd8 int  +0x4e8c reset of the push repeat count (60)
+# enemies, items, scenery
+71009ebf04 L_71009ebfa8 int  enemy +0x427c full-speed hold after a weak-point hit (10 / 15 / 60)
+71009ebf04 L_71009ec02c f1step enemy +0x4274 easing back into its scaled time (a per-difficulty step a frame)
+7100ae25a0 L_7100ae26ec int  +408 global enemy action slot after the player's event (30)
+7100ae25a0 L_7100ae26f8 int  +404 the same slot after an enemy took it (300)
+71001ae09c L_71001ae184 int  AI class +1392: wait up to 120 (an up-counter)
+71001ae220 L_71001ae260 int  the same class: wait up to 60 / 164
+71001ae34c L_71001ae394 int  the same class: wait up to 59
+7100192b08 L_7100195a04 int  mech +0x898c state wait (20 / 40); at 0 and below (L_7100195a48) only "< 0" is tested
+71002a3538 L_71002a35ec f1   item / halo +2940 pickup hold-off after a break (20.0)
+71009e8c28 L_71009e8c58 f1   breakable scenery +5512 shake (10.0)
+# core / systems
+7100ac88d4 L_7100ac8904 int  input latch +256 (10 after the button)
+7100ac88d4 L_7100ac8910 int  input latch +260
+7100ac88d4 L_7100ac8924 int  input latch +264
+7100ac88d4 L_7100ac8930 int  input latch +268
+7100af29fc L_7100af3bec int  core_ActLv +172 sound state
+7100af29fc L_7100af3c14 int  core_ActLv +176
+7100b01ce8 L_7100b01d80 int  +40 countdown that fires State_FinishSlowOff (Witch Time's end)
+# hit-stop: the engine's time controller, the shared object update and the per-class delays (+1536, then 0x7100dd1978)
+7100dd1ec8 L_7100dd1fb8 int  time controller +40: frames before its rate applies
+7100dd1ec8 L_7100dd1fe0 int  time controller +36: frames at its rate (a hit-stop, a slow-down)
+71009b0ea0 L_71009b0ed4 int  object +1532: frames at the rate after the +1536 delay
+71000765b8 L_710007b79c int  +1536 hit-stop delay
+71002d0210 L_71002d065c int  +1536 hit-stop delay
+71002e4a98 L_71002e4bc8 int  +1536 hit-stop delay
+71002ff9c8 L_71002ffc8c int  +1536 hit-stop delay
+7100329e00 L_710032a148 int  +1536 hit-stop delay
+710034165c L_71003416fc int  +1536 hit-stop delay
+71003552e8 L_7100355388 int  +1536 hit-stop delay
+710038feec L_71003903d4 int  +1536 hit-stop delay
+710039c444 L_710039c78c int  +1536 hit-stop delay
+71003ac81c L_71003ac94c int  +1536 hit-stop delay
+71003f4978 L_71003f4aa8 int  +1536 hit-stop delay
+71004162bc L_71004163ec int  +1536 hit-stop delay
+7100429978 L_7100429a18 int  +1536 hit-stop delay
+710044122c L_71004412cc int  +1536 hit-stop delay
+7100458d2c L_7100458e5c int  +1536 hit-stop delay
+7100474118 L_71004741b8 int  +1536 hit-stop delay
+71004894e8 L_7100489588 int  +1536 hit-stop delay
+7100491be8 L_7100491c88 int  +1536 hit-stop delay
+71004a4634 L_71004a4764 int  +1536 hit-stop delay
+71004c103c L_71004c11d0 int  +1536 hit-stop delay
+71004e76d0 L_71004e7804 int  +1536 hit-stop delay
+7100501760 L_7100501890 int  +1536 hit-stop delay
+71005160f0 L_71005162b0 int  +1536 hit-stop delay
+710052a318 L_710052a448 int  +1536 hit-stop delay
+71005517e4 L_7100551884 int  +1536 hit-stop delay
+710056bc50 L_710056c0a4 int  +1536 hit-stop delay
+7100592348 L_7100592b90 int  +1536 hit-stop delay
+71005a37d4 L_71005a3a1c int  +1536 hit-stop delay
+71005aed90 L_71005aeec0 int  +1536 hit-stop delay
+71005c01dc L_71005c027c int  +1536 hit-stop delay
+71006103a4 L_7100610754 int  +1536 hit-stop delay
+71006376f8 L_7100637798 int  +1536 hit-stop delay
+710064a390 L_710064a7d8 int  +1536 hit-stop delay
+7100665028 L_7100665370 int  +1536 hit-stop delay
+7100682858 L_71006828f8 int  +1536 hit-stop delay
+71006b02ec L_71006b038c int  +1536 hit-stop delay
+71006ba568 L_71006ba608 int  +1536 hit-stop delay
+71006cbe90 L_71006cbf30 int  +1536 hit-stop delay
+71006d9948 L_71006d9cd8 int  +1536 hit-stop delay
+71006e6514 L_71006e672c int  +1536 hit-stop delay
+71006f6d24 L_71006f6dc4 int  +1536 hit-stop delay
+710070283c L_71007028dc int  +1536 hit-stop delay
+7100709f40 L_710070a100 int  +1536 hit-stop delay
+710071b234 L_710071b2d4 int  +1536 hit-stop delay
+710073c410 L_710073c5c8 int  +1536 hit-stop delay
+7100752b64 L_7100752da4 int  +1536 hit-stop delay
+7100777764 L_7100777d1c int  +1536 hit-stop delay
+710078c100 L_710078c234 int  +1536 hit-stop delay
+710079ba20 L_710079bbf8 int  +1536 hit-stop delay
+71007a931c L_71007a93bc int  +1536 hit-stop delay
+71009b1654 L_71009b16f0 int  +1536 hit-stop delay
+7100a14d6c L_7100a14fa8 int  +1536 hit-stop delay
