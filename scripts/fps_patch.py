@@ -1,4 +1,4 @@
-"""Frame rate above 60 fps for Bayonetta 2: patches a copy of the lifted C (notes/fps-research.md, findings 107, 113, 114, 129, 134, 136).
+"""Frame rate above 60 fps for Bayonetta 2: patches a copy of the lifted C (notes/fps-research.md, findings 107, 113, 114, 129, 134, 136, 144).
 
     python scripts/fps_patch.py [--gen=build/gen_eh] --out=<dir> [--ticks=lifter/fps_ticks.txt]
     python scripts/fps_patch.py [--gen=build/gen_eh] --inplace      (the real build: setup.py's lift step runs this)
@@ -29,6 +29,10 @@ frame_rate (runtime/gfx_options.c sets the variables below for 61..120) or from 
   - a cinematic's shot and scene changes (0x7100e322e8, 0x7100e32758) keep their game time: the hold on a shot's last
     keyframe lasts as long as at 30 fps instead of one update (finding 129: the pictures ran ahead of the voices);
     RECOMPS_CINE_FIX=0 = the game's own.
+  - the slow motion of time channel 0 (0x7100b55938): at its end the event's timeline lands on the 30 fps frame grid at
+    any step (the game's scale assumed a step of 2.0; at 0.5 the timeline stopped one float ulp short of the even frame:
+    the world freeze, finding 144), and its timer loses its amount x step / k, so it lasts as long as at 30 / 60 fps;
+    RECOMPS_SLOWMO_FIX=0 = the game's own, =1 = the alignment only.
 The patched files include their helpers after '#include "funcs.h"'; funcs.h gains the declarations of PROTOS.
 """
 import os, re, shutil, sys
@@ -349,6 +353,35 @@ CINE_HOOKS = [                              # (label, code put before it); the t
     ('L_7100e32408: fcmp', 'if (cine_fix_on() && c->v[1].f[0] >= c->v[0].f[0]) cine_last_hold(c);'),
     ('L_7100e327d0: c->x[20] =', 'if (cine_fix_on() && cine_end_early(c)) goto L_7100e32854;'),
 ]
+SLOWMO = r'''
+/* [fps_patch.py] finding 144: the slow motion of time channel 0 (0x7100b55938) above 60 fps. While it runs, channel 0's
+ * scale ([clock + 120]; the channel's step is the clock's step times it) is its rate, and its timer loses rate (mode 2) or
+ * 2 x rate (the game's 30 fps mode) each update. When it ends in the 30 fps mode the scale is set, for one update, to the
+ * frames left to the next even frame of the event's timeline x 0.5: a step of 2.0 lands the timeline on the 30 fps frame
+ * grid. With a step of 0.5 each update covers a quarter of what is left; the timeline creeps up to the even frame, and one
+ * float ulp short of it the advance (0.25 ulp) rounds away: the event stands still (the 5-30 s world freeze at 120 fps,
+ * music looping) until one update has a step of 1.0 or more (0.5 ulp rounds up: a long frame). Here the scale is
+ * (frames left) / step, at most 1.0, and the timeline counts as aligned within 1/1000 frame of an even frame; the timer
+ * loses its stock amount x step / k (k = 2 while the game asks for 30 fps, else 1: the step the game would have), so a
+ * slow motion lasts as long as at 30 / 60 fps (it was 2-4 times shorter). RECOMPS_SLOWMO_FIX=0: the game's own; =1: the
+ * alignment only. */
+static int slowmo_fix(void) { static int v = -1; if (v < 0) { const char *e = getenv("RECOMPS_SLOWMO_FIX"); v = uncap_on() ? (e ? atoi(e) : 2) : 0; } return v; }
+static void slowmo_timer(Ctx *c) {          /* 0x7100b55978: v2 = what the timer loses this update (rate or 2 x rate) */
+    float k = (rd32(rd64(0x71018668e0ULL) + 4) >> 5 & 1) ? 2.0f : 1.0f;     /* bit 37 of the flag word: 30 fps wanted */
+    c->v[2].f[0] = c->v[2].f[0] * uncap_f(rd64(0x7101867708ULL) + 200) / k;
+}
+static int slowmo_align(Ctx *c) {           /* 0x7100b55b3c: v0 = frames to the next even frame (0 .. 2], x0 = the clock;
+                                               1 = aligned (the stock path for a frame already on the grid) */
+    float rem = c->v[0].f[0], s = uncap_f(c->x[0] + 200);
+    if (!(rem > 1e-3f) || rem > 2.0f - 1e-3f || !(s > 0.0f)) return 1;
+    vzero(&c->v[0]); c->v[0].f[0] = rem / s < 1.0f ? rem / s : 1.0f;
+    return 0;
+}
+'''
+SLOWMO_HOOKS = [                            # (label, code put before it), in 0x7100b55938
+    ('L_7100b55978: {', 'if (slowmo_fix() >= 2) slowmo_timer(c);'),
+    ('L_7100b55b3c: {', 'if (slowmo_fix()) { if (slowmo_align(c)) goto L_7100b55ba8; goto L_7100b55b40; }'),
+]
 
 
 def find_file(gen, fn):
@@ -653,6 +686,11 @@ def main():
     for lab, hook in CINE_HOOKS:
         replace_once(ls, lab, hook + '\n' + lab)
     cine_file = name
+    # the slow motion of time channel 0 (finding 144): its end lands the event's timeline on the frame grid at any step
+    name, ls = lines_of('7100b55938')
+    for lab, hook in SLOWMO_HOOKS:
+        replace_once(ls, lab, hook + '\n' + lab)
+    slowmo_file = name
     # the counters (finding 134): each moves by the frames due to it; the key of its record is its store's address
     done, slots = 0, 0
     for fn, lab, kind in sites:
@@ -705,7 +743,8 @@ def main():
         src = os.path.join(gen, fname)
         if fname in files:
             text = '\n'.join(files[fname])
-            extra = HELP + (LIMIT if fname == present_file else '') + (TICK + SITES if fname == clock_file else '') + (CINE if fname == cine_file else '')
+            extra = HELP + (LIMIT if fname == present_file else '') + (TICK + SITES if fname == clock_file else '') + (CINE if fname == cine_file else '') + \
+                    (SLOWMO if fname == slowmo_file else '')
             assert text.count('#include "funcs.h"\n') == 1, fname
             write(os.path.join(out, fname), text.replace('#include "funcs.h"\n', '#include "funcs.h"\n' + extra, 1))
         elif fname == 'funcs.h':                          # the sites' helpers (defined in the clock's file); older lists replaced
