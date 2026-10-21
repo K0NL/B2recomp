@@ -82,6 +82,7 @@ static volatile LONG g_vb_state;                       /* 0 not started, 1 measu
 static int g_pace_want = -1;                           /* 0 clock, 1 display lock when the refresh rate allows */
 static int g_hold_on = -1;                             /* present at the tick */
 static volatile LONG g_lock_k;                         /* display lock: refreshes per game frame, 0 = our own clock */
+static int g_pace_hz = 60;                             /* [Recomps#1] the ticks per second: 60, or frame_rate above 60 (gfx_options.c gfx_pace_rate); the guest's vsync event stays at 60 */
 static volatile LONG64 g_lock_drops, g_lock_relocks;   /* [Recomps#1] finding 122: lock lost after a vblank gap / taken again */
 static volatile LONG64 g_drift_drops, g_drift_relocks; /* [Recomps#1] finding 125 (vsync = auto): lock dropped because the game's speed under it left 60 +-1.1 % / taken again */
 static int g_pace_auto;                                /* vsync = auto: the drift check may drop the lock (display: it only says so) */
@@ -163,7 +164,7 @@ static DWORD WINAPI vblank_thread(LPVOID arg) {
     (void)arg;
 #ifndef _WIN32
     /* [Recomps#1] Linux: no D3DKMT; the refresh clock is our own (a Linux vblank source: plan step 6) */
-    printf("display: no vblank source on Linux yet: the refresh clock stays our own 60 Hz clock%c", 10);
+    printf("display: no vblank source on Linux yet: the refresh clock stays our own clock%c", 10);
     InterlockedExchange(&g_vb_state, -1);
     return 0;
 #else
@@ -239,20 +240,22 @@ static void pace_options(void) {
     g_hold_on = h ? atoi(h) != 0 : opt != 1 && opt != 2;               /* fifo: the swapchain holds the presents itself; off: at once, by request */
     { int latency_mode(void); if (!h && latency_mode() >= 2) g_hold_on = 0; }      /* L1: latency = lowest: the frame goes to the window as soon as it is ready */
     if (p && atof(p) > 0.02 && atof(p) < 0.98) g_lock_phase = atof(p);
-    printf("display: pacing: %s; a finished frame is presented %s%c", g_pace_want ? "locked to the display when its refresh rate is k x 60 Hz within 1.1 % (vsync = display / auto)" : "our own 60.000 Hz clock (vsync = clock)",
-           g_hold_on ? "at the next tick (steady cadence)" : "as soon as it is ready", 10);
+    g_pace_hz = gfx_pace_rate();
+    printf("display: pacing: %s %d Hz%s; a finished frame is presented %s%s%c", g_pace_want ? "locked to the display when its refresh rate is k x" : "our own clock at",
+           g_pace_hz, g_pace_want ? " within 1.1 % (vsync = display / auto), else our own clock" : " (vsync = clock)", g_hold_on ? "at the next tick (steady cadence)" : "as soon as it is ready",
+           g_pace_hz > 60 ? "; frame_rate above 60: the game is released on these ticks and its interval 0 is one tick, the guest's vsync event stays at 60 Hz" : "", 10);
 }
 /* vsync thread, once the refresh is measured: lock or not */
 static int pace_try_lock(void) {
-    double hz = (double)g_freq.QuadPart / g_vb_period;
-    int k = (int)(hz / 60.0 + 0.5);
-    double per = k ? hz / k : 0, off = k ? (per - 60.0) / 60.0 : 1;
+    double hz = (double)g_freq.QuadPart / g_vb_period, r = (double)g_pace_hz;      /* [Recomps#1] r: 60, or frame_rate above 60 */
+    int k = (int)(hz / r + 0.5);
+    double per = k ? hz / k : 0, off = k ? (per - r) / r : 1;
     if (k >= 1 && k <= 8 && off > -0.011 && off < 0.011) {
-        printf("display: DISPLAY LOCK: %.3f Hz = %d refresh%s per game frame: the game runs at %.3f frames per second (%+.2f %% against 60), tick %.0f %% of a refresh after every %s vblank%c", hz, k, k > 1 ? "es" : "", per, off * 100.0,
-               g_lock_phase * 100.0, k == 1 ? "" : k == 2 ? "second" : "k-th", 10);
+        printf("display: DISPLAY LOCK: %.3f Hz = %d refresh%s per game frame: the game runs at %.3f frames per second (%+.2f %% against %d), tick %.0f %% of a refresh after every %s vblank%c", hz, k, k > 1 ? "es" : "", per, off * 100.0,
+               g_pace_hz, g_lock_phase * 100.0, k == 1 ? "" : k == 2 ? "second" : "k-th", 10);
         return k;
     }
-    printf("display: %.3f Hz is not k x 60 Hz within 1.1 %%: our own 60.000 Hz clock paces the game (a frame is on screen %.2f refreshes on average: they cannot all be equal)%c", hz, hz / 60.0, 10);
+    printf("display: %.3f Hz is not k x %d Hz within 1.1 %%: our own %d.000 Hz clock paces the game (a frame is on screen %.2f refreshes on average: they cannot all be equal)%c", hz, g_pace_hz, g_pace_hz, hz / r, 10);
     return 0;
 }
 
@@ -644,7 +647,7 @@ static DWORD WINAPI vsync_thread(LPVOID arg) {
                 int k = pace_try_lock();
                 if (k) { vb_last = g_vb_count; lock_hz = (double)g_freq.QuadPart / g_vb_period; InterlockedExchange(&g_lock_k, k); }
             }
-            if (g_pace_want && !lock_tried && g_vb_state == -1) { lock_tried = 1; printf("display: no vblank source: our own 60 Hz clock%c", 10); }
+            if (g_pace_want && !lock_tried && g_vb_state == -1) { lock_tried = 1; printf("display: no vblank source: our own %d Hz clock%c", g_pace_hz, 10); }
             if (g_lock_k) {
                 LONG64 k = g_lock_k, vb_target = vb_last + k, vc, vq;
                 int timeouts = 0;
@@ -656,13 +659,13 @@ static DWORD WINAPI vsync_thread(LPVOID arg) {
                 if (vc < vb_target) {                                              /* no vblank for 100 ms (display off, mode change, a stall): our clock goes on */
                     InterlockedExchange(&g_lock_k, 0);
                     QueryPerformanceCounter(&now);
-                    t0.QuadPart = now.QuadPart - n * g_freq.QuadPart / 60;
+                    t0.QuadPart = now.QuadPart - n * g_freq.QuadPart / g_pace_hz;
                     /* finding 122: not for the rest of the run (a player's RX 560 lost it once, 1,200 frames in, and ran 59.79 Hz
                      * against our 60.000 Hz clock from there): it is taken again after a second of regular vblanks */
                     relock_k = (LONG)k; relock_vb = vc; relock_t = now;
                     dr_t.QuadPart = 0;                                             /* finding 125: a new 5 s window once locked again */
                     if (InterlockedIncrement64(&g_lock_drops) <= 20)
-                        printf("display: no vblank for 100 ms: display lock off, our own 60 Hz clock goes on until the vblanks are regular again%c", 10);
+                        printf("display: no vblank for 100 ms: display lock off, our own %d Hz clock goes on until the vblanks are regular again%c", g_pace_hz, 10);
                     continue;
                 }
                 LONG64 extra = (vc - vb_target) / k;                               /* whole game frames this thread slept through */
@@ -674,28 +677,28 @@ static DWORD WINAPI vsync_thread(LPVOID arg) {
                 QueryPerformanceCounter(&now);                                     /* finding 125: the lock's speed against real time */
                 if (!dr_t.QuadPart) { dr_t = now; dr_n = n; }
                 else if (now.QuadPart - dr_t.QuadPart >= 5 * g_freq.QuadPart) {
-                    double fps = (double)(n - dr_n) * (double)g_freq.QuadPart / (double)(now.QuadPart - dr_t.QuadPart), off = fps / 60.0 - 1.0;
+                    double fps = (double)(n - dr_n) * (double)g_freq.QuadPart / (double)(now.QuadPart - dr_t.QuadPart), off = fps / (double)g_pace_hz - 1.0;
                     dr_t = now; dr_n = n;
                     int out = off < -0.011 || off > 0.011;
                     if (out && !g_pace_auto) {
-                        if (!drift_said) printf("display: vsync = display: the game ran at %.3f frames per second under the display lock over the last 5 s (%+.2f %% against 60; refresh %.3f Hz at the lock, %.3f now): the lock stays; vsync = auto would change to our own 60.000 Hz clock%c",
-                                                fps, off * 100.0, lock_hz, (double)g_freq.QuadPart / g_vb_period, 10);
+                        if (!drift_said) printf("display: vsync = display: the game ran at %.3f frames per second under the display lock over the last 5 s (%+.2f %% against %d; refresh %.3f Hz at the lock, %.3f now): the lock stays; vsync = auto would change to our own %d.000 Hz clock%c",
+                                                fps, off * 100.0, g_pace_hz, lock_hz, (double)g_freq.QuadPart / g_vb_period, g_pace_hz, 10);
                         drift_said = 1;
                     } else if (out) {
                         LONG64 d = InterlockedIncrement64(&g_drift_drops);
                         InterlockedExchange(&g_lock_k, 0);
                         drift_k = d < 3 ? (LONG)k : 0;
                         dr_vb = g_vb_count; dr_vt = now; dr_t.QuadPart = 0;
-                        printf("display: the game ran at %.3f frames per second under the display lock over the last 5 s (%+.2f %% against 60; refresh %.3f Hz at the lock, %.3f now): not within 1.1 %% (a variable refresh rate?): our own 60.000 Hz clock paces the game %s%c",
-                               fps, off * 100.0, lock_hz, (double)g_freq.QuadPart / g_vb_period, drift_k ? "until the vblanks come at the lock's rate again" : "for the rest of the run (3 drops)", 10);
+                        printf("display: the game ran at %.3f frames per second under the display lock over the last 5 s (%+.2f %% against %d; refresh %.3f Hz at the lock, %.3f now): not within 1.1 %% (a variable refresh rate?): our own %d.000 Hz clock paces the game %s%c",
+                               fps, off * 100.0, g_pace_hz, lock_hz, (double)g_freq.QuadPart / g_vb_period, g_pace_hz, drift_k ? "until the vblanks come at the lock's rate again" : "for the rest of the run (3 drops)", 10);
                     }
                 }
             } else {
-            if (!t0.QuadPart) { QueryPerformanceCounter(&now); t0.QuadPart = now.QuadPart - n * g_freq.QuadPart / 60; }
-            LONGLONG target = t0.QuadPart + (n + 1) * g_freq.QuadPart / 60;       /* no accumulated rounding */
+            if (!t0.QuadPart) { QueryPerformanceCounter(&now); t0.QuadPart = now.QuadPart - n * g_freq.QuadPart / g_pace_hz; }
+            LONGLONG target = t0.QuadPart + (n + 1) * g_freq.QuadPart / g_pace_hz;       /* no accumulated rounding */
             precise_wait_until(target, timer);
             QueryPerformanceCounter(&now);
-            LONG64 passed = (now.QuadPart - t0.QuadPart) * 60 / g_freq.QuadPart;   /* >= n + 1; more when this thread was kept off the CPU */
+            LONG64 passed = (now.QuadPart - t0.QuadPart) * g_pace_hz / g_freq.QuadPart;   /* >= n + 1; more when this thread was kept off the CPU */
             if (passed < n + 1) passed = n + 1;
             if (passed > n + 1) InterlockedExchangeAdd64(&g_vsync_late, passed - (n + 1));
             n = passed;
@@ -719,7 +722,7 @@ static DWORD WINAPI vsync_thread(LPVOID arg) {
                 AcquireSRWLockExclusive(&g_vb_lock);
                 vcount = g_vb_count;
                 ReleaseSRWLockExclusive(&g_vb_lock);
-                double hz = (double)(vcount - dr_vb) * (double)g_freq.QuadPart / (double)(now.QuadPart - dr_vt.QuadPart), off = hz / drift_k / 60.0 - 1.0;
+                double hz = (double)(vcount - dr_vb) * (double)g_freq.QuadPart / (double)(now.QuadPart - dr_vt.QuadPart), off = hz / drift_k / (double)g_pace_hz - 1.0;
                 if (hz > lock_hz * 0.997 && hz < lock_hz * 1.003 && off > -0.011 && off < 0.011) {      /* the vblanks come at the lock's rate again */
                     vb_last = vcount;
                     InterlockedExchange(&g_lock_k, drift_k);
@@ -729,7 +732,12 @@ static DWORD WINAPI vsync_thread(LPVOID arg) {
                 } else { dr_vb = vcount; dr_vt = now; }
             }
             }
-            if (g_vsync_event) { os_signal_event(g_vsync_event); InterlockedIncrement64(&g_vsync_signals); }
+            {   /* [Recomps#1] the guest's vsync event at 60 per second whatever the tick rate (its VSync Count Thread counts them) */
+                static LONG64 sig60 = -1;
+                LONG64 c60 = g_pace_hz > 60 ? n * 60 / g_pace_hz : n;
+                if (g_vsync_event && c60 != sig60) { os_signal_event(g_vsync_event); InterlockedIncrement64(&g_vsync_signals); }
+                sig60 = c60;
+            }
             AcquireSRWLockExclusive(&g_vsync_lock);
             { LARGE_INTEGER tq; QueryPerformanceCounter(&tq); g_tick_at[n & 15] = tq.QuadPart; }      /* L1: when this tick was given */
             InterlockedExchange64(&g_vsync_n, n);
@@ -788,6 +796,9 @@ void display_init(void) {
 /* Called after every presented frame (nvn_gl.c has already put it in the window): holds the caller to 60 Hz. */
 static volatile LONG g_interval = 1;         /* nvnWindowSetPresentInterval: display refreshes per presented frame (0 = do not wait) */
 void display_set_interval(int n) { InterlockedExchange(&g_interval, n < 0 ? 0 : n > 5 ? 5 : n); }
+/* [Recomps#1] the interval the pacing uses: above 60 fps the lifted frame-rate patch asks for 0 (do not wait) at every
+ * present; when display.c paces at frame_rate (g_pace_hz > 60) that is one of its ticks */
+static LONG64 eff_interval(void) { LONG iv = g_interval; return iv ? iv : g_pace_hz > 60 ? 1 : 0; }
 void nvn_pf_pace(LONG64 ticks);            /* nvn_gl.c: timing scopes */
 /* SSBU_CLOCKSTAT=1: per 600 presented frames, the real time, the vsync signals sent, the refreshes the game counted
  * (its frame counter at 0x710593a440: 600 = one step per presented frame) and the refreshes this thread slept through. */
@@ -831,7 +842,7 @@ static void frame_queued(void) {
         LONG64 held = InterlockedExchange64(&g_hold_ticks, 0);
         if (held) nvn_pf_pace(held);                               /* the hold of the finished frame is pacing time (it replaces the wait after the present) */
     } else {
-    LONG64 at = g_vsync_n + 1, iv = g_interval;
+    LONG64 at = g_vsync_n + 1, iv = eff_interval();
     if (!iv) at = g_vsync_n;                                       /* interval 0: shown at once, nobody waits */
     else if (at < g_latch + iv) at = g_latch + iv;
     g_latch = at;
@@ -976,7 +987,7 @@ static void l1_ready(LONG64 tgt) {
     (void)late;
     if (g_lat_mode > 0 && tgt && g_lat_last_d > 0) {      /* round 2: a NEAR miss of a delayed frame (ready < 2 ms before its tick): no delay for 120 frames */
         LONG64 n = g_vsync_n, t = g_tick_at[n & 15];
-        double per = g_lock_k ? (double)g_lock_k * g_vb_period : (double)g_freq.QuadPart / 60.0;
+        double per = g_lock_k ? (double)g_lock_k * g_vb_period : (double)g_freq.QuadPart / (double)g_pace_hz;
         if (t && (double)t + (double)(tgt - n) * per - (double)now.QuadPart < 2.0 * (double)g_freq.QuadPart / 1000.0) { if (g_lat_backoff < 120) InterlockedExchange(&g_lat_backoff, 120); g_lat_near++; }
     }
     if (g_l1_cur.release && now.QuadPart > g_l1_cur.release && now.QuadPart - g_l1_cur.release < g_freq.QuadPart / 10) {
@@ -1010,7 +1021,7 @@ static void lat_release(void) {
     latency_mode();
     if (g_lat_mode > 0 && !g_lockstep) {
         LONG64 n = g_vsync_n, t = g_tick_at[n & 15];
-        double per = g_lock_k ? (double)g_lock_k * g_vb_period : (double)g_freq.QuadPart / 60.0;
+        double per = g_lock_k ? (double)g_lock_k * g_vb_period : (double)g_freq.QuadPart / (double)g_pace_hz;
         g_lat_last_d = 0;
         if (g_lat_backoff > 0) InterlockedDecrement(&g_lat_backoff);
         else if (t && n == g_latch && g_lat_ri >= 256) {
@@ -1052,7 +1063,7 @@ static void l1_report(FILE *out) {
 void display_present_plan(int vulkan) {
     if (!vulkan || old_pacing()) return;
     pace_options();
-    LONG64 now_n = g_vsync_n, iv = g_interval, prev = g_latch, at = now_n + 1;
+    LONG64 now_n = g_vsync_n, iv = eff_interval(), prev = g_latch, at = now_n + 1;
     int on_time = iv && now_n < prev + iv && prev + iv - now_n <= 6;
     if (!iv) at = now_n;
     else if (at < prev + iv) at = prev + iv;
@@ -1269,8 +1280,8 @@ void display_report(FILE *out) {
     fprintf(out, "display: %s; %lld vsync signals, %lld refreshes slept through by the vsync thread\n", old_pacing() ? "old pacing (SSBU_OLD_PACING=1: two clocks)" : "one refresh clock", (long long)g_vsync_signals, (long long)g_vsync_late);
     if (g_pc_n > 0) fprintf(out, "display: the game's thread was on an EFFICIENCY core at %lld of %lld presents (%s)\n", (long long)g_pc_frames_slow, (long long)g_pc_frames, g_pc_on ? "performance cores asked for" : "SSBU_PCORES=0: left to the system");
     if (g_vb_state == 2) {
-        fprintf(out, "display: refresh %.3f Hz measured; %s; presents held for their tick %lld, late frames presented at once %lld; display lock lost after a vblank gap %lld times, taken again %lld times; dropped because the refresh drifted %lld times, taken again %lld times\n", (double)g_freq.QuadPart / g_vb_period,
-                g_lock_k ? "DISPLAY LOCK (the tick is the display's vblank)" : "our own 60.000 Hz clock", (long long)g_hold_n, (long long)g_hold_late, (long long)g_lock_drops, (long long)g_lock_relocks,
+        fprintf(out, "display: refresh %.3f Hz measured; %s (ticks for %d fps); presents held for their tick %lld, late frames presented at once %lld; display lock lost after a vblank gap %lld times, taken again %lld times; dropped because the refresh drifted %lld times, taken again %lld times\n", (double)g_freq.QuadPart / g_vb_period,
+                g_lock_k ? "DISPLAY LOCK (the tick is the display's vblank)" : "our own clock", g_pace_hz, (long long)g_hold_n, (long long)g_hold_late, (long long)g_lock_drops, (long long)g_lock_relocks,
                 (long long)g_drift_drops, (long long)g_drift_relocks);
         pace_stat_line(out, "all frames", 0, 0);
         pace_stat_line(out, "fight frames", 1, 0);

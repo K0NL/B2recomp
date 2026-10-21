@@ -208,9 +208,12 @@ static BOOL CALLBACK opt_load(PINIT_ONCE once, PVOID arg, PVOID *ctx) {
      * The UCRT environment is one per process, so game.dll sees what is set here. Set variables (test runs) win. */
     if (o->frame_rate > 60 && !getenv("RECOMPS_UNCAP")) {
         char n[16]; snprintf(n, sizeof n, "%d", o->frame_rate);
+        const char *pe = getenv("SSBU_PACE_120");      /* [Recomps#1] long frames at 120: the runtime paces (gfx_pace_rate below), not the lifted limiter */
+        int paced = !(pe && !atoi(pe));
         _putenv_s("RECOMPS_UNCAP", "1");
-        if (!getenv("RECOMPS_UNCAP_FPS")) _putenv_s("RECOMPS_UNCAP_FPS", n);
-        printf("graphics options: frame_rate=%d: the game's clock measures real time, capped at %d fps (experimental; notes/fps-research.md)\n", o->frame_rate, o->frame_rate);
+        if (!getenv("RECOMPS_UNCAP_FPS")) _putenv_s("RECOMPS_UNCAP_FPS", paced ? "0" : n);
+        printf("graphics options: frame_rate=%d: the game's clock measures real time, %s %d fps (experimental; notes/fps-research.md)\n", o->frame_rate,
+               paced ? "the game released and its pictures presented on a steady tick of" : "the lifted limiter caps it at (SSBU_PACE_120=0)", o->frame_rate);
     }
     if (o->profile == 1) {       /* the low-end profile wins over the three keys it sets, wherever they stand in the file (values: O1_options.md, session 9) */
         o->scale = GFX_LOW_SCALE; o->aniso = 0; o->present = 0;
@@ -229,4 +232,19 @@ static BOOL CALLBACK opt_load(PINIT_ONCE once, PVOID arg, PVOID *ctx) {
 const GfxOptions *gfx_options(void) {
     InitOnceExecuteOnce(&g_once, opt_load, NULL, NULL);
     return &g_opt;
+}
+/* [Recomps#1] long frames at 120 fps (2026-10-21): the rate display.c paces the game at. Above 60 fps the lifted limiter
+ * started every frame on its own 120.000 Hz clock and each picture was presented the moment it was ready, so every
+ * millisecond of jitter in the game's logic and our replay reached the screen (on a 238 Hz panel 10-20 % of the frames
+ * were not shown for two refreshes, against 1 % at 60). Now display.c paces at frame_rate as it does at 60: the game is
+ * released on a tick (the display's vblank when the refresh is k x frame_rate, else our own clock) and its picture is
+ * held for the next tick. SSBU_PACE_120=0: the lifted limiter and pictures as soon as ready, as before. */
+int gfx_pace_rate(void) {
+    static int r = -1;
+    if (r < 0) {
+        const GfxOptions *o = gfx_options();
+        const char *e = getenv("SSBU_PACE_120"), *u = getenv("RECOMPS_UNCAP_FPS");
+        r = o->frame_rate > 60 && !(e && !atoi(e)) && u && !atoi(u) ? o->frame_rate : 60;      /* a test's own limiter rate (RECOMPS_UNCAP_FPS) keeps the old way */
+    }
+    return r;
 }
