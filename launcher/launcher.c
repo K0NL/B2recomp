@@ -1003,7 +1003,8 @@ static void draw_play(const DRAWITEMSTRUCT *d) {
 
 /* ================================================================ build screen
  * The first start of the builder package (B2recomp.exe at its top): while build\game.dll, build\game_native.exe or
- * targets\exefs\main.elf is missing (or with --build) the window shows this screen instead of the settings. The player
+ * targets\exefs\main.elf is missing (or with --build, or after an update: needs_update) the window shows this screen
+ * instead of the settings. The player
  * chooses the dump folder (Browse, typed, or dragged onto the window); Build runs scripts\setup.py --dump <folder> with
  * deps\python\python.exe when the package has it (else python.exe from PATH), in a hidden console of its own inside a job
  * object, so Close stops it and every compiler it started. Its output goes to the log box; the ten steps are ticked off
@@ -1029,6 +1030,35 @@ static int game_built(void) {
     wchar_t dll[MAX_PATH];
     swprintf(dll, MAX_PATH, L"%s\\game.dll", g_buildd);
     return file_exists(g_game) && file_exists(dll) && file_exists(g_elf);
+}
+/* [Recomps#1] An update unpacked over the old folder (as on Linux, launcher_linux.py needs_update): the package's VERSION is
+ * not the one setup.py last built (build\setup_state.json "version", kept after a complete run; a build from before v0.2.10
+ * has none). The build screen then opens with that build's dump folder, and Build redoes what changed (setup.py: tables,
+ * lift, compile of the changed files, link, check; a minute or two). Settings and saves stay: the package brings its
+ * settings as config\defaults (make_package.py), copied to config\ only when missing (wWinMain). */
+static int g_update;
+static int needs_update(void) {
+    wchar_t p[MAX_PATH];
+    char v[64];
+    static char b[65536];
+    swprintf(p, MAX_PATH, L"%s\\VERSION", g_root);
+    FILE *f = _wfopen(p, L"rb");
+    if (!f) return 0;                                       /* a source checkout, not a builder package */
+    size_t n = fread(v, 1, sizeof v - 1, f);
+    fclose(f);
+    v[n] = 0;
+    while (n && (v[n - 1] == '\n' || v[n - 1] == '\r' || v[n - 1] == ' ')) v[--n] = 0;
+    if (!n) return 0;
+    swprintf(p, MAX_PATH, L"%s\\setup_state.json", g_buildd);
+    if (!(f = _wfopen(p, L"rb"))) return 0;                 /* never built: the first build, not an update */
+    n = fread(b, 1, sizeof b - 1, f);
+    fclose(f);
+    b[n] = 0;
+    const char *d = strstr(b, "\"done\": {"), *q = strstr(b, "\"version\": \"");
+    if (!d || d[9] == '}') return 0;                        /* no step done yet */
+    if (!q) return 1;
+    q += 12;
+    return strncmp(q, v, strlen(v)) != 0 || q[strlen(v)] != '"';
 }
 static void find_python(void) {
     swprintf(g_python, MAX_PATH, L"%s\\deps\\python\\python.exe", g_root);
@@ -1319,8 +1349,9 @@ static void create_build_controls(void) {
     prefill_dump();
     dump_check();
     DragAcceptFiles(g_main, TRUE);
-    SetWindowTextW(g_status, *g_python ? L"Choose your dump folder, then press Build."
-                                       : L"Python was not found: the builder package brings its own (deps\\python).");
+    SetWindowTextW(g_status, !*g_python ? L"Python was not found: the builder package brings its own (deps\\python)."
+                             : g_update ? L"B2recomp was updated: press Build to bring your game up to date (a minute or two; settings and saves stay)."
+                                        : L"Choose your dump folder, then press Build.");
 }
 
 /* ================================================================ code mods window
@@ -1949,8 +1980,19 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmdline, int show) {
     swprintf(g_elf, MAX_PATH, L"%s\\targets\\exefs\\main.elf", g_root);
     swprintf(g_modsdir, MAX_PATH, L"%s\\mods", g_root);
     swprintf(g_modsini, MAX_PATH, L"%s\\config\\mods.ini", g_root);
+    {   /* [Recomps#1] the package's default settings (config\defaults) become config\*.ini only when those are missing, so an
+           update unpacked over the old folder keeps the player's own (as B2recomp.sh on Linux; needs_update above) */
+        static const wchar_t *k_def[] = { L"graphics.ini", L"controllers.ini" };
+        for (int i = 0; i < 2; i++) {
+            wchar_t s[MAX_PATH], d[MAX_PATH];
+            swprintf(s, MAX_PATH, L"%s\\config\\defaults\\%s", g_root, k_def[i]);
+            swprintf(d, MAX_PATH, L"%s\\config\\%s", g_root, k_def[i]);
+            if (file_exists(s) && !file_exists(d)) CopyFileW(s, d, TRUE);
+        }
+    }
     swprintf(tmp, MAX_PATH, L"%s\\scripts\\setup.py", g_root);
-    g_mode = file_exists(tmp) && (!game_built() || (cmdline && wcsstr(cmdline, L"--build")));
+    g_update = file_exists(tmp) && game_built() && needs_update();
+    g_mode = file_exists(tmp) && (!game_built() || g_update || (cmdline && wcsstr(cmdline, L"--build")));
     find_python();
     /* the game and the pad tools must read the files edited here and nothing of a test run (play.ps1's list + config overrides) */
     static const wchar_t *k_clear[] = { L"SSBU_SEQ", L"SSBU_SCRIPT", L"SSBU_PRESS", L"SSBU_SHOT", L"SSBU_SHOT_EVERY", L"SSBU_SHOT_DIR",
