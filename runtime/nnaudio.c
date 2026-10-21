@@ -82,16 +82,47 @@ typedef struct {
 } Slot;
 
 static CRITICAL_SECTION g_lock;
-static uint64_t g_audio_out, g_event, g_device_event;
-static int g_rate = 48000, g_channels = 2, g_open, g_started;
-static HWAVEOUT g_wave;
+static uint64_t g_device_event;
 static HANDLE g_wake;
-static Slot g_slots[SLOTS];
-static unsigned g_head, g_tail;                       /* playing queue: slots head..tail-1 (mod SLOTS) */
-static uint64_t g_released[SLOTS];
-static unsigned g_rel_head, g_rel_tail;
 static LARGE_INTEGER g_freq;
-static LONGLONG g_clock_due;
+/* Edición mejorada: one state per AudioOut. Bayonetta 2 opens a SECOND AudioOut for a CRI movie's sound while its
+ * mixer's AudioOut stays open (OpenDefaultAudioOut twice, the movie's closed at its end). With one shared state the
+ * second open reset the first one's queue and both fed one device: the movie's sound was consumed at a fraction of real
+ * time, and CRI Mana, which times the pictures by its sound, played the attract movie about 6x too slowly, then skipped
+ * ahead. Each AudioOut now has its own queue, event and waveOut device (Windows mixes the devices). */
+typedef struct {
+    uint64_t audio_out, event;
+    int rate, channels, open, started;
+    HWAVEOUT wave;
+    Slot slots[SLOTS];
+    unsigned head, tail;                              /* playing queue: slots head..tail-1 (mod SLOTS) */
+    uint64_t released[SLOTS];
+    unsigned rel_head, rel_tail;
+    LONGLONG clock_due, empty_since;
+    unsigned long long frames_submitted;
+} AOut;
+#define NAOUT 4
+static AOut g_ao[NAOUT];
+static AOut *aout_of(uint64_t guest) {                /* the open AudioOut at this guest address (else the first) */
+    for (int i = 0; i < NAOUT; i++) if (g_ao[i].open && g_ao[i].audio_out == guest) return &g_ao[i];
+    return &g_ao[0];
+}
+#define g_audio_out (A_->audio_out)
+#define g_event (A_->event)
+#define g_rate (A_->rate)
+#define g_channels (A_->channels)
+#define g_open (A_->open)
+#define g_started (A_->started)
+#define g_wave (A_->wave)
+#define g_slots (A_->slots)
+#define g_head (A_->head)
+#define g_tail (A_->tail)
+#define g_released (A_->released)
+#define g_rel_head (A_->rel_head)
+#define g_rel_tail (A_->rel_tail)
+#define g_clock_due (A_->clock_due)
+#define g_empty_since (A_->empty_since)
+#define g_frames_submitted (A_->frames_submitted)
 static float g_volume = 1.0f;                         /* output volume of the active device */
 static const char g_device_name[] = "AudioTvOutput";
 /* statistics, protected by g_lock */
@@ -101,12 +132,11 @@ static unsigned g_sec_appended, g_sec_released, g_sec_peak, g_sec_polls, g_sec_e
  * game did not append the next one in time; the listener hears a gap until the next AppendAudioOutBuffer. Counted from
  * the first buffer with sound on (before it the game's mixer may legitimately idle). audio_report prints them. */
 static unsigned long long g_underruns, g_underrun_ticks, g_underrun_longest;
-static LONGLONG g_empty_since;
 static unsigned g_queue_max;
 /* A second, stricter measure: at an append, the DEVICE's own play position (waveOutGetPosition, samples) had already
  * reached the end of everything handed to it: the output really ran out of samples (waveOut marks a buffer "done" when
  * its own pipeline has taken it, which can be earlier than the moment it is heard). */
-static unsigned long long g_frames_submitted, g_starved;
+static unsigned long long g_starved;
 static FILE *g_wav;
 static int g_tone_left, g_heard;
 static unsigned long long g_tone_phase;
@@ -115,6 +145,7 @@ static unsigned long long g_wav_bytes;
 static LONGLONG now_ticks(void) { LARGE_INTEGER t; QueryPerformanceCounter(&t); return t.QuadPart; }
 
 static void wav_header(void) {
+    AOut *A_ = &g_ao[0];
     unsigned char h[44];
     uint32_t data = (uint32_t)g_wav_bytes, riff = data + 36, rate = (uint32_t)g_rate, bytes_per_sec = rate * 4;
     uint16_t fmt = 1, ch = 2, align = 4, bits = 16;
@@ -131,7 +162,7 @@ static void wav_header(void) {
 static int16_t sat16(int v) { return (int16_t)(v > 32767 ? 32767 : v < -32768 ? -32768 : v); }
 
 /* Copies a guest buffer to host stereo samples; returns the number of frames and the peak amplitude. */
-static unsigned convert(Slot *s, const int16_t *in, size_t bytes, unsigned *peak_out) {
+static unsigned convert(AOut *A_, Slot *s, const int16_t *in, size_t bytes, unsigned *peak_out) {
     unsigned frames = (unsigned)(bytes / (2u * (unsigned)g_channels)), peak = 0;
     size_t need = (size_t)frames * 4;
     if (need > s->capacity || !s->pcm) {
@@ -165,7 +196,7 @@ static unsigned convert(Slot *s, const int16_t *in, size_t bytes, unsigned *peak
 }
 
 /* SSBU_AUDIO_TONE: a quiet 440 Hz tone over the first second, to check the host output path by ear. */
-static unsigned add_tone(int16_t *pcm, unsigned frames, unsigned peak) {
+static unsigned add_tone(AOut *A_, int16_t *pcm, unsigned frames, unsigned peak) {
     for (unsigned i = 0; i < frames; i++, g_tone_phase++) {
         int v = (int)(3000.0 * sin(6.283185307179586 * 440.0 * (double)g_tone_phase / g_rate));
         for (int k = 0; k < 2; k++) {
@@ -178,7 +209,7 @@ static unsigned add_tone(int16_t *pcm, unsigned frames, unsigned peak) {
 }
 
 /* Moves the buffers that have finished playing to the released list. Returns how many. Caller holds g_lock. */
-static int collect_finished(int everything) {
+static int collect_finished(AOut *A_, int everything) {
     int n = 0;
     LONGLONG now = now_ticks();
     while (g_head != g_tail) {
@@ -207,8 +238,9 @@ static DWORD WINAPI audio_thread(LPVOID arg) {
     for (;;) {
         WaitForSingleObject(g_wake, 2);
         EnterCriticalSection(&g_lock);
-        int n = g_open ? collect_finished(0) : 0;
-        uint64_t ev = g_event;
+        int n = 0; uint64_t ev = 0, evs[NAOUT]; int nev = 0;
+        for (int i = 0; i < NAOUT; i++) { AOut *A_ = &g_ao[i]; int k = g_open ? collect_finished(A_, 0) : 0; if (k && g_event) evs[nev++] = g_event; n += k; }
+        AOut *A_ = &g_ao[0];
         LONGLONG now = now_ticks();
         int report = 0;
         unsigned queued = g_tail - g_head;
@@ -223,7 +255,7 @@ static DWORD WINAPI audio_thread(LPVOID arg) {
             report = g_open && (every_second || seconds % 10 == 0);
         }
         LeaveCriticalSection(&g_lock);
-        if (n && ev) os_signal_event(ev);
+        (void)ev; for (int i = 0; i < nev; i++) os_signal_event(evs[i]);
         if (report) {
             printf("nn::audio: t=%us appended %u released %u polls %u (empty %u) queued %u peak %u, total %llu buffers, %llu s with sound\n",
                    seconds, acc_appended, acc_released, acc_polls, acc_empty, queued, acc_peak, g_total_appended, g_nonsilent_seconds);
@@ -242,6 +274,8 @@ static void audio_InitializeAudioOutParameter(Ctx *c) {   /* (AudioOutParameter 
 static void audio_OpenDefaultAudioOut(Ctx *c) {       /* (AudioOut *, nn::os::SystemEvent *, const AudioOutParameter &) -> Result */
     unsigned want_rate = rd32(A2), want_channels = rd16(A2 + 4);
     EnterCriticalSection(&g_lock);
+    AOut *A_ = &g_ao[0];
+    for (int i = 0; i < NAOUT; i++) if (!g_ao[i].open || g_ao[i].audio_out == A0) { A_ = &g_ao[i]; break; }   /* a free state, or this AudioOut's own */
     g_audio_out = A0;
     g_event = A1;
     g_rate = want_rate ? (int)want_rate : 48000;
@@ -272,7 +306,10 @@ static void audio_OpenDefaultAudioOut(Ctx *c) {       /* (AudioOut *, nn::os::Sy
             char exe[MAX_PATH] = "";
             GetModuleFileNameA(NULL, exe, sizeof exe);
             const char *base = strrchr(exe, '\\') ? strrchr(exe, '\\') + 1 : exe, *vol = getenv("SSBU_VOLUME");
-            int percent = vol ? atoi(vol) : (!_stricmp(base, "ssbu_native.exe") || !_stricmp(base, "ssbu_user.exe") || !_stricmp(base, "game_native.exe")) ? 100 : 0;   /* [Recomps#1] our exe is audible */
+            /* edición mejorada (issue #25 "No sound"): audible whatever the exe is called; only the test scripts (SSBU_SEQ /
+               SSBU_SCRIPT) are silent by default. Before, a renamed exe (a Steam shortcut copy, a wrapper) played muted. */
+            (void)base;
+            int percent = vol ? atoi(vol) : (getenv("SSBU_SEQ") || getenv("SSBU_SCRIPT")) ? 0 : 100;
             if (percent < 0) percent = 0;
             if (percent > 100) percent = 100;
             DWORD level = (DWORD)(0xffff * percent / 100);
@@ -294,8 +331,8 @@ static void audio_OpenDefaultAudioOut(Ctx *c) {       /* (AudioOut *, nn::os::Sy
     RET(0);
 }
 
-static void audio_GetAudioOutChannelCount(Ctx *c) { RET(g_channels); }
-static void audio_GetAudioOutSampleRate(Ctx *c) { RET(g_rate); }
+static void audio_GetAudioOutChannelCount(Ctx *c) { AOut *A_ = aout_of(A0); RET(g_channels); }
+static void audio_GetAudioOutSampleRate(Ctx *c) { AOut *A_ = aout_of(A0); RET(g_rate); }
 static void audio_GetAudioOutSampleFormat(Ctx *c) { RET(SAMPLE_FORMAT_PCM16); }
 
 static void audio_SetAudioOutBufferInfo(Ctx *c) {     /* (AudioOutBuffer *, void *data, size_t capacity, size_t dataSize) */
@@ -311,15 +348,16 @@ static void audio_GetAudioOutBufferDataPointer(Ctx *c) { RET(rd64(A0 + BUF_DATA)
 static void audio_AppendAudioOutBuffer(Ctx *c) {      /* (AudioOut *, AudioOutBuffer *) -> bool */
     uint64_t buf = A1, data = rd64(buf + BUF_DATA), size = rd64(buf + BUF_SIZE);
     int ok = 0;
+    AOut *A_ = aout_of(A0);
     EnterCriticalSection(&g_lock);
     if (g_open && g_tail - g_head < SLOTS && data && size) {
         Slot *s = &g_slots[g_tail % SLOTS];
         unsigned peak = 0;
-        unsigned frames = convert(s, (const int16_t *)(uintptr_t)data, (size_t)size, &peak);
+        unsigned frames = convert(A_, s, (const int16_t *)(uintptr_t)data, (size_t)size, &peak);
         s->guest = buf;
         s->frames = frames;
         s->prepared = 0;
-        if (g_tone_left > 0) { g_tone_left--; peak = add_tone(s->pcm, frames, peak); }
+        if (g_tone_left > 0) { g_tone_left--; peak = add_tone(A_, s->pcm, frames, peak); }
         if (peak && !g_heard) { g_heard = 1; printf("nn::audio: first buffer with sound (buffer %llu, peak %u)\n", g_total_appended, peak); }
         {   /* TEST ONLY, SSBU_AUDIO_HASH=<file> (round "four players"): one line per buffer the game hands to the device:
              * index, frames, peak, FNV-1a 64 of the game's own samples (before our stereo copy). Compares the mixer's output
@@ -381,6 +419,7 @@ static void audio_AppendAudioOutBuffer(Ctx *c) {      /* (AudioOut *, AudioOutBu
 /* End-of-run line (hostrt.c report_and_exit): what the output path did in this run. */
 void audio_report(FILE *out) {
     if (!g_total_appended) return;
+    AOut *A_ = &g_ao[0];
     double f = g_freq.QuadPart ? (double)g_freq.QuadPart : 1.0;
     fprintf(out, "nn::audio: %d Hz, %d channels granted, 16-bit; %llu buffers appended, %llu released, %llu refused; deepest queue %u buffers; "
                  "underruns (device ran dry while started, after the first sound): %llu, %.1f ms in all, longest %.1f ms; %llu s with sound\n",
@@ -391,6 +430,7 @@ void audio_report(FILE *out) {
 
 static void audio_StartAudioOut(Ctx *c) {             /* (AudioOut *) -> Result */
     EnterCriticalSection(&g_lock);
+    AOut *A_ = aout_of(A0);
     if (g_open && !g_started) {
         g_started = 1;
         g_clock_due = now_ticks();                    /* clock-driven buffers queued before the start begin now */
@@ -409,7 +449,8 @@ static void audio_StartAudioOut(Ctx *c) {             /* (AudioOut *) -> Result 
 static void audio_GetReleasedAudioOutBuffer(Ctx *c) { /* (AudioOut *) -> AudioOutBuffer * or null */
     uint64_t r = 0;
     EnterCriticalSection(&g_lock);
-    if (g_open) collect_finished(0);
+    AOut *A_ = aout_of(A0);
+    if (g_open) collect_finished(A_, 0);
     if (g_rel_head != g_rel_tail) r = g_released[g_rel_head++ % SLOTS];
     g_sec_polls++;
     if (!r) g_sec_empty++;
@@ -419,12 +460,13 @@ static void audio_GetReleasedAudioOutBuffer(Ctx *c) { /* (AudioOut *) -> AudioOu
 
 static void audio_StopAudioOut(Ctx *c) {              /* (AudioOut *): everything queued becomes released */
     EnterCriticalSection(&g_lock);
+    AOut *A_ = aout_of(A0);
     HWAVEOUT w = g_wave;
     LeaveCriticalSection(&g_lock);
     if (w) waveOutReset(w);                           /* marks every queued header as done */
     g_frames_submitted = 0;                           /* waveOutReset also sets the device position back to 0 */
     EnterCriticalSection(&g_lock);
-    if (g_open) collect_finished(1);
+    if (g_open) collect_finished(A_, 1);
     g_started = 0;
     if (g_wave) waveOutPause(g_wave);
     uint64_t ev = g_event;
@@ -435,11 +477,12 @@ static void audio_StopAudioOut(Ctx *c) {              /* (AudioOut *): everythin
 
 static void audio_CloseAudioOut(Ctx *c) {             /* (AudioOut *) */
     EnterCriticalSection(&g_lock);
+    AOut *A_ = aout_of(A0);
     HWAVEOUT w = g_wave;
     LeaveCriticalSection(&g_lock);
     if (w) waveOutReset(w);
     EnterCriticalSection(&g_lock);
-    if (g_open) collect_finished(1);
+    if (g_open) collect_finished(A_, 1);
     g_open = g_started = 0;
     g_wave = NULL;
     g_event = 0;

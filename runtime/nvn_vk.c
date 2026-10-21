@@ -221,6 +221,21 @@ static int swapchain_create(void) {
     V.extent = ext;
     return 1;
 }
+/* Edición mejorada (issues #22, #15): a present or acquire answered SUBOPTIMAL made the swapchain go and come back, with a
+ * full GPU wait, at EVERY such frame. Overlays and HDR composition (NVIDIA overlay / RTX HDR, Steam, gamescope) can answer
+ * SUBOPTIMAL on every frame although nothing changed: the game stalled and flickered. Now OUT_OF_DATE always remakes it,
+ * SUBOPTIMAL only when the surface's size really differs from the swapchain's. */
+static int swapchain_stale(VkResult r, int suboptimal) {
+    if (r == VK_ERROR_OUT_OF_DATE_KHR) return 1;
+    if (r != VK_SUBOPTIMAL_KHR && !suboptimal) return 0;
+    VkSurfaceCapabilitiesKHR caps;
+    if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR(V.gpu, V.surface, &caps) != VK_SUCCESS) return 1;
+    if (caps.currentExtent.width == 0xffffffffu) return 0;             /* the window decides the size: it is ours */
+    int stale = caps.currentExtent.width != V.extent.width || caps.currentExtent.height != V.extent.height;
+    static int said;
+    if (!stale && !said) { said = 1; printf("nvn_vk: SUBOPTIMAL with the same size (an overlay or HDR composition): the swapchain is kept\n"); fflush(stdout); }
+    return stale;
+}
 
 /* ---------------------------------------------------------------- start */
 static void *vk_sym(const char *name) {
@@ -491,7 +506,7 @@ static void present_colour(const float rgba[4]) {
     pr.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
     pr.waitSemaphoreCount = 1; pr.pWaitSemaphores = &V.rendered; pr.swapchainCount = 1; pr.pSwapchains = &V.swapchain; pr.pImageIndices = &index;
     r = vkQueuePresentKHR(V.queue, &pr);
-    if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR || suboptimal) { swapchain_destroy(); InterlockedIncrement64(&g_vk_recreated); }      /* made again at the next present */
+    if (swapchain_stale(r, suboptimal)) { swapchain_destroy(); InterlockedIncrement64(&g_vk_recreated); }      /* made again at the next present */
     else vk_ok("vkQueuePresentKHR", r);
     InterlockedIncrement64(&g_vk_frames);
 }
