@@ -689,16 +689,21 @@ static uint64_t *ww_slot(uint64_t page, int insert) {
         }
     }
 }
-/* Newest write stamp of the pages of [p, p+n), or 0 when the memory is not write-watched. Never returns less than 1 otherwise. */
-static uint64_t ww_newest(const uint8_t *p, size_t n) {
+/* [Recomps#1] finding 140: a page's stamp is also given to its 4 MB region, a key of its own in the same table (the vertex
+ * buffers kept on the GPU, nvn_vk_draw.c, ask once per region for all the buffers in it) */
+#define WW_REGION(pg) ((pg) >> 10 | 1ull << 62)
+static int g_ww_tmon = -1;
+static void ww_init(void) {
+    if (g_ww_off < 0) { g_ww_off = getenv("SSBU_NO_WRITEWATCH") != NULL; g_ww_tab = calloc(WW_SLOTS, sizeof *g_ww_tab); g_ww_stamp = 1; }
+    if (g_ww_tmon < 0) g_ww_tmon = getenv("SSBU_VK_PREPTIME") && atoi(getenv("SSBU_VK_PREPTIME"));
+}
+/* Asks Windows which pages of [p, p+n) were written since the last question; they (and their regions) get a new stamp.
+ * 0 = the memory is not write-watched. */
+static int ww_ask(const uint8_t *p, size_t n) {
     static void *pages[16384];
     ULONG_PTR count, cap;
     DWORD gran = 0;
-    if (g_ww_off < 0) { g_ww_off = getenv("SSBU_NO_WRITEWATCH") != NULL; g_ww_tab = calloc(WW_SLOTS, sizeof *g_ww_tab); g_ww_stamp = 1; }
-    static int tm = -1;
-    if (tm < 0) tm = getenv("SSBU_VK_PREPTIME") && atoi(getenv("SSBU_VK_PREPTIME"));
-    LONG64 t0 = tm ? pf_now() : 0;
-    if (g_ww_off || !n) return 0;
+    LONG64 t0 = g_ww_tmon ? pf_now() : 0;
     /* [Recomps#1] finding 93: the list offered is as long as the range has pages, not 16384 entries: the time of a question
      * follows the length of the list (scratchpad test: 54 pages asked with room for 16384 = 4.9 us, for 64 = 1.2 us); the
      * render thread asked 84 (tutorial) to 282 (first fight) times per frame, 0.43 / 1.6 ms */
@@ -706,18 +711,40 @@ static uint64_t ww_newest(const uint8_t *p, size_t n) {
     if (cap > 16384) cap = 16384;
     count = cap;
     if (GetWriteWatch(WRITE_WATCH_FLAG_RESET, (void *)p, n, pages, &count, &gran)) return 0;
-    if (tm) { LONG64 t1 = pf_now(); g_ww_tm[0] += t1 - t0; t0 = t1; g_ww_tm[2]++; g_ww_tm[3] += (LONG64)(((uintptr_t)p + n - 1) >> 12) - (LONG64)((uintptr_t)p >> 12) + 1; }
-    uint64_t first = (uint64_t)(uintptr_t)p >> 12, last = ((uint64_t)(uintptr_t)p + n - 1) >> 12, newest = g_ww_floor ? g_ww_floor : 1;
-    if (g_ww_used > WW_SLOTS / 2) { memset(g_ww_tab, 0, WW_SLOTS * sizeof *g_ww_tab); g_ww_used = 0; g_ww_floor = ++g_ww_stamp; newest = g_ww_floor; }      /* forget: everything counts as written once */
+    if (g_ww_tmon) { LONG64 t1 = pf_now(); g_ww_tm[0] += t1 - t0; t0 = t1; g_ww_tm[2]++; g_ww_tm[3] += (LONG64)(((uintptr_t)p + n - 1) >> 12) - (LONG64)((uintptr_t)p >> 12) + 1; }
+    uint64_t first = (uint64_t)(uintptr_t)p >> 12, last = ((uint64_t)(uintptr_t)p + n - 1) >> 12;
+    if (g_ww_used > WW_SLOTS / 2) { memset(g_ww_tab, 0, WW_SLOTS * sizeof *g_ww_tab); g_ww_used = 0; g_ww_floor = ++g_ww_stamp; }      /* forget: everything counts as written once */
     if (count) {
         uint64_t stamp = ++g_ww_stamp;
         if (count == cap) {                        /* more written pages than the list holds (or every page of the range): stamp the whole range */
             ResetWriteWatch((void *)p, n);
             for (uint64_t pg = first; pg <= last; pg++) *ww_slot(pg, 1) = stamp;
-        } else for (ULONG_PTR i = 0; i < count; i++) *ww_slot((uint64_t)(uintptr_t)pages[i] >> 12, 1) = stamp;
+            for (uint64_t rg = first >> 10; rg <= last >> 10; rg++) *ww_slot(rg | 1ull << 62, 1) = stamp;
+        } else {
+            uint64_t rl = ~0ull;                   /* the list is in address order: a region once per run of its pages */
+            for (ULONG_PTR i = 0; i < count; i++) {
+                uint64_t pg = (uint64_t)(uintptr_t)pages[i] >> 12;
+                *ww_slot(pg, 1) = stamp;
+                if (pg >> 10 != rl) { rl = pg >> 10; *ww_slot(WW_REGION(pg), 1) = stamp; }
+            }
+        }
     }
-    for (uint64_t pg = first; pg <= last; pg++) { uint64_t *s = ww_slot(pg, 0); if (s && *s > newest) newest = *s; }
-    if (tm) g_ww_tm[1] += pf_now() - t0;
+    if (g_ww_tmon) g_ww_tm[1] += pf_now() - t0;
+    return 1;
+}
+/* The newest stamp of the keys first..last (| tag) in the table: the floor for a key not in it */
+static uint64_t ww_stamps(uint64_t first, uint64_t last, uint64_t tag) {
+    uint64_t newest = g_ww_floor ? g_ww_floor : 1;
+    for (uint64_t k = first; k <= last; k++) { uint64_t *s = ww_slot(k | tag, 0); if (s && *s > newest) newest = *s; }
+    return newest;
+}
+/* Newest write stamp of the pages of [p, p+n), or 0 when the memory is not write-watched. Never returns less than 1 otherwise. */
+static uint64_t ww_newest(const uint8_t *p, size_t n) {
+    ww_init();
+    if (g_ww_off || !n || !ww_ask(p, n)) return 0;
+    LONG64 t0 = g_ww_tmon ? pf_now() : 0;
+    uint64_t newest = ww_stamps((uint64_t)(uintptr_t)p >> 12, ((uint64_t)(uintptr_t)p + n - 1) >> 12, 0);
+    if (g_ww_tmon) g_ww_tm[1] += pf_now() - t0;
     return newest;
 }
 /* SSBU_VK_PREPTIME: ticks in GetWriteWatch, ticks in the stamp table, questions, pages asked about */
@@ -725,6 +752,21 @@ const LONG64 *nvn_front_ww_times(void) { return g_ww_tm; }
 /* Round 16 (nvn_vk_draw.c, SSBU_VK_CBKEEP): the same question for any guest range: has the CPU written a page of it since
  * the stamp the caller remembers? 0 = the memory is not write-watched. Render thread only. */
 uint64_t nvn_front_mem_newest(const void *p, size_t n) { return ww_newest(p, n); }
+/* [Recomps#1] finding 140 (nvn_vk_draw.c, the vertex buffers kept on the GPU): nvn_front_mem_region asks about a whole range
+ * at once (a 4 MB region holding many vertex buffers) and returns the newest stamp of its regions, 0 = not write-watched
+ * (ask = 0: the stamp only, from the table);
+ * nvn_front_mem_stamp = the newest stamp of a range's pages from the table, without asking (after the question for its
+ * region); nvn_front_mem_now = the newest stamp given so far: a page written after it gets a newer one. Render thread only. */
+uint64_t nvn_front_mem_region(const void *p, size_t n, int ask) {      /* ask = 0: only the table (the region was asked about) */
+    ww_init();
+    if (g_ww_off || !n || (ask && !ww_ask(p, n))) return 0;
+    return ww_stamps((uint64_t)(uintptr_t)p >> 22, ((uint64_t)(uintptr_t)p + n - 1) >> 22, 1ull << 62);
+}
+uint64_t nvn_front_mem_stamp(const void *p, size_t n) {
+    ww_init();
+    return g_ww_off || !n ? 0 : ww_stamps((uint64_t)(uintptr_t)p >> 12, ((uint64_t)(uintptr_t)p + n - 1) >> 12, 0);
+}
+uint64_t nvn_front_mem_now(void) { ww_init(); return g_ww_stamp; }
 
 static void tex_upload_memory(Tex *t, const Fmt *f) {
     static uint8_t *tmp;
