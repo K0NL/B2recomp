@@ -24,7 +24,8 @@ static int have_targets_live(void);
     X(vkCmdSetPrimitiveTopology) X(vkCmdSetDepthTestEnable) X(vkCmdSetDepthWriteEnable) X(vkCmdSetDepthCompareOp) X(vkCmdSetStencilTestEnable) X(vkCmdSetStencilOp) \
     X(vkCmdSetDepthBiasEnable) X(vkCmdSetPrimitiveRestartEnable) X(vkCmdSetRasterizerDiscardEnable) X(vkCmdBindVertexBuffers) X(vkCmdBindIndexBuffer) X(vkCmdDraw) X(vkCmdDrawIndexed) \
     X(vkCmdClearAttachments) X(vkCmdCopyBufferToImage) X(vkCmdCopyImageToBuffer) X(vkCmdBlitImage) X(vkCmdResolveImage) X(vkCmdClearDepthStencilImage) X(vkGetFenceStatus) \
-    X(vkCreateComputePipelines) X(vkCmdDispatch) X(vkCreateQueryPool) X(vkDestroyQueryPool) X(vkCmdResetQueryPool) X(vkCmdWriteTimestamp) X(vkGetQueryPoolResults) X(vkCmdBeginQuery) X(vkCmdEndQuery) X(vkResetQueryPool) X(vkCreatePipelineCache) X(vkGetPipelineCacheData) X(vkDestroyPipelineCache) X(vkCmdCopyBuffer)
+    X(vkCreateComputePipelines) X(vkCmdDispatch) X(vkCreateQueryPool) X(vkDestroyQueryPool) X(vkCmdResetQueryPool) X(vkCmdWriteTimestamp) X(vkGetQueryPoolResults) X(vkCmdBeginQuery) X(vkCmdEndQuery) X(vkResetQueryPool) X(vkCreatePipelineCache) X(vkGetPipelineCacheData) X(vkDestroyPipelineCache) X(vkCmdCopyBuffer) \
+    X(vkCreateDescriptorUpdateTemplate) X(vkUpdateDescriptorSetWithTemplate) X(vkDestroyDescriptorUpdateTemplate)
 #define X(n) static PFN_##n n;
 VKD(X)
 #undef X
@@ -367,6 +368,13 @@ static LONG64 g_ts_n;
 static float g_fr_gpu[FRSTAT_N], g_fr_wall[FRSTAT_N];
 static uint8_t g_fr_fight[FRSTAT_N];
 static LONG64 g_cur_frame, g_battle_frames;
+/* [Recomps#1] finding 145, TEST ONLY: SSBU_VK_CUTC_ALT=1: its pieces are off in every other 300-frame stretch (the ones whose
+ * "frames X..X+300" lines have X / 300 odd), to compare on and off with the same load on the PC */
+int nvn_vk_cutc_live(void) {
+    static int alt = -1;
+    if (alt < 0) alt = getenv("SSBU_VK_CUTC_ALT") && atoi(getenv("SSBU_VK_CUTC_ALT"));
+    return !alt || ((g_cur_frame - 1) / 300) % 2 == 0;
+}
 /* Round 16 (P3 section 15), all test / switch code:
  * SSBU_VK_PASSTIME=1 (with SSBU_VK_GPUTIME=1): a timestamp at the start of every pass (and of every run of compute
  *   dispatches, and of the present blit); the time to the next mark of the same command buffer is that segment's GPU time.
@@ -967,7 +975,7 @@ static VTex *vt_get2(Tex *t, int sync) {
         }
     }
     vt_check(vt);
-    if (sync && nvn_front_tex_changed(t)) {
+    if (sync && nvn_front_tex_changed(t, R.gen)) {
         if (!tu0) tu0 = tk();
         g_put_vt = vt;
         cmd_begin();
@@ -1571,6 +1579,44 @@ static VkDescriptorSet set_alloc(VkDescriptorSetLayout layout) {
         pi.maxSets = 8192; pi.poolSizeCount = 2; pi.pPoolSizes = ps;
         VKC(vkCreateDescriptorPool(V.device, &pi, NULL, &s->pool[s->npool++]));
     }
+}
+/* [Recomps#1] finding 145 (cut C of finding 142): set 0's buffers (a draw's 5-10 storage buffers in the universal layout: 66
+ * bindings, more than a device must allow to push) are written through an update template per list of bindings (the buffers
+ * a stage pair declares, in draw_prepare's order: 39 lists in the fight) instead of one VkWriteDescriptorSet per buffer for
+ * vkUpdateDescriptorSets: the descriptor step 10 % cheaper a draw at 120 fps. SSBU_VK_SETTMPL=0: vkUpdateDescriptorSets as
+ * before. (Allocating set 0 64 at a time was measured too: the allocation 36 % cheaper, the update and the binds after it
+ * as much dearer, the sets no longer warm in the cache: not kept.) */
+#define UT_N 1024
+static struct { VkDescriptorSetLayout dl; uint64_t a, b; VkDescriptorUpdateTemplate t; } g_ut[UT_N];
+static int g_ut_on = -1, g_ut_n;
+static VkDescriptorUpdateTemplate set0_template(VkDescriptorSetLayout dl, const VStage *vs, const VStage *fs) {
+    if (g_ut_on < 0) g_ut_on = !(getenv("SSBU_VK_SETTMPL") && !atoi(getenv("SSBU_VK_SETTMPL")));
+    if (!g_ut_on || !nvn_vk_cutc_live()) return VK_NULL_HANDLE;
+    uint64_t a = (uint64_t)(vs->cbufs & 0x3fffe) | (uint64_t)(vs->ssbos & 0xffff) << 32, b = fs ? (uint64_t)(fs->cbufs & 0x3fffe) | (uint64_t)(fs->ssbos & 0xffff) << 32 | 1ull << 63 : 0;
+    unsigned h = (unsigned)(((a * 0x9E3779B97F4A7C15ull) ^ (b * 0xC2B2AE3D27D4EB4Full) ^ (uint64_t)(uintptr_t)dl) >> 40) & (UT_N - 1);
+    for (int probe = 0; probe < 32; probe++, h = (h + 1) & (UT_N - 1)) {
+        if (g_ut[h].t && g_ut[h].dl == dl && g_ut[h].a == a && g_ut[h].b == b) return g_ut[h].t;
+        if (g_ut[h].t) continue;
+        VkDescriptorUpdateTemplateEntry e[68];
+        uint32_t ne = 0;
+        for (int s = 0; s < (fs ? 2 : 1); s++) {
+            const VStage *v = s ? fs : vs;
+            for (unsigned n = 1; n < 34; n++) {
+                unsigned bit = n < 18 ? v->cbufs >> n & 1 : v->ssbos >> (n - 18) & 1;
+                if (!bit) continue;
+                e[ne].dstBinding = 40u * (unsigned)s + (n < 18 ? n : 20 + n - 18); e[ne].dstArrayElement = 0; e[ne].descriptorCount = 1;
+                e[ne].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; e[ne].offset = ne * sizeof(VkDescriptorBufferInfo); e[ne].stride = sizeof(VkDescriptorBufferInfo);
+                ne++;
+            }
+        }
+        if (!ne) return VK_NULL_HANDLE;
+        VkDescriptorUpdateTemplateCreateInfo ci = {VK_STRUCTURE_TYPE_DESCRIPTOR_UPDATE_TEMPLATE_CREATE_INFO};
+        ci.descriptorUpdateEntryCount = ne; ci.pDescriptorUpdateEntries = e; ci.templateType = VK_DESCRIPTOR_UPDATE_TEMPLATE_TYPE_DESCRIPTOR_SET; ci.descriptorSetLayout = dl;
+        if (vkCreateDescriptorUpdateTemplate(V.device, &ci, NULL, &g_ut[h].t) != VK_SUCCESS) { g_ut[h].t = VK_NULL_HANDLE; return VK_NULL_HANDLE; }
+        g_ut[h].dl = dl; g_ut[h].a = a; g_ut[h].b = b; g_ut_n++;
+        return g_ut[h].t;
+    }
+    return VK_NULL_HANDLE;                         /* a crowded table: vkUpdateDescriptorSets */
 }
 static struct { uint64_t key; VkDescriptorSet set; uint32_t gen; VkDescriptorSetLayout dl; int n, off; } g_tset[4096];      /* texture sets of the command buffer being recorded */
 static struct { VTex *d2, *d1, *d3; VkImageView v[7]; } g_dummy;
@@ -2542,6 +2588,20 @@ static uint64_t g_dt_voff[16]; static VkBuffer g_dt_vb[16]; int nvn_front_draw_t
 /* [Recomps#1] SSBU_VK_PREPTIME=1, TEST ONLY: draw preparation split into its steps (printed with nvn_vk_perf every 300 frames) */
 static LONG64 g_ptm[12], g_ptm_t, g_ptm_n, g_set0_upd;      /* g_ptm[11]: allocation of set 0 */
 #define PT(i) do { if (g_ptm_on > 0) { LONG64 pt_ = tk(); g_ptm[i] += pt_ - g_ptm_t; g_ptm_t = pt_; } } while (0)
+/* [Recomps#1] finding 145 (cut C of finding 142): a stage's size table (c2, 896 bytes: what TXQ answers, written at
+ * nvnCommandBufferBindTextures) went into the stream ring for every draw; it is copied again only when it changed (g_c2_ver,
+ * OP_TEXTURES) or the ring may have moved on (R.gen). SSBU_VK_C2KEEP=0: a copy per draw as before. */
+static struct { uint64_t off; uint32_t gen, ver; int ok; } g_c2k[6];
+static uint32_t g_c2_ver[6];
+static int g_c2k_on = -1;
+static LONG64 g_c2k_n[2];                          /* SSBU_VK_PREPTIME: copies, copies left out */
+static uint64_t c2_ref(int s) {
+    if (g_c2k_on < 0) g_c2k_on = !(getenv("SSBU_VK_C2KEEP") && !atoi(getenv("SSBU_VK_C2KEEP")));
+    if (g_c2k_on && g_c2k[s].ok && g_c2k[s].gen == R.gen && g_c2k[s].ver == g_c2_ver[s] && nvn_vk_cutc_live()) { g_c2k_n[1]++; return g_c2k[s].off; }
+    uint64_t off = ring_raw(R.c2[s], sizeof R.c2[s]);      /* a ring wrap moves R.gen on: read after */
+    g_c2k[s].off = off; g_c2k[s].gen = R.gen; g_c2k[s].ver = g_c2_ver[s]; g_c2k[s].ok = 1; g_c2k_n[0]++;
+    return off;
+}
 static int draw_prepare(unsigned prim) {
     if (g_ptm_on < 0) g_ptm_on = getenv("SSBU_VK_PREPTIME") && atoi(getenv("SSBU_VK_PREPTIME"));
     if (g_ptm_on > 0) { g_ptm_t = tk(); g_ptm_n++; }
@@ -2586,7 +2646,7 @@ static int draw_prepare(unsigned prim) {
             if (!(v->cbufs >> n & 1)) continue;
             BufRef *b = &bufs[nbuf++];
             b->zero = 0; b->buf = R.ring;
-            if (n == 2) { b->off = ring_raw(R.c2[s], sizeof R.c2[s]); b->size = sizeof R.c2[s]; }
+            if (n == 2) { b->off = c2_ref(s); b->size = sizeof R.c2[s]; }
             else if (n == 1 && st->ctl[3] && st->ctl[4]) { b->size = st->ctl[3]; b->off = ring_put((uint64_t)(uintptr_t)(st->code - 0x30 + st->ctl[4]), b->size); }
             else if (n >= 3 && R.ubo[s][n - 3].addr && R.ubo[s][n - 3].size) buf_ref(R.ubo[s][n - 3].addr, R.ubo[s][n - 3].size, sal, b);
             else b->zero = 1;
@@ -2671,6 +2731,7 @@ static int draw_prepare(unsigned prim) {
         int nw = 0, ib = 0, it = 0;
         if (!p->push0 && p->nb[0]) sets[0] = set_alloc(p->dl[0]);
         PT(11);
+        VkDescriptorUpdateTemplate ut = sets[0] ? set0_template(p->dl[0], vs, fs) : VK_NULL_HANDLE;      /* finding 145: then only bi[] is filled */
         /* [Recomps#1] finding 93: each write is filled whole below (no memset of all 194 entries of the universal layout, 12 KB per draw) */
         for (int s = 0; s < (fs ? 2 : 1); s++) {
             VStage *v = s ? fs : vs;
@@ -2679,12 +2740,17 @@ static int draw_prepare(unsigned prim) {
                 if (!bit) continue;
                 BufRef *b = &bufs[ib];
                 bi[ib].buffer = b->zero ? R.zero : b->buf; bi[ib].offset = b->zero ? 0 : b->off; bi[ib].range = b->zero ? 65536 : b->size;
-                w[nw] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, sets[0], 40u * (unsigned)s + (n < 18 ? n : 20 + n - 18), 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, NULL, &bi[ib], NULL};
+                if (!ut) w[nw] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, sets[0], 40u * (unsigned)s + (n < 18 ? n : 20 + n - 18), 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, NULL, &bi[ib], NULL};
                 nw++; ib++;
             }
         }
         if (p->push0) { if (nw) vkCmdPushDescriptorSetKHR(R.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p->layout, 0, (uint32_t)nw, w); }
-        else if (sets[0]) { LONG64 u0 = g_ptm_on > 0 ? tk() : 0; vkUpdateDescriptorSets(V.device, (uint32_t)nw, w, 0, NULL); if (g_ptm_on > 0) g_set0_upd += tk() - u0; vkCmdBindDescriptorSets(R.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p->layout, 0, 1, &sets[0], 0, NULL); }
+        else if (sets[0]) {
+            LONG64 u0 = g_ptm_on > 0 ? tk() : 0;
+            if (ut) vkUpdateDescriptorSetWithTemplate(V.device, sets[0], ut, bi); else vkUpdateDescriptorSets(V.device, (uint32_t)nw, w, 0, NULL);
+            if (g_ptm_on > 0) g_set0_upd += tk() - u0;
+            vkCmdBindDescriptorSets(R.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p->layout, 0, 1, &sets[0], 0, NULL);
+        }
         PT(8);
         if (p->nb[1]) {
             uint64_t key = fnv(0xcbf29ce484222325ULL, &p->dl[1], sizeof p->dl[1]);
@@ -3193,7 +3259,7 @@ static void exec(const Cmd *m, int depth) {
                 if (((nf >= 1 && nf <= 0x30) || (nf >= 0x6D && nf <= 0x78)) && (k == 2 || k == 3 || k == 7 || k == 8 || k == 10 || k == 11)) isint = k == 3 || k == 8 || k == 11 ? 2 : 1;
                 if (nf == 0x3E) isint = 1;
             }
-            memcpy(&R.c2[stage][48 + 2 * u], dims, 16);
+            if (memcmp(&R.c2[stage][48 + 2 * u], dims, 16)) { memcpy(&R.c2[stage][48 + 2 * u], dims, 16); g_c2_ver[stage]++; }      /* finding 145: c2_ref copies it again */
             R.tex_int[stage] = (R.tex_int[stage] & ~(1u << u)) | ((uint32_t)(isint != 0) << u);
             R.tex_sint[stage] = (R.tex_sint[stage] & ~(1u << u)) | ((uint32_t)(isint == 2) << u);
         }
@@ -4086,14 +4152,18 @@ swap: ;
                    (long long)frame - 300, (long long)frame, (double)(g_ptr_n - lprn) / 300.0, (double)(g_ptr[0] - lpr[0]) * k, (double)(g_ptr[1] - lpr[1]) * k, (double)(g_ptr[2] - lpr[2]) * k, (double)(g_ptr[3] - lpr[3]) * k, g_nsmp,
                    (double)(g_dsh_sent - lds) / 300.0, (double)(g_dsh_kept - ldk) / 300.0, dsh_on());
             memcpy(lpr, g_ptr, sizeof lpr); lprn = g_ptr_n; lds = g_dsh_sent; ldk = g_dsh_kept;
-            {   const LONG64 *ww = nvn_front_ww_times(); static LONG64 lw[4];
-                printf("nvn_vk_preptime: frames %lld..%lld write-watch questions: %.1f/frame over %.0f pages/frame, ms/frame: GetWriteWatch %.2f, stamp table %.2f\n",
-                       (long long)frame - 300, (long long)frame, (double)(ww[2] - lw[2]) / 300.0, (double)(ww[3] - lw[3]) / 300.0, (double)(ww[0] - lw[0]) * k, (double)(ww[1] - lw[1]) * k);
+            {   const LONG64 *ww = nvn_front_ww_times(); static LONG64 lw[10];
+                printf("nvn_vk_preptime: frames %lld..%lld write-watch questions: %.1f/frame over %.0f pages/frame, ms/frame: GetWriteWatch %.2f, stamp table %.2f | "
+                       "textures per frame (finding 145): cluster questions %.1f (written pages found %.1f), own questions %.1f; unchanged by their blocks' stamps %.1f, walked %.1f\n",
+                       (long long)frame - 300, (long long)frame, (double)(ww[2] - lw[2]) / 300.0, (double)(ww[3] - lw[3]) / 300.0, (double)(ww[0] - lw[0]) * k, (double)(ww[1] - lw[1]) * k,
+                       (double)(ww[4] - lw[4]) / 300.0, (double)(ww[8] - lw[8]) / 300.0, (double)(ww[7] - lw[7]) / 300.0, (double)(ww[5] - lw[5]) / 300.0, (double)(ww[6] - lw[6]) / 300.0);
                 memcpy(lw, ww, sizeof lw); }
-            {   static LONG64 l[7];      /* 5, 6: allocate, update */
-                printf("nvn_vk_preptime: frames %lld..%lld buffer sets (set 0) ms/frame: allocate %.2f, update %.2f (their bind and the writes: buffer descriptors)\n",
-                       (long long)frame - 300, (long long)frame, (double)(g_ptm[11] - l[5]) * k, (double)(g_set0_upd - l[6]) * k);
-                l[5] = g_ptm[11]; l[6] = g_set0_upd;
+            {   static LONG64 l[7], l2[2];      /* 5, 6: allocate, update; l2: finding 145's size tables */
+                printf("nvn_vk_preptime: frames %lld..%lld buffer sets (set 0) ms/frame: allocate %.2f, update %.2f (their bind and the writes: buffer descriptors) | "
+                       "per frame (finding 145): size tables (c2) copied %.0f, kept %.0f; %d update templates\n",
+                       (long long)frame - 300, (long long)frame, (double)(g_ptm[11] - l[5]) * k, (double)(g_set0_upd - l[6]) * k,
+                       (double)(g_c2k_n[0] - l2[0]) / 300.0, (double)(g_c2k_n[1] - l2[1]) / 300.0, g_ut_n);
+                l[5] = g_ptm[11]; l[6] = g_set0_upd; l2[0] = g_c2k_n[0]; l2[1] = g_c2k_n[1];
             }
         }
         {   /* finding 138: the ring's range cache; the polls for finished submissions during a replay (slot_poll) */
@@ -4437,6 +4507,7 @@ static void vkd_shutdown(void) {
     }
     for (int i = 0; i < g_nsmp; i++) vkDestroySampler(V.device, g_smp[i].s, NULL);
     vkDestroySampler(V.device, g_smp_default, NULL);
+    for (int i = 0; i < UT_N; i++) if (g_ut[i].t) { vkDestroyDescriptorUpdateTemplate(V.device, g_ut[i].t, NULL); g_ut[i].t = VK_NULL_HANDLE; }      /* finding 145 */
     if (g_ts_pool) { vkDestroyQueryPool(V.device, g_ts_pool, NULL); g_ts_pool = NULL; g_ts_on = 0; }
     for (int i = 0; i < NSLOT; i++) { for (int k = 0; k < R.slot[i].npool; k++) vkDestroyDescriptorPool(V.device, R.slot[i].pool[k], NULL); vkDestroyFence(V.device, R.slot[i].fence, NULL); }
     vkDestroyBuffer(V.device, R.ring, NULL); vkDestroyBuffer(V.device, R.zero, NULL);
