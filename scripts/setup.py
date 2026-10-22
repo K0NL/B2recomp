@@ -160,7 +160,8 @@ def link_folder(link, target):
     if LINUX_HOST:
         os.symlink(target, link, target_is_directory=True)
         return 'symlink to ' + target
-    r = subprocess.run(['cmd', '/c', 'mklink', '/J', link, target], capture_output=True, text=True)
+    # quoted here: cmd splits an unquoted path at commas too, and Python quotes only paths with spaces (finding 149)
+    r = subprocess.run('cmd /c mklink /J "%s" "%s"' % (link, target), capture_output=True, text=True)
     if r.returncode:
         raise Fail('could not make the junction %s -> %s: %s' % (link, target, (r.stdout + r.stderr).strip()))
     return 'junction to ' + target

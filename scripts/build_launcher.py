@@ -55,7 +55,7 @@ code = run([toolchain.LLVM_RC, '/fo', RES, RC])
 if not code:
     # entry point wWinMain: MSVC's linker finds it with /subsystem:windows; mingw needs -municode -mwindows, and lld in
     # mingw mode takes the .res as an ordinary input
-    target = ['-municode', '-mwindows', RES] if toolchain.MINGW else ['-Wl,/subsystem:windows', '-Wl,' + RES]
+    target = ['-municode', '-mwindows', RES] if toolchain.MINGW else ['-Wl,/subsystem:windows', '-Xlinker', RES]   # a path whole (commas, F149)
     code = run([toolchain.CLANG, '-O2', '-Wall', '-Wno-missing-braces', '-D_CRT_SECURE_NO_WARNINGS',
                 os.path.join(SRCD, 'launcher.c'), '-o', EXE, '-luser32', '-lgdi32', '-lcomctl32', '-lshell32', '-luxtheme',
                 '-ldwmapi', '-lmsimg32', '-lole32', '-luuid'] + target)
