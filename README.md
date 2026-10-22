@@ -27,6 +27,7 @@ Measured on the developer's PC (Windows 11, 16 threads, a Vulkan 1.3 GPU):
 | Standard test run (`scripts/bench.py`: tutorial and the first fight, scripted) | 59.5 fps at 60 and 119 fps at 120 (the display rate), 0 faults |
 | Frame rate 120 (beta) | the test fight at 119 fps on a 238 Hz monitor, each frame shown for two refreshes; combos, hit-stop, Witch Time and slow motions keep their 60 fps timing |
 | HDR (Windows HDR on) | the picture goes out as HDR10, as bright as Windows' *SDR content brightness*, at no measurable cost (tested on an NVIDIA card) |
+| PlayStation / Xbox button pictures (with the prompt mod) | with Face buttons by printed letter they follow the printed letters, the action prompts in play included (tested with a DualSense) |
 | Later chapters | being played and tested |
 | Other PCs and GPUs | run by players on AMD Radeon cards (RX 560 to RX 9070 XT) and on Windows 10; fixes for their reports are in v0.2.1 to v0.2.6 |
 
@@ -88,13 +89,17 @@ Hover over any setting for a short explanation. Press **Save** (Play also saves)
 
 **5. Choose your controls.**
 - **Controller** (DualSense, DualShock, Xbox, Switch Pro and most others): connect it before you press Play. "Face
-  buttons" decides whether A is the right button (as on a Switch) or the button printed A. **Test controller...**
-  shows whether your pad is seen; **Remap controller...** fixes a pad whose buttons are mixed up.
+  buttons" decides whether A is the right button (as on a Switch) or the button printed A (on a PlayStation pad, By
+  printed letter makes Cross A, Circle B, Square X and Triangle Y). **Test controller...** shows whether your pad is
+  seen; **Remap controller...** fixes a pad whose buttons are mixed up.
 - **PlayStation or Xbox button pictures** (optional): the game shows Switch buttons. Download *Controller Prompts
   Replacement (DS4/XBOX)* by Timo654 ([GameBanana 360121](https://gamebanana.com/mods/360121), the **Switch**
   version), unpack it and put its `DS4Prompts` and/or `XBOXPrompts` folder into the `mods\` folder beside
   `B2recomp.exe` (make the folder if it is not there). With **Button prompts** on Auto the game then shows the
   buttons of the controller you play with; or choose PlayStation or Xbox. It is chosen when the game starts.
+  With **Face buttons** on By printed letter (or a remap that puts A on the bottom button) the pictures follow the
+  printed letters, so Cross is shown where the game asks for A, and the action prompts in play ("Check", ...) show
+  the button where it sits on your pad (Triangle / Y at the top).
 - **Keyboard and mouse** work at the same time as a controller, with a layout like the original Bayonetta on PC:
 
   | Action | Keys |

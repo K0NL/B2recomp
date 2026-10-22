@@ -135,6 +135,8 @@ static void remove_tree(const char *dir) {
 #define FS_DIR_ROOTS (ROM_MOD_MAX + 2)
 static char g_rom_mod[ROM_MOD_MAX][MAX_PATH];            /* <mod>\romfs folders, the one that wins first */
 static int g_rom_mods;
+static char g_prompt_root[MAX_PATH];                     /* [Recomps#1] finding 148: the button prompt mod's romfs folder + '\' */
+static int g_prompt_swap;                                /* ... and its A / B and X / Y pictures change places (prompt_swap_open) */
 static int mod_cmp(const void *a, const void *b) { return _stricmp(*(char *const *)a, *(char *const *)b); }
 static int mod_family(const char *name) {                /* 2 playstation, 3 xbox, 0 neither: by the words of the name */
     char w[64]; int n = 0, fam = 0;
@@ -238,6 +240,24 @@ static void mod_report(const char *dir, const char *rel, int *files, int *repl, 
     } while (FindNextFileA(h, &fd));
     FindClose(h);
 }
+/* [Recomps#1] finding 148, Bayonetta 2 1.2: the HUD's action prompt ("Check", ...; FUN_7100d34050) has four button places
+ * around its ring, top / left / right / bottom, given the masks of a table at 0x7101464340: X, Y, A, B (the Switch places;
+ * only the place of the action's button is shown). With the face buttons by printed letter Y belongs at the top and A at
+ * the bottom, as on a PlayStation or Xbox pad: the table becomes Y, X, B, A. Only that function reads it (the drawing, not
+ * the input); it is written only when it holds the four values expected, so another game or version is left alone. The
+ * ring's crescent turns toward the button by an angle the prompt's maker chooses from the button in code (A 0, B 90, X -90,
+ * Y 180): scripts/prompt_fix.py patches those stores in the lifted C to take the angle of the button's place in this
+ * table, so the ring follows this rewrite ("prompts:" lines). */
+static void prompt_places_by_letter(void) {
+    uint32_t *t = (uint32_t *)(uintptr_t)0x7101464340ull;
+    static const uint32_t sw[4] = {0x40, 0x80, 0x10, 0x20}, letter[4] = {0x80, 0x40, 0x20, 0x10};
+    DWORD old;
+    if (memcmp(t, sw, sizeof sw)) { printf("romfs mods: the action prompt's button places: not the table expected, left as they are\n"); return; }
+    if (!VirtualProtect(t, sizeof sw, PAGE_READWRITE, &old)) return;
+    memcpy(t, letter, sizeof letter);
+    VirtualProtect(t, sizeof sw, old, &old);
+    printf("romfs mods: the action prompt's button places follow the printed letters too (Y top, X left, B right, A bottom)\n");
+}
 static void rom_mods_init(void) {
     const char *env = getenv("SSBU_MODS");
     char dir[MAX_PATH], tmp[MAX_PATH], ini_path[MAX_PATH], pat[MAX_PATH], want[2][MAX_PATH];
@@ -294,7 +314,16 @@ static void rom_mods_init(void) {
         }
         if (nroots < 64) snprintf(roots[nroots++], MAX_PATH, "%s", romfs);
     }
-    if (prompt[0]) snprintf(g_rom_mod[g_rom_mods++], MAX_PATH, "%s", prompt);
+    if (prompt[0]) {
+        const char *e = getenv("SSBU_PROMPT_SWAP");      /* [Recomps#1] finding 148; TEST: 0 / 1 = never / always */
+        snprintf(g_rom_mod[g_rom_mods++], MAX_PATH, "%s", prompt);
+        snprintf(g_prompt_root, sizeof g_prompt_root, "%s\\", prompt);
+        g_prompt_swap = e && e[0] ? atoi(e) != 0 : nnpad_prompts_by_letter();
+        printf("romfs mods: button prompts for face buttons %s (from what drives A on player 1's pad%s)\n",
+               g_prompt_swap ? "by printed letter: the pictures of A and B, and of X and Y, change places" : "by position, as the mod draws them",
+               e && e[0] ? "; SSBU_PROMPT_SWAP" : "");
+        if (g_prompt_swap) prompt_places_by_letter();
+    }
     for (int i = nroots - 1; i >= 0 && g_rom_mods < ROM_MOD_MAX; i--) snprintf(g_rom_mod[g_rom_mods++], MAX_PATH, "%s", roots[i]);
     if (nroots + (prompt[0] != 0) > ROM_MOD_MAX) printf("romfs mods: more than %d mods with a romfs\\, the first ones by name are left out\n", ROM_MOD_MAX);
     for (int i = 0; i < g_rom_mods; i++) {
@@ -691,6 +720,79 @@ static void fs_QueryMountRomCacheSize(Ctx *c) {          /* (size_t *out) */
     RET(0);
 }
 
+/* [Recomps#1] finding 148: the prompt mod's face buttons for the printed-letter layout. Timo654's prompt mod (GameBanana
+ * 360121) puts each PlayStation / Xbox picture where the Switch button sits (by position: Switch A, the right button, shows
+ * Circle / Xbox B). With the face buttons by printed letter (nnpad_prompts_by_letter: A is the bottom button) the pictures
+ * of A and B, and of X and Y, change places: when the game opens a .dat of the prompt mod, the records btn_001 (B) /
+ * btn_002 (A) and btn_003 (Y) / btn_004 (X) of its .uvd atlases are found (PlatinumGames DAT: offset, extension and size
+ * tables; UVD: count, record table, 96-byte records: name[64], id, texture, x, y, w, h, ...), and every read of the file
+ * gets their texture and x, y, w, h exchanged. The mod's files stay as they are. */
+typedef struct { HANDLE h; int n; uint64_t off[8]; uint8_t val[8][20]; } PromptSwap;
+static PromptSwap g_pswap[16];
+static SRWLOCK g_pswap_lock = SRWLOCK_INIT;
+static int read_some(HANDLE h, uint64_t off, void *buf, DWORD n) {
+    OVERLAPPED ov = {0};
+    DWORD got = 0;
+    ov.Offset = (DWORD)off; ov.OffsetHigh = (DWORD)(off >> 32);
+    return ReadFile(h, buf, n, &got, &ov) && got == n;
+}
+static void prompt_swap_open(HANDLE h, const char *path) {
+    size_t lr = strlen(g_prompt_root), lp = strlen(path);
+    if (!g_prompt_swap || lp < 4 || _strnicmp(path, g_prompt_root, lr) || _stricmp(path + lp - 4, ".dat")) return;
+    uint32_t hd[7];                                      /* 'DAT\0', count, offsets, extensions, names, sizes, hash map */
+    if (!read_some(h, 0, hd, sizeof hd) || memcmp(hd, "DAT", 4) || !hd[1] || hd[1] > 4096) return;
+    uint32_t n = hd[1], *offs = calloc(n, 4), *sizes = calloc(n, 4);
+    char *ext = calloc(n, 4);
+    PromptSwap ps;
+    memset(&ps, 0, sizeof ps); ps.h = h;
+    if (offs && sizes && ext && read_some(h, hd[2], offs, 4 * n) && read_some(h, hd[3], ext, 4 * n) && read_some(h, hd[5], sizes, 4 * n)) {
+        for (uint32_t i = 0; i < n; i++) {
+            uint32_t u[4];                               /* textures, records, record table, texture table */
+            if (memcmp(ext + 4 * i, "uvd", 4) || sizes[i] < 16 || !read_some(h, offs[i], u, sizeof u)) continue;
+            if (!u[1] || u[1] > 65536 || (uint64_t)u[2] + 96ull * u[1] > sizes[i]) continue;
+            uint8_t *rec = malloc(96 * (size_t)u[1]);
+            int at[5] = {-1, -1, -1, -1, -1};
+            if (rec && read_some(h, (uint64_t)offs[i] + u[2], rec, 96 * u[1])) {
+                for (uint32_t k = 0; k < u[1]; k++) { const char *nm = (const char *)rec + 96 * k; if (!memcmp(nm, "btn_00", 6) && nm[6] >= '1' && nm[6] <= '4' && !nm[7]) at[nm[6] - '0'] = (int)k; }
+                for (int p = 1; p <= 3; p += 2) {        /* btn_001 <-> btn_002 (B, A), btn_003 <-> btn_004 (Y, X) */
+                    if (at[p] < 0 || at[p + 1] < 0 || ps.n + 2 > 8) continue;
+                    for (int s = 0; s < 2; s++) {
+                        ps.off[ps.n] = (uint64_t)offs[i] + u[2] + 96ull * (uint64_t)at[p + s] + 68;
+                        memcpy(ps.val[ps.n], rec + 96 * (size_t)at[p + 1 - s] + 68, 20);
+                        ps.n++;
+                    }
+                }
+            }
+            free(rec);
+        }
+    }
+    free(offs); free(sizes); free(ext);
+    if (!ps.n) return;
+    AcquireSRWLockExclusive(&g_pswap_lock);
+    for (int i = 0; i < 16; i++) if (!g_pswap[i].h) { g_pswap[i] = ps; break; }
+    ReleaseSRWLockExclusive(&g_pswap_lock);
+    printf("romfs mods: %s: the pictures of A and B, and of X and Y, change places\n", path + lr);
+}
+static void prompt_swap_read(HANDLE h, uint64_t off, uint8_t *buf, uint64_t got) {
+    if (!g_prompt_swap) return;
+    AcquireSRWLockShared(&g_pswap_lock);
+    for (int i = 0; i < 16; i++) {
+        if (g_pswap[i].h != h) continue;
+        for (int k = 0; k < g_pswap[i].n; k++) {
+            uint64_t a = g_pswap[i].off[k], b = a + 20, lo = a > off ? a : off, hi = b < off + got ? b : off + got;
+            if (lo < hi) memcpy(buf + (lo - off), g_pswap[i].val[k] + (lo - a), (size_t)(hi - lo));
+        }
+        break;
+    }
+    ReleaseSRWLockShared(&g_pswap_lock);
+}
+static void prompt_swap_close(HANDLE h) {
+    if (!g_prompt_swap) return;
+    AcquireSRWLockExclusive(&g_pswap_lock);
+    for (int i = 0; i < 16; i++) if (g_pswap[i].h == h) memset(&g_pswap[i], 0, sizeof g_pswap[i]);
+    ReleaseSRWLockExclusive(&g_pswap_lock);
+}
+
 static void fs_OpenFile(Ctx *c) {                     /* (FileHandle *out, const char *path, int mode) */
     char rel[MAX_PATH], path[MAX_PATH];
     Mount *m = NULL;
@@ -722,10 +824,11 @@ static void fs_OpenFile(Ctx *c) {                     /* (FileHandle *out, const
         if (on) printf("fslog: open \"%s\" mode %d -> %s\n", STR(1), (int)A2, r ? "NOT FOUND" : "ok"); }
     if (r) { wr64(A0, 0); RET(r); return; }
     open_remember(h, (int)(A2 & 7), m);
+    if (modded) prompt_swap_open(h, path);              /* [Recomps#1] finding 148 */
     wr64(A0, (uint64_t)h);
     RET(0);
 }
-static void fs_CloseFile(Ctx *c) { if (A0) { open_mode((HANDLE)A0, 1); CloseHandle((HANDLE)A0); } }
+static void fs_CloseFile(Ctx *c) { if (A0) { open_mode((HANDLE)A0, 1); prompt_swap_close((HANDLE)A0); CloseHandle((HANDLE)A0); } }
 extern int g_hitch_ms; void hitch_note(const char *s);      /* hitch.c: SSBU_HITCH */
 static uint64_t read_at(HANDLE h, int64_t offset, void *buf, uint64_t size) {
     uint64_t total = 0;
@@ -740,6 +843,7 @@ static uint64_t read_at(HANDLE h, int64_t offset, void *buf, uint64_t size) {
         if (!ReadFile(h, (char *)buf + total, chunk, &got, &ov) || got == 0) break;
         total += got;
     }
+    prompt_swap_read(h, (uint64_t)offset, (uint8_t *)buf, total);      /* [Recomps#1] finding 148 */
     /* [Recomps#1] the heap is write-watched (r2_imports.c): one CPU write per page of what was read, so the renderer's
      * texture-change check (nvn_gl.c ww_newest) sees the pages whatever the kernel's copy into them counts as */
     for (uint64_t off = 0; off < total; off += 4096 - (((uintptr_t)buf + off) & 4095)) { volatile uint8_t *q = (volatile uint8_t *)buf + off; *q = *q; }

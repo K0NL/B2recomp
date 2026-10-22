@@ -144,7 +144,8 @@ static const char *const g_default_ini =
 "\r\n"
 "[general]\r\n"
 "; Face buttons. positional = the button in Nintendo's A position (right) acts as A: right = A, bottom = B, top = X, left = Y.\r\n"
-";   labels = the printed letter decides (an Xbox pad's A is Pro A). auto = labels for GameCube controllers, positional otherwise.\r\n"
+";   labels = the printed letter decides (an Xbox pad's A is Pro A; on a PlayStation pad Cross is A, Circle B, Square X,\r\n"
+";   Triangle Y), and the PlayStation / Xbox button pictures follow it. auto = labels for GameCube controllers, positional otherwise.\r\n"
 "layout = auto\r\n"
 "; Radial dead zone and outer zone of the sticks (fractions of full travel): inside the dead zone nothing, beyond the outer\r\n"
 "; zone full deflection; the stick is rescaled in between and its length is limited to 1 (circular gate).\r\n"
@@ -554,9 +555,10 @@ static int def_map(const Dev *d, int labels, int b, Src *o) {          /* the bu
         static const int pos[4] = {1, 0, 3, 2};                         /* south -> B, east -> A, west -> Y, north -> X */
         for (int i = 0; i < 4; i++) {
             int target = pos[i];
-            if (labels) {
+            if (labels) {      /* [Recomps#1] finding 148: a PlayStation pad's symbols count as the letters in their place on an Xbox pad (Cross = A) */
                 SDL_GamepadButtonLabel l = SDL_GetGamepadButtonLabel(d->gp, (SDL_GamepadButton)face[i]);
-                target = l == SDL_GAMEPAD_BUTTON_LABEL_A ? 0 : l == SDL_GAMEPAD_BUTTON_LABEL_B ? 1 : l == SDL_GAMEPAD_BUTTON_LABEL_X ? 2 : l == SDL_GAMEPAD_BUTTON_LABEL_Y ? 3 : pos[i];
+                target = l == SDL_GAMEPAD_BUTTON_LABEL_A || l == SDL_GAMEPAD_BUTTON_LABEL_CROSS ? 0 : l == SDL_GAMEPAD_BUTTON_LABEL_B || l == SDL_GAMEPAD_BUTTON_LABEL_CIRCLE ? 1
+                       : l == SDL_GAMEPAD_BUTTON_LABEL_X || l == SDL_GAMEPAD_BUTTON_LABEL_SQUARE ? 2 : l == SDL_GAMEPAD_BUTTON_LABEL_Y || l == SDL_GAMEPAD_BUTTON_LABEL_TRIANGLE ? 3 : pos[i];
             }
             if (target == b) o[n++] = mk(SK_BTN, face[i], 0);
         }
@@ -743,6 +745,35 @@ int nnpad_button_prompts(void) {
     case SDL_GAMEPAD_TYPE_XBOX360: case SDL_GAMEPAD_TYPE_XBOXONE: return 3;
     default: return 1;
     }
+}
+/* [Recomps#1] finding 148: do player 1's face buttons go by printed letter, A being the bottom button (Xbox A, PlayStation
+ * Cross)? Then the PlayStation / Xbox prompt mod's pictures of A and B, and of X and Y, change places (nnfs.c). Asked of
+ * what really drives Pro A on player 1's pad (else the first pad): its [device] map.A, else the default of its layout
+ * (def_map): the bottom button = by letter, the right one = by position. Without a pad (scripted runs, XInput) [general]
+ * layout. At the moment of the call (nnfs.c, the first file access). */
+int nnpad_prompts_by_letter(void) {
+    lock(); if (!g_cfg.path[0]) cfg_load(1); int def = g_cfg.def.layout == 1; unlock();
+    const char *seq = getenv("SSBU_SEQ"), *backend = getenv("SSBU_PAD_BACKEND");
+    if ((seq && seq[0]) || (backend && !_stricmp(backend, "xinput")) || !nnpad_init()) return def;
+    lock();
+    const Dev *best = NULL;
+    for (int i = 0; i < MAXDEV; i++) {
+        const Dev *d = &g_dev[i];
+        if (!d->used || d->ignored || !d->gp) continue;
+        if (d->slot == 0) { best = d; break; }
+        if (!best) best = d;
+    }
+    int r = def;
+    if (best) {
+        const DevCfg *dc = dev_cfg(best);
+        Src s[4];
+        int n, south = 0, east = 0;
+        if (dc && dc->nmap[0] >= 0) { n = dc->nmap[0]; memcpy(s, dc->map[0], sizeof s); } else n = def_map(best, eff_layout(best), 0, s);
+        for (int k = 0; k < n; k++) if (s[k].kind == SK_BTN && !s[k].raw) { south |= s[k].idx == SDL_GAMEPAD_BUTTON_SOUTH; east |= s[k].idx == SDL_GAMEPAD_BUTTON_EAST; }
+        r = south && !east;
+    }
+    unlock();
+    return r;
 }
 int nnpad_kb_vk(int idx) {
     if (!g_inited) { lock(); if (!g_cfg.path[0]) { cfg_load(1); } unlock(); }
