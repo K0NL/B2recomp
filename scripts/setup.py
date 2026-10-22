@@ -27,7 +27,8 @@ ignored by git; never upload them). Steps, resumable (a finished step is skipped
              (the launcher's Mods window). compile then rebuilds only the C files the lift changed (seconds, not minutes)
     tables   runtime/gen/* from YOUR sdk and main (layout, imports, lifted SDK functions, SDK constants, test vectors)
     lift     lifter/recomp_eh.py: your main.elf -> build/gen_eh (C); then scripts/fps_patch.py --inplace (the frame-rate
-             patch: off at graphics.ini frame_rate = 60, the default)
+             patch: off at graphics.ini frame_rate = 60, the default) and scripts/event_fix.py (cutscenes keep no
+             deleted character, finding 146)
     compile  scripts/compile_main.py: build/gen_eh -> build/obj (clang -O2; the longest step, ~5 min with 16 threads)
     icon     optional: build/bayonetta2.ico from <folder>/control/icon_AmericanEnglish.dat
     link     scripts/build_runtime.py: build/game.dll, build/game_native.exe (+ SDL3.dll, ssbu_glslang.dll);
@@ -437,6 +438,9 @@ def step_lift(cx):
     # the frame-rate patch (graphics.ini frame_rate above 60; off at 60): the clock, the present and the timers of
     # lifter/fps_ticks.txt, patched into the lifted C in place (scripts/fps_patch.py)
     cx.run('lift', [sys.executable, os.path.join(REPO, 'scripts', 'fps_patch.py'), '--gen=' + os.path.join(cx.build, 'gen_eh'), '--inplace'])
+    # a cutscene lets go of a character the game deletes while it runs and binds the replacement (finding 146: the crash
+    # after Verse 10 at 120 fps), at every frame rate (scripts/event_fix.py)
+    cx.run('lift', [sys.executable, os.path.join(REPO, 'scripts', 'event_fix.py'), '--gen=' + os.path.join(cx.build, 'gen_eh')])
 
 
 def step_compile(cx):
