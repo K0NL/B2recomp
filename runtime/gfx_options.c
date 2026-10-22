@@ -129,7 +129,27 @@ static const char *const k_default_ini =
 ";   (scripts/fps_patch.py, notes/fps-research.md). Not every frame counter is converted yet: some effects, menus and\r\n"
 ";   button-mash prompts may run faster than at 60, and the cinematics run in real time. vsync = clock / display /\r\n"
 ";   auto still show each frame at once above 60 (no tearing: mailbox, else FIFO, which shows at most one frame per refresh).\r\n"
-"frame_rate = 60\r\n";
+"frame_rate = 60\r\n"
+"\r\n"
+/* [Recomps#1] finding 147 */
+"; hdr = auto | off | on      (Vulkan, Windows)\r\n"
+";   auto: while Windows HDR is on for the monitor the game is on, the picture goes out as HDR (the game's colours at\r\n"
+";   the brightness below, as Windows shows other programs); otherwise as before. on: always. off: never.\r\n"
+"hdr = auto\r\n"
+"\r\n"
+"; hdr_format = hdr10 | scrgb\r\n"
+";   hdr10: 10 bits a colour, PQ, BT.2020 (what HDR monitors take). scrgb: 16-bit floating point, linear.\r\n"
+"hdr_format = hdr10\r\n"
+"\r\n"
+"; hdr_paper_white = auto | 80 .. 1000\r\n"
+";   How bright the game's white is with HDR on, in nits. auto: Windows' 'SDR content brightness' of that monitor\r\n"
+";   (Settings > System > Display > HDR), followed while the game runs.\r\n"
+"hdr_paper_white = auto\r\n"
+"\r\n"
+"; hdr_gamma = 2.2 | srgb\r\n"
+";   How the game's colours are read with HDR on. 2.2: as an SDR monitor shows them (deep blacks). srgb: as Windows\r\n"
+";   shows SDR programs in HDR (lighter dark parts).\r\n"
+"hdr_gamma = 2.2\r\n";
 
 #define GFX_LOW_SCALE 0.5f
 #define GFX_LOW_SCALE_TEXT "0.50"
@@ -199,6 +219,10 @@ static BOOL CALLBACK opt_load(PINIT_ONCE once, PVOID arg, PVOID *ctx) {
         else if (!_stricmp(key, "aspect")) o->aspect_stretch = !_stricmp(val, "stretch");      /* [Recomps#1] */
         else if (!_stricmp(key, "shader_prepare")) o->shader_prepare = !_stricmp(val, "background") ? 1 : !_stricmp(val, "off") ? 2 : 0;
         else if (!_stricmp(key, "frame_rate")) { int v = atoi(val); o->frame_rate = v < 60 ? 60 : v > 120 ? 120 : v; }      /* [Recomps#1] */
+        else if (!_stricmp(key, "hdr")) o->hdr = !_stricmp(val, "off") ? 1 : !_stricmp(val, "on") ? 2 : 0;      /* [Recomps#1] finding 147 */
+        else if (!_stricmp(key, "hdr_format")) o->hdr_scrgb = !_stricmp(val, "scrgb");
+        else if (!_stricmp(key, "hdr_paper_white")) { float v = (float)atof(val); o->hdr_paper_white = v >= 80.0f && v <= 1000.0f ? v : 0.0f; }      /* auto, or a value out of range */
+        else if (!_stricmp(key, "hdr_gamma")) o->hdr_srgb = !_stricmp(val, "srgb");
         else unknown++;
     }
     if (f) fclose(f);
@@ -224,6 +248,9 @@ static BOOL CALLBACK opt_load(PINIT_ONCE once, PVOID arg, PVOID *ctx) {
     printf("graphics options: %s (%s): renderer=%s window=%s %dx%d vsync=%s gpu=%s console_mode=%s resolution_scale=%.2f anisotropic_filtering=%d frame_time_overlay=%s aspect=%s%s\n", o->path,
            written ? "written with the defaults" : f ? "read" : "NOT readable, defaults used", o->renderer ? "opengl" : "vulkan", k_win[o->window_mode], o->width, o->height, k_vs[o->present],
            o->gpu[0] ? o->gpu : "auto", o->handheld ? "handheld" : "docked", o->scale, o->aniso, o->overlay ? "on" : "off", o->aspect_stretch ? "stretch" : "keep", unknown ? " (lines with an unknown key were ignored)" : "");
+    {   char pw[16]; static const char *const k_hdr[3] = {"auto", "off", "on"};      /* [Recomps#1] finding 147 */
+        if (o->hdr_paper_white > 0) snprintf(pw, sizeof pw, "%.0f", o->hdr_paper_white); else snprintf(pw, sizeof pw, "auto");
+        printf("graphics options: hdr=%s hdr_format=%s hdr_paper_white=%s hdr_gamma=%s\n", k_hdr[o->hdr], o->hdr_scrgb ? "scrgb" : "hdr10", pw, o->hdr_srgb ? "srgb" : "2.2"); }
     if (o->scale != 1.0f && o->renderer) printf("graphics options: resolution_scale=%.2f is ignored by the OpenGL renderer (Vulkan only)\n", o->scale);
     if (o->scale != 1.0f && (o->scale < 0.25f || o->scale > 3.0f)) printf("graphics options: resolution_scale=%.2f is outside 0.25 .. 3.0: the nearest of the two is used\n", o->scale);      /* PR #8 (stephenjayakar): above 1.0 allowed (nvn_vk_draw.c RS_MAX = 2.0) */
     fflush(stdout);

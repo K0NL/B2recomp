@@ -116,6 +116,9 @@ static struct {
     VkSemaphore acquired, rendered;
     VkFence fence;
     int fence_pending, alive, validate;
+    VkSurfaceFormatKHR hdr10, scrgb;      /* [Recomps#1] finding 147: the HDR swapchains the surface offers (format 0 = none) */
+    int hdr;                              /* the swapchain's output: 0 SDR (format), 1 HDR10, 2 scRGB (nvn_vk_draw.c hdr_*) */
+    VkImageView views[16];                /* HDR: the swapchain images' views (the HDR pass draws into them) */
 } V;
 static volatile LONG64 g_vk_frames, g_vk_recreated, g_vk_skipped, g_vk_errors, g_vk_messages, g_vk_missing_calls;
 static int g_vk_missing_warn = -1;
@@ -178,10 +181,13 @@ static int has_name(const VkExtensionProperties *e, uint32_t n, const char *name
 
 /* ---------------------------------------------------------------- swapchain */
 static void wait_last_submit(void);
+static int hdr_mode_want(void);                          /* nvn_vk_draw.c, finding 147: 0 SDR, 1 HDR10, 2 scRGB */
+static void hdr_views(int make);                         /* nvn_vk_draw.c: the swapchain images' views (1) / they and the 8-bit picture go (0) */
 static void swapchain_destroy(void) {
     if (!V.swapchain) return;
     wait_last_submit();                                  /* also resets the fence for the next submit */
     vkDeviceWaitIdle(V.device);
+    hdr_views(0);
     vkDestroySwapchainKHR(V.device, V.swapchain, NULL);
     V.swapchain = NULL; V.image_count = 0;
 }
@@ -204,7 +210,9 @@ static int swapchain_create(void) {
     ci.surface = V.surface;
     ci.minImageCount = caps.minImageCount + 1 < 3 ? 3 : caps.minImageCount + 1;
     if (caps.maxImageCount && ci.minImageCount > caps.maxImageCount) ci.minImageCount = caps.maxImageCount;
-    ci.imageFormat = V.format.format; ci.imageColorSpace = V.format.colorSpace;
+    int hdr = hdr_mode_want();                           /* [Recomps#1] finding 147: an HDR swapchain; the frame reaches it through the HDR pass */
+    VkSurfaceFormatKHR sf = hdr == 1 ? V.hdr10 : hdr == 2 ? V.scrgb : V.format;
+    ci.imageFormat = sf.format; ci.imageColorSpace = sf.colorSpace;
     ci.imageExtent = ext;
     ci.imageArrayLayers = 1;
     ci.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
@@ -219,6 +227,8 @@ static int swapchain_create(void) {
     r = vkGetSwapchainImagesKHR(V.device, V.swapchain, &V.image_count, V.images);
     if (r != VK_SUCCESS && r != VK_INCOMPLETE) vk_fatal("vkGetSwapchainImagesKHR", r);
     V.extent = ext;
+    V.hdr = hdr;
+    if (hdr) hdr_views(1);
     return 1;
 }
 
@@ -250,10 +260,11 @@ int nvn_vk_init(void *hwnd) {
     uint32_t niext = 128;
     r = vkEnumerateInstanceExtensionProperties(NULL, &niext, iext);
     if (r != VK_SUCCESS && r != VK_INCOMPLETE) vk_fatal("vkEnumerateInstanceExtensionProperties", r);
-    const char *exts[4], *layers[1];
+    const char *exts[6], *layers[1];
     uint32_t next = 0, nlayers = 0;
     exts[next++] = "VK_KHR_surface"; exts[next++] = "VK_KHR_win32_surface";
     if (!has_name(iext, niext, "VK_KHR_surface") || !has_name(iext, niext, "VK_KHR_win32_surface")) { printf("nvn_vk: the Vulkan loader has no VK_KHR_surface / VK_KHR_win32_surface\n"); fflush(stdout); ExitProcess(5); }
+    if (has_name(iext, niext, "VK_EXT_swapchain_colorspace")) exts[next++] = "VK_EXT_swapchain_colorspace";      /* [Recomps#1] finding 147: the HDR colour spaces */
     { const char *e = getenv("SSBU_VK_VALIDATE"); V.validate = e && atoi(e) != 0; }
     if (V.validate) {
         static VkLayerProperties lp[64];
@@ -369,6 +380,10 @@ int nvn_vk_init(void *hwnd) {
     for (uint32_t i = 0; i < nfmt && !V.format.format; i++) if (fmts[i].format == VK_FORMAT_B8G8R8A8_UNORM && fmts[i].colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) V.format = fmts[i];
     for (uint32_t i = 0; i < nfmt && !V.format.format; i++) if (fmts[i].format == VK_FORMAT_R8G8B8A8_UNORM && fmts[i].colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) V.format = fmts[i];
     if (!V.format.format) { printf("nvn_vk: the surface offers no 8-bit UNORM format in the sRGB colour space (%u formats, first: %d)\n", (unsigned)nfmt, (int)fmts[0].format); fflush(stdout); ExitProcess(5); }
+    for (uint32_t i = 0; i < nfmt; i++) {                /* [Recomps#1] finding 147: the two HDR swapchains Windows composes */
+        if (fmts[i].format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 && fmts[i].colorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT) V.hdr10 = fmts[i];
+        if (fmts[i].format == VK_FORMAT_R16G16B16A16_SFLOAT && fmts[i].colorSpace == VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT) V.scrgb = fmts[i];
+    }
 
     /* present mode: the 60 Hz pacing is display.c's, so the swapchain must not wait for the display */
     VkPresentModeKHR modes[16];
@@ -423,7 +438,8 @@ int nvn_vk_init(void *hwnd) {
     if (r != VK_SUCCESS) vk_fatal("vkCreateFence", r);
 
     int ok = swapchain_create();
-    printf("nvn_vk: swapchain %ux%u, %u images, format %d, present mode %s%s\n", (unsigned)V.extent.width, (unsigned)V.extent.height, (unsigned)V.image_count, (int)V.format.format, k_mode[V.mode],
+    printf("nvn_vk: swapchain %ux%u, %u images, format %d, present mode %s%s\n", (unsigned)V.extent.width, (unsigned)V.extent.height, (unsigned)V.image_count,
+           (int)(V.hdr == 1 ? V.hdr10.format : V.hdr == 2 ? V.scrgb.format : V.format.format), k_mode[V.mode],      /* [Recomps#1] finding 147: the HDR format when it is HDR */
            ok ? "" : " (the window has no area yet: created at the first present)");
     fflush(stdout);
     V.alive = 1;
