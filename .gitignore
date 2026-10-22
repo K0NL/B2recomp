@@ -64,6 +64,7 @@
 !/scripts/pchtxt.py
 !/scripts/fps_patch.py
 !/scripts/event_fix.py
+!/scripts/prompt_fix.py
 !/scripts/bench.py
 !/scripts/make_package.py
 !/scripts/package/build.bat

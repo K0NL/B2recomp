@@ -238,7 +238,8 @@ S_ = dict(
                 tip='60: the game as made. Above 60 (experimental): the game runs up to this many frames per second at its normal speed. '
                     'Its main timers are converted; some effects, menus and button-mash prompts may still run faster, and cinematics run in real time.'),
     layout=Setting(F_PAD, 'layout', K_COMBO, O_LAYOUT, 1, d='auto', label='Face buttons',
-                   tip="By position: the right button is A, bottom B, top X, left Y (as on a Switch). By printed letter: an Xbox pad's A is A. "
+                   tip="By position: the right button is A, bottom B, top X, left Y (as on a Switch). By printed letter: an Xbox pad's A is A; "
+                       'on a PlayStation pad Cross is A, Circle B, Square X, Triangle Y. The PlayStation and Xbox button pictures follow this choice. '
                        'Auto: by letter on GameCube pads, by position on all others.'),
     prompts=Setting(F_PAD, 'button_prompts', K_COMBO, O_PROMPTS, 0, d='auto', label='Button prompts',
                     tip='Which button pictures the game shows. PlayStation and Xbox need the free mod "Controller Prompts '

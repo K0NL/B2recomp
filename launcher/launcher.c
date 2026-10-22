@@ -228,7 +228,9 @@ static Setting g_s[S_COUNT] = {
                             L"as Windows' 'SDR content brightness' (Settings > System > Display > HDR); otherwise as before. On: always HDR10. "
                             L"Off: never (Windows shows the game like other SDR programs)." },
     [S_LAYOUT]   = { F_PAD, "layout", K_COMBO, OPTS(o_layout), 1, .def = "auto", .label = L"Face buttons",
-                     .tip = L"By position: the right button is A, bottom B, top X, left Y (as on a Switch). By printed letter: an Xbox pad's A is A. Auto: by letter on GameCube pads, by position on all others." },
+                     .tip = L"By position: the right button is A, bottom B, top X, left Y (as on a Switch). By printed letter: an Xbox pad's A is A; "
+                            L"on a PlayStation pad Cross is A, Circle B, Square X, Triangle Y. The PlayStation and Xbox button pictures follow this choice. "
+                            L"Auto: by letter on GameCube pads, by position on all others." },
     [S_PROMPTS]  = { F_PAD, "button_prompts", K_COMBO, OPTS(o_prompts), 0, .def = "auto", .label = L"Button prompts",   /* [Recomps#1] nnpad_sdl.c */
                      .tip = L"Which button pictures the game shows. PlayStation and Xbox need the free mod \"Controller Prompts "
                             L"Replacement (DS4/XBOX)\" by Timo654 (gamebanana.com/mods/360121, Switch version): put its DS4Prompts / "
