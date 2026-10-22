@@ -146,7 +146,8 @@ def link_folder(link, target):
         else:
             return 'a real folder, kept (not replaced by the dump\'s)'
     os.makedirs(os.path.dirname(link), exist_ok=True)
-    r = subprocess.run(['cmd', '/c', 'mklink', '/J', link, target], capture_output=True, text=True)
+    # quoted here: cmd splits an unquoted path at commas too, and Python quotes only paths with spaces (finding 149)
+    r = subprocess.run('cmd /c mklink /J "%s" "%s"' % (link, target), capture_output=True, text=True)
     if r.returncode:
         raise Fail('could not make the junction %s -> %s: %s' % (link, target, (r.stdout + r.stderr).strip()))
     return 'junction to ' + target
