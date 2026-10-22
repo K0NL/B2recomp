@@ -14,25 +14,56 @@ With this patch:
     +0x40 = 0: the state of a character the scene did not find, which the event code checks before every use);
   - at that slot's next update (0x7100e27e1c) the game's own bind runs again (the slot's registered bits +0x94 0x2 / 0x10
     cleared first): it takes the character that now carries the ID (Loki's replacement) or makes the scene's own;
+  - but not while any character's data is on its way out (finding 150): making a character takes a user of its data
+    (0x71007b4a04 case 0 -> 0x71009a7770 -> 0x71009a69e8 -> 0x7100e18cb8: package +0x58 + 1), and a user taken during the
+    data's 3-update unload countdown (0x7100e17c84) is the game's own stop (0xe7ffdefe at 0x7100e17d58, "UNTRANSLATED
+    INSTRUCTION"). A chapter select or a return to the title deletes every character, so their data runs out right then:
+    the bind waits while any package of the manager [0x7101868130] is in its countdown, state 8 or 9 (state 6, loaded and
+    kept while it has users, is where most packages are all the time); the wait counts as tries, at most 120;
   - an "events:" line for each (none in normal play).
 RECOMPS_EVENT_FIX=0 = the game's own. Test only: RECOMPS_EVENT_TEST=<event slot>,<update>,<scene slot>,<updates> asks one of
 the 8 event slots at [0x7101871808] that waits to start (state 2) to start at logic update <update>, then requests the
 deletion of its scene slot's character <updates> updates into the scene (finding 146's crash with RECOMPS_EVENT_FIX=0;
 "let go" and "bound again" without). A save at the Verse 10 checkpoint: event slot 2 = event 2260, scene slot 4 = Loki.
+RECOMPS_EVENT_UNLOADLOG=1 (test only): an "events: TEST:" line whenever the number of packages on their way out changes
+(at most 60 lines), so a run can show when a rebind would wait.
+A lift patched by an older event_fix.py is refused: lift again first (setup.py's lift step always does).
 """
 import os
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MARK = '/* [event_fix.py] cutscenes keep no deleted character'
+CURRENT = MARK + ' (findings 146, 150) */'
 
 HELP = r'''
-/* [event_fix.py] cutscenes keep no deleted character (finding 146) */
+/* [event_fix.py] cutscenes keep no deleted character (findings 146, 150) */
 #include <stdio.h>
 #include <stdlib.h>
 static int evfix_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("RECOMPS_EVENT_FIX"); v = !e || atoi(e); } return v; }
 static uint64_t evfix_slot[16];
-static unsigned evfix_tries[16];
+static unsigned evfix_tries[16], evfix_wait[16];
+/* finding 150: the number of characters' data on its way out. The package manager [0x7101868130] keeps each character's data
+   as an entry (lists +0xb0 / +0xd0, counts +0xbc / +0xdc; +0x60 state, +0x54 / +0x58 users); state 6 = loaded and kept while
+   it has users (most entries, all the time), 8 -> 9 = the 3-update unload countdown (0x7100e17c84) once they are gone. A new
+   user in the countdown is the game's own stop (0xe7ffdefe at 0x7100e17d58), and a bind that makes a character takes one
+   (0x7100e18cb8) */
+static int evfix_unloading(void) {
+    uint64_t m = rd64(0x7101868130ULL);
+    if (!m) return 0;
+    static const int lists[2][2] = { {0xb0, 0xbc}, {0xd0, 0xdc} };
+    int n = 0;
+    for (int l = 0; l < 2; l++) {
+        uint64_t arr = rd64(m + lists[l][0]);
+        uint32_t cnt = rd32(m + lists[l][1]);
+        for (uint32_t i = 0; arr && i < cnt && i < 4096; i++) {
+            uint64_t e = rd64(arr + 8 * (uint64_t)i);
+            uint32_t st = e ? rd32(e + 0x60) : 0;
+            n += st == 8 || st == 9;
+        }
+    }
+    return n;
+}
 /* every event that can hold a scene: the 8 slots at [0x7101871808] (64 bytes: +0 flags, +20 state, +40 scene) and the list at
    [0x7101871810] (+8 array, +16 count) */
 static int evfix_events(uint64_t *ev, int max) {
@@ -63,7 +94,7 @@ void recomps_evfix_deleted(Ctx *c, uint64_t entry) {
                 wr64(s + 0x40, 0);
                 int k = 0;
                 while (k < 16 && evfix_slot[k] && evfix_slot[k] != s) k++;
-                if (k < 16) { evfix_slot[k] = s; evfix_tries[k] = 0; }
+                if (k < 16) { evfix_slot[k] = s; evfix_tries[k] = 0; evfix_wait[k] = 0; }
                 printf("events: character %x deleted while event %x/%x/%x held it (scene slot %d): let go%s\n", rd32(s + 0x2c),
                        rd32(ev[e] + 4), rd32(ev[e] + 8), rd32(ev[e] + 12), j, k < 16 ? "; bound again at its next update" : "");
                 fflush(stdout);
@@ -76,9 +107,18 @@ void recomps_evfix_slot(Ctx *c, uint64_t slot) {
         if (evfix_slot[k] != slot) continue;
         if (rd64(slot + 0x38)) { evfix_slot[k] = 0; return; }
         if (++evfix_tries[k] > 120) {
-            printf("events: character %x not bound again (nothing found in 120 updates)\n", rd32(slot + 0x2c));
+            if (evfix_wait[k]) printf("events: character %x not bound again (120 updates, %u of them waiting for character data on its way out)\n", rd32(slot + 0x2c), evfix_wait[k]);
+            else printf("events: character %x not bound again (nothing found in 120 updates)\n", rd32(slot + 0x2c));
             fflush(stdout);
             evfix_slot[k] = 0;
+            return;
+        }
+        int out = evfix_unloading();
+        if (out) {                                       /* finding 150: no new user for data in its unload countdown */
+            if (!evfix_wait[k]++) {
+                printf("events: character %x: bound again later: %d character data on its way out (a chapter select or the title?)\n", rd32(slot + 0x2c), out);
+                fflush(stdout);
+            }
             return;
         }
         wr32(slot + 0x94, rd32(slot + 0x94) & ~0x12u);   /* registered with the scene / in event mode: for the new one */
@@ -98,6 +138,18 @@ void recomps_evfix_test(Ctx *c) {
     static int ev = -2, at, slot, after;
     static unsigned long long upd, started;
     static uint64_t scene;
+    static int ulog = -1, ulast, ulines;
+    static unsigned long long uupd;
+    if (ulog < 0) { const char *e = getenv("RECOMPS_EVENT_UNLOADLOG"); ulog = e && atoi(e); }
+    if (ulog && ulines < 60) {                           /* finding 150, test only: when a rebind would wait */
+        int n = evfix_unloading();
+        uupd++;
+        if (n != ulast) {
+            printf("events: TEST: character data on its way out: %d (logic update %llu)\n", n, uupd);
+            fflush(stdout);
+            ulast = n; ulines++;
+        }
+    }
     if (ev == -2) { const char *e = getenv("RECOMPS_EVENT_TEST"); ev = -1; if (e && sscanf(e, "%d,%d,%d,%d", &ev, &at, &slot, &after) != 4) ev = -1; }
     if (ev < 0 || ev > 7) return;
     upd++;
@@ -155,6 +207,9 @@ def main():
     if missing:
         raise SystemExit('event_fix.py: not found in %s: %s' % (gen, ', '.join('f_' + m for m in sorted(missing))))
     if MARK in texts[where[HOME]]:
+        if CURRENT not in texts[where[HOME]]:
+            raise SystemExit('event_fix.py: %s holds the patch of an older event_fix.py: lift again first (setup.py --from lift)'
+                             % where[HOME])
         print('event_fix.py: already patched (%s)' % ', '.join(sorted(set(where.values()))))
         return
     for fn, call in HOOKS:
