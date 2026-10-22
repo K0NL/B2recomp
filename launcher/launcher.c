@@ -191,11 +191,12 @@ static const Opt o_vsync[] = { {"auto", L"Auto (by refresh rate)"}, {"display", 
 static const Opt o_latency[] = { {"normal", L"Normal"}, {"low", L"Low"}, {"lowest", L"Lowest (frames may judder)"} };
 static const Opt o_aniso[] = { {"game", L"Game default"}, {"2", L"2x"}, {"4", L"4x"}, {"8", L"8x"}, {"16", L"16x"} };
 static const Opt o_aspect[] = { {"keep", L"Keep 16:9 (black bars)"}, {"stretch", L"Stretch to the window"} };
+static const Opt o_hdr[] = { {"auto", L"Auto (when Windows HDR is on)"}, {"on", L"On (always)"}, {"off", L"Off"} };
 static const Opt o_layout[] = { {"auto", L"Auto"}, {"positional", L"By position (Switch)"}, {"labels", L"By printed letter"} };
 static const Opt o_prompts[] = { {"auto", L"Auto (by controller)"}, {"switch", L"Switch"}, {"playstation", L"PlayStation"}, {"xbox", L"Xbox"} };
 #define OPTS(a) a, (int)(sizeof a / sizeof a[0])
 
-enum { S_RENDERER, S_PROFILE, S_WINDOW, S_WIDTH, S_HEIGHT, S_VSYNC, S_LATENCY, S_SCALE, S_ANISO, S_ASPECT, S_OVERLAY, S_FPS,
+enum { S_RENDERER, S_PROFILE, S_WINDOW, S_WIDTH, S_HEIGHT, S_VSYNC, S_LATENCY, S_SCALE, S_ANISO, S_ASPECT, S_OVERLAY, S_FPS, S_HDR,
        S_LAYOUT, S_PROMPTS, S_DEADZONE, S_RUMBLE, S_STRENGTH, S_INPUT, S_COUNT };
 static const Opt o_input[] = { {"both", L"Controller and keyboard"}, {"keyboard", L"Keyboard and mouse only"}, {"controller", L"Controller only"} };
 static Setting g_s[S_COUNT] = {
@@ -222,6 +223,10 @@ static Setting g_s[S_COUNT] = {
     [S_FPS]      = { F_GFX, "frame_rate", K_SLIDER, .lo = 60, .hi = 120, .step = 1, .def = "60", .label = L"Frame rate (beta)",   /* [Recomps#1] gfx_options.c */
                      .tip = L"60: the game as made. Above 60 (experimental): the game runs up to this many frames per second at its normal speed. "
                             L"Its main timers are converted; some effects, menus and button-mash prompts may still run faster, and cinematics run in real time." },
+    [S_HDR]      = { F_GFX, "hdr", K_COMBO, OPTS(o_hdr), 0, .def = "auto", .label = L"HDR",      /* [Recomps#1] finding 147 */
+                     .tip = L"Auto: while Windows HDR is on for the monitor the game is on, the picture goes out as HDR10, its white as bright "
+                            L"as Windows' 'SDR content brightness' (Settings > System > Display > HDR); otherwise as before. On: always HDR10. "
+                            L"Off: never (Windows shows the game like other SDR programs)." },
     [S_LAYOUT]   = { F_PAD, "layout", K_COMBO, OPTS(o_layout), 1, .def = "auto", .label = L"Face buttons",
                      .tip = L"By position: the right button is A, bottom B, top X, left Y (as on a Switch). By printed letter: an Xbox pad's A is A. Auto: by letter on GameCube pads, by position on all others." },
     [S_PROMPTS]  = { F_PAD, "button_prompts", K_COMBO, OPTS(o_prompts), 0, .def = "auto", .label = L"Button prompts",   /* [Recomps#1] nnpad_sdl.c */
@@ -308,7 +313,8 @@ static void update_ui(void) {
     EnableWindow(g_s[S_ANISO].hw, vk && custom);
     EnableWindow(g_s[S_LATENCY].hw, vk);
     EnableWindow(g_s[S_ASPECT].hw, vk);
-    int rumble = SendMessageW(g_s[S_RUMBLE].hw, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    EnableWindow(g_s[S_HDR].hw, vk);
+    int rumble =SendMessageW(g_s[S_RUMBLE].hw, BM_GETCHECK, 0, 0) == BST_CHECKED;
     EnableWindow(g_s[S_STRENGTH].hw, rumble);
     SetWindowTextW(g_s[S_RUMBLE].hval, rumble ? L"On" : L"Off");
     for (int i = 0; i < S_COUNT; i++) {                      /* labels are dimmed with their control (WM_CTLCOLORSTATIC) */
@@ -501,7 +507,7 @@ static void play(void) {
  * settings on two panels with the standard Windows controls in their dark theme, a gold Play button. Without the art file
  * the header shows the title in text. */
 #define WIN_W 780
-#define WIN_H 756
+#define WIN_H 788                                          /* [Recomps#1] finding 147: one row more (HDR) */
 #define HEADER 244
 #define C_BG     RGB(7, 10, 20)
 #define C_PANEL  RGB(15, 20, 36)
@@ -518,7 +524,7 @@ static HBITMAP g_art;
 static COLORREF g_caption = C_BG;
 static HFONT g_headfont, g_titlefont;
 static int g_playhot;
-static const RECT k_panel[2] = { {14, 232, 454, 692}, {466, 232, 766, 692} };   /* graphics, controller (96-dpi px) */
+static const RECT k_panel[2] = { {14, 232, 454, 724}, {466, 232, 766, 724} };   /* graphics, controller (96-dpi px) */
 static BOOL (WINAPI *p_AllowDarkModeForWindow)(HWND, BOOL);
 
 static HWND mk(const wchar_t *cls, const wchar_t *text, DWORD style, int x, int y, int w, int h, int id) {
@@ -603,6 +609,7 @@ static void create_controls(void) {
     mk_setting(S_SCALE, lx, cx, cw, y); y += dy + 18;
     mk_setting(S_ANISO, lx, cx, cw, y); y += dy;
     mk_setting(S_ASPECT, lx, cx, cw, y); y += dy;
+    mk_setting(S_HDR, lx, cx, cw, y); y += dy;
     mk_setting(S_OVERLAY, lx, cx, cw, y); y += dy;
     g_gfxnote = mk(L"STATIC", L"", SS_LEFT, lx, y + 2, gp->right - gp->left - 32, 34, -1);
     SendMessageW(g_gfxnote, WM_SETFONT, (WPARAM)g_smallfont, FALSE);
@@ -925,7 +932,7 @@ static void load_art(void) {                                 /* g_art = the head
 }
 
 static int g_mode;                                          /* 0 = settings + Play, 1 = build screen (below) */
-static const RECT k_bpanel = { 14, 232, 766, 660 };
+static const RECT k_bpanel = { 14, 232, 766, 692 };
 static void spaced_text(HDC dc, const wchar_t *t, int x, int y, int extra) {
     SetTextCharacterExtra(dc, extra);
     TextOutW(dc, x, y, t, (int)wcslen(t));
