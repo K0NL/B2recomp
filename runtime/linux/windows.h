@@ -268,7 +268,7 @@ BOOL FlsFree(DWORD i);
 #define MEM_PRIVATE 0x20000u
 #define MEM_IMAGE 0x1000000u
 #define MEM_MAPPED 0x40000u
-#define MEM_WRITE_WATCH 0x200000u                       /* accepted, ignored: no write-watch on Linux yet (plan step 7) */
+#define MEM_WRITE_WATCH 0x200000u                       /* tracked by the kernel where it can (win32_compat.c, GetWriteWatch) */
 #define PAGE_NOACCESS 0x01u
 #define PAGE_READONLY 0x02u
 #define PAGE_READWRITE 0x04u
@@ -284,10 +284,8 @@ SIZE_T VirtualQuery(const void *addr, MEMORY_BASIC_INFORMATION *mbi, SIZE_T len)
 BOOL IsBadReadPtr(const void *p, UINT_PTR n);
 BOOL IsBadWritePtr(void *p, UINT_PTR n);
 #define WRITE_WATCH_FLAG_RESET 1u
-static inline UINT GetWriteWatch(DWORD f, void *b, SIZE_T n, void **a, ULONG_PTR *c, ULONG *g) {
-    (void)f; (void)b; (void)n; (void)a; (void)c; (void)g; return 1;   /* "not watched": callers hash instead */
-}
-static inline UINT ResetWriteWatch(void *b, SIZE_T n) { (void)b; (void)n; return 1; }
+UINT GetWriteWatch(DWORD flags, void *base, SIZE_T n, void **addrs, ULONG_PTR *count, ULONG *gran);   /* 1 = not watched: callers hash */
+UINT ResetWriteWatch(void *base, SIZE_T n);
 
 /* ---- modules */
 HMODULE LoadLibraryA(LPCSTR name);                      /* "x.dll" names of the runtime map to Linux libraries */
