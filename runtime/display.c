@@ -106,17 +106,29 @@ static LONG64 g_ps_phase[10];                          /* where in the refresh t
  * threads on efficiency cores. Now: the process says it is not to be throttled (ProcessPowerThrottling: execution speed
  * off = high quality of service) and the threads that make a frame (the game's main thread, the render thread, the
  * refresh clock) are restricted to the CPU sets of the highest efficiency class. SSBU_PCORES=0: as before.
- * The report says on which class of core the game's thread was seen at each present. */
+ * The report says on which class of core the game's thread was seen at each present.
+ * [Recomps#1] finding 152: every thread of the game is kept there (os_threads.c thread_main too), so only when the class
+ * holds at least PC_MIN logical processors. A player's handheld (Intel Arc G3 Extreme: 2 performance + 12 efficiency)
+ * froze 5-6 s at loads: MainJob1 / MainJob2 (nn::os priority 10 = ABOVE_NORMAL) spun on its only 2 and the main thread
+ * (NORMAL), kept there too, ran only when Windows' starvation boost came (about every 4 s). With fewer the threads are
+ * left to the system; the process still asks not to be throttled, so the scheduler prefers the performance cores.
+ * SSBU_PCORES=0: left to the system always; =2: kept on the performance class whatever its size (the old rule);
+ * TEST ONLY SSBU_PCORES_SIM=<n>: the first n logical processors stand for the performance class (a hybrid CPU on any PC). */
+#define PC_MIN 6
+#define PC_STR2(x) #x
+#define PC_STR(x) PC_STR2(x)
 static ULONG g_pc_ids[128];
 static int g_pc_n = -1, g_pc_on = 1;
+static const char *g_pc_why = "performance cores asked for";
 static uint8_t g_cpu_class[256], g_class_max;
 static volatile LONG64 g_pc_frames, g_pc_frames_slow;
 static void pcore_init(void) {
 #ifdef _WIN32
     ULONG len = 0;
-    const char *e = getenv("SSBU_PCORES");
+    const char *e = getenv("SSBU_PCORES"), *sim = getenv("SSBU_PCORES_SIM");
+    int mode = e && e[0] ? atoi(e) : 1, nsim = sim && sim[0] ? atoi(sim) : 0;
     g_pc_n = 0;
-    if (e && !atoi(e)) g_pc_on = 0;
+    if (!mode) { g_pc_on = 0; g_pc_why = "SSBU_PCORES=0: left to the system"; }
     GetSystemCpuSetInformation(NULL, 0, &len, GetCurrentProcess(), 0);
     uint8_t *buf = len ? malloc(len) : NULL;
     if (!buf || !GetSystemCpuSetInformation((PSYSTEM_CPU_SET_INFORMATION)buf, len, &len, GetCurrentProcess(), 0)) { free(buf); return; }
@@ -126,17 +138,22 @@ static void pcore_init(void) {
             PSYSTEM_CPU_SET_INFORMATION s = (PSYSTEM_CPU_SET_INFORMATION)(buf + at);
             if (!s->Size) break;
             if (s->Type == CpuSetInformation) {
-                if (!pass) { if (s->CpuSet.EfficiencyClass > g_class_max) g_class_max = s->CpuSet.EfficiencyClass; g_cpu_class[s->CpuSet.LogicalProcessorIndex] = s->CpuSet.EfficiencyClass; ncpu++; }
-                else if (s->CpuSet.EfficiencyClass == g_class_max) { if (g_pc_n < 128) g_pc_ids[g_pc_n++] = s->CpuSet.Id; }
+                uint8_t cls = s->CpuSet.EfficiencyClass;
+                if (nsim > 0) cls = s->CpuSet.LogicalProcessorIndex < nsim ? 1 : 0;      /* TEST: the first nsim are the fast ones */
+                if (!pass) { if (cls > g_class_max) g_class_max = cls; g_cpu_class[s->CpuSet.LogicalProcessorIndex] = cls; ncpu++; }
+                else if (cls == g_class_max) { if (g_pc_n < 128) g_pc_ids[g_pc_n++] = s->CpuSet.Id; }
                 else nslow++;
             }
             at += s->Size;
         }
     free(buf);
     if (!nslow) { g_pc_n = 0; printf("display: CPU: %d logical processors of one class: nothing to choose%c", ncpu, 10); return; }
-    printf("display: CPU: %d logical processors, %d of the performance class, %d of an efficiency class: %s%c", ncpu, g_pc_n, nslow,
-           g_pc_on ? "the game's main thread, the render thread and the refresh clock run on the performance class only; the process asks not to be throttled (SSBU_PCORES=0: left to the system)" : "left to the system (SSBU_PCORES=0)", 10);
-    if (g_pc_on) {
+    if (g_pc_on && g_pc_n < PC_MIN && mode != 2) { g_pc_on = 0; g_pc_why = "left to the system: too few performance processors for the game's threads"; }
+    printf("display: CPU: %s%d logical processors, %d of the performance class, %d of an efficiency class: %s%c", nsim > 0 ? "TEST SSBU_PCORES_SIM: " : "", ncpu, g_pc_n, nslow,
+           g_pc_on ? "the game's threads, the render thread and the refresh clock run on the performance class only; the process asks not to be throttled (SSBU_PCORES=0: left to the system)"
+           : mode ? "too few performance processors to keep the game's threads on (fewer than " PC_STR(PC_MIN) "): left to the system; the process asks not to be throttled (SSBU_PCORES=2: kept there all the same)"
+                  : "left to the system (SSBU_PCORES=0)", 10);
+    if (mode) {
         PROCESS_POWER_THROTTLING_STATE st;
         memset(&st, 0, sizeof st);
         st.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION; st.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED; st.StateMask = 0;
@@ -1278,7 +1295,7 @@ void display_pace(void) {
 void display_report(FILE *out) {
     fprintf(out, "\ndisplay: %lld frames presented\n", (long long)g_frames);
     fprintf(out, "display: %s; %lld vsync signals, %lld refreshes slept through by the vsync thread\n", old_pacing() ? "old pacing (SSBU_OLD_PACING=1: two clocks)" : "one refresh clock", (long long)g_vsync_signals, (long long)g_vsync_late);
-    if (g_pc_n > 0) fprintf(out, "display: the game's thread was on an EFFICIENCY core at %lld of %lld presents (%s)\n", (long long)g_pc_frames_slow, (long long)g_pc_frames, g_pc_on ? "performance cores asked for" : "SSBU_PCORES=0: left to the system");
+    if (g_pc_n > 0) fprintf(out, "display: the game's thread was on an EFFICIENCY core at %lld of %lld presents (%s)\n", (long long)g_pc_frames_slow, (long long)g_pc_frames, g_pc_why);
     if (g_vb_state == 2) {
         fprintf(out, "display: refresh %.3f Hz measured; %s (ticks for %d fps); presents held for their tick %lld, late frames presented at once %lld; display lock lost after a vblank gap %lld times, taken again %lld times; dropped because the refresh drifted %lld times, taken again %lld times\n", (double)g_freq.QuadPart / g_vb_period,
                 g_lock_k ? "DISPLAY LOCK (the tick is the display's vblank)" : "our own clock", g_pace_hz, (long long)g_hold_n, (long long)g_hold_late, (long long)g_lock_drops, (long long)g_lock_relocks,

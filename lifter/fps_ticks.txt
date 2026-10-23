@@ -64,6 +64,14 @@
 71000579d0 L_7100057a20 int  direction array entry 1 (+0x4e44, 22 after a push; six entries since finding 114)
 71000579d0 L_7100057ac8 int  direction array entry 7 (+0x4e5c)
 71000579d0 L_7100057dd8 int  +0x4e8c reset of the push repeat count (60)
+# finding 154: the stick-motion windows of the same function. A push from neutral opens 10 frames for the next push
+# (+0x4e64); a second push the same way sets +0x4e70, the opposite way +0x4e6c (10 frames each: the double tap and the
+# back-forward pair that moves such as Tetsuzanko check); +0x4e80 = 5 frames after a push. At 120 fps per pass they
+# lasted half as long, and those moves rarely came out.
+71000579d0 L_7100057bd8 int  +0x4e80 window after a stick push (5)
+71000579d0 L_7100057c38 int  +0x4e70 the same direction twice (10)
+71000579d0 L_7100057c50 int  +0x4e6c opposite directions, back-forward (10)
+71000579d0 L_7100057c6c int  +0x4e64 window for the next push (10)
 # enemies, items, scenery
 71009ebf04 L_71009ebfa8 int  enemy +0x427c full-speed hold after a weak-point hit (10 / 15 / 60)
 71009ebf04 L_71009ec02c f1step enemy +0x4274 easing back into its scaled time (a per-difficulty step a frame)
