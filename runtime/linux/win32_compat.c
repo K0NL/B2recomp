@@ -16,6 +16,7 @@
 #include <sys/resource.h>
 #include <pwd.h>
 #include <sys/file.h>
+#include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <sys/syscall.h>
@@ -418,8 +419,58 @@ void DeleteFiber(void *fiber) {
 void *GetCurrentFiber(void) { return t_fiber; }
 void *GetFiberData(void) { return t_fiber ? t_fiber->param : NULL; }
 
+/* ---- write watch (MEM_WRITE_WATCH, GetWriteWatch): userfaultfd write-protection in async mode, where the kernel itself
+ * lifts a page's protection at its first write (also a write by a system call or a driver), and PAGEMAP_SCAN, which lists
+ * the pages written and protects them again in one call (Linux 6.7+; Wine emulates write watches the same way). Where the
+ * kernel has neither (or userfaultfd is not allowed), a reservation is not watched and the callers hash, as before.
+ * The kernel ABI is spelled out here: the toolchain's kernel headers may be older than these calls. */
+#define WW_UFFD_API 0xAAull
+#define WW_UFFD_USER_MODE_ONLY 1
+#define WW_UFFD_FEATURE_WP_UNPOPULATED (1ull << 13)
+#define WW_UFFD_FEATURE_WP_ASYNC (1ull << 15)
+#define WW_UFFDIO_REGISTER_MODE_WP (1ull << 1)
+#define WW_UFFDIO_WRITEPROTECT_MODE_WP (1ull << 0)
+struct ww_uffdio_api { uint64_t api, features, ioctls; };
+struct ww_uffdio_range { uint64_t start, len; };
+struct ww_uffdio_register { struct ww_uffdio_range range; uint64_t mode, ioctls; };
+struct ww_uffdio_writeprotect { struct ww_uffdio_range range; uint64_t mode; };
+#define WW_UFFDIO_API _IOWR(0xAA, 0x3F, struct ww_uffdio_api)
+#define WW_UFFDIO_REGISTER _IOWR(0xAA, 0x00, struct ww_uffdio_register)
+#define WW_UFFDIO_WRITEPROTECT _IOWR(0xAA, 0x06, struct ww_uffdio_writeprotect)
+struct ww_page_region { uint64_t start, end, categories; };
+struct ww_pm_scan_arg { uint64_t size, flags, start, end, walk_end, vec, vec_len, max_pages, category_inverted, category_mask, category_anyof_mask, return_mask; };
+#define WW_PAGEMAP_SCAN _IOWR('f', 16, struct ww_pm_scan_arg)
+#define WW_PM_SCAN_WP_MATCHING (1ull << 0)
+#define WW_PM_SCAN_CHECK_WPASYNC (1ull << 1)
+#define WW_PAGE_IS_WRITTEN (1ull << 1)
+#ifndef __NR_userfaultfd
+#define __NR_userfaultfd 323                                  /* x86-64 */
+#endif
+static int g_uffd = -1, g_pagemap = -1;
+static pthread_once_t g_ww_once = PTHREAD_ONCE_INIT;
+static void ww_init(void) {
+    struct ww_uffdio_api api = { WW_UFFD_API, WW_UFFD_FEATURE_WP_ASYNC | WW_UFFD_FEATURE_WP_UNPOPULATED, 0 };
+    if (getenv("SSBU_NO_WRITEWATCH")) return;                 /* the renderer's own switch: then nothing asks anyway */
+    int fd = (int)syscall(__NR_userfaultfd, O_CLOEXEC | O_NONBLOCK | WW_UFFD_USER_MODE_ONLY);
+    if (fd >= 0 && ioctl(fd, WW_UFFDIO_API, &api) == 0) g_pagemap = open("/proc/self/pagemap", O_RDONLY | O_CLOEXEC);
+    if (g_pagemap >= 0) { g_uffd = fd; printf("win32_compat: write watch tracked by the kernel (userfaultfd async write-protect, PAGEMAP_SCAN)\n"); }
+    else {
+        printf("win32_compat: no write watch from this kernel (userfaultfd async write-protect / PAGEMAP_SCAN, Linux 6.7+: %s): textures are hashed\n", strerror(errno));
+        if (fd >= 0) close(fd);
+    }
+}
+static int ww_protect(uintptr_t a, size_t n) {                 /* from now on [a, a+n) counts as not written */
+    struct ww_uffdio_writeprotect wp = { { a, n }, WW_UFFDIO_WRITEPROTECT_MODE_WP };
+    return ioctl(g_uffd, WW_UFFDIO_WRITEPROTECT, &wp) == 0;
+}
+static int ww_register(uintptr_t a, size_t n) {
+    pthread_once(&g_ww_once, ww_init);
+    struct ww_uffdio_register reg = { { a, n }, WW_UFFDIO_REGISTER_MODE_WP, 0 };
+    return g_uffd >= 0 && ioctl(g_uffd, WW_UFFDIO_REGISTER, &reg) == 0 && ww_protect(a, n);
+}
+
 /* ---- virtual memory */
-typedef struct { uintptr_t base; size_t size; } Res;
+typedef struct { uintptr_t base; size_t size; int ww; } Res;   /* ww: a write-watched reservation the kernel tracks */
 static Res *g_res;
 static int g_nres, g_capres;
 static pthread_mutex_t g_res_m = PTHREAD_MUTEX_INITIALIZER;
@@ -439,9 +490,9 @@ static Res *res_find(uintptr_t a) {                       /* with g_res_m held: 
     for (int i = 0; i < g_nres; i++) if (a >= g_res[i].base && a < g_res[i].base + g_res[i].size) return &g_res[i];
     return NULL;
 }
-static void res_add(uintptr_t b, size_t n) {
+static void res_add(uintptr_t b, size_t n, int ww) {
     if (g_nres == g_capres) { g_capres = g_capres ? g_capres * 2 : 64; g_res = realloc(g_res, (size_t)g_capres * sizeof *g_res); }
-    g_res[g_nres++] = (Res){ b, n };
+    g_res[g_nres++] = (Res){ b, n, ww };
 }
 void *VirtualAlloc(void *addr, SIZE_T size, DWORD type, DWORD prot) {
     size_t page = 4096;
@@ -452,6 +503,7 @@ void *VirtualAlloc(void *addr, SIZE_T size, DWORD type, DWORD prot) {
     if (r && (type & MEM_COMMIT)) {                       /* commit inside an existing reservation */
         uintptr_t s = a & ~(page - 1), e = (a + size + page - 1) & ~(page - 1);
         int ok = mprotect((void *)s, e - s, prot_of(prot)) == 0;
+        if (ok && r->ww) ww_protect(s, e - s);              /* newly committed pages are not written (as on Windows) */
         pthread_mutex_unlock(&g_res_m);
         return ok ? (void *)s : NULL;
     }
@@ -474,7 +526,7 @@ void *VirtualAlloc(void *addr, SIZE_T size, DWORD type, DWORD prot) {
         }
     }
     if (m == MAP_FAILED) { pthread_mutex_unlock(&g_res_m); SetLastError(8); return NULL; }   /* ERROR_NOT_ENOUGH_MEMORY */
-    res_add((uintptr_t)m, n);
+    res_add((uintptr_t)m, n, (type & MEM_WRITE_WATCH) && ww_register((uintptr_t)m, n));
     pthread_mutex_unlock(&g_res_m);
     return m;
 }
@@ -495,6 +547,39 @@ BOOL VirtualFree(void *addr, SIZE_T size, DWORD type) {
     }
     pthread_mutex_unlock(&g_res_m);
     return TRUE;
+}
+/* The pages of [base, base+n) written since the last reset, in address order, at most *count of them; with
+ * WRITE_WATCH_FLAG_RESET the ones listed count as not written again. 1 = not a watched reservation (the callers hash). */
+UINT GetWriteWatch(DWORD flags, void *base, SIZE_T n, void **addrs, ULONG_PTR *count, ULONG *gran) {
+    uintptr_t s = (uintptr_t)base & ~(uintptr_t)4095, e = ((uintptr_t)base + n + 4095) & ~(uintptr_t)4095;
+    pthread_mutex_lock(&g_res_m);
+    Res *r = n ? res_find(s) : NULL;
+    int ww = r && r->ww && e <= r->base + r->size;
+    pthread_mutex_unlock(&g_res_m);
+    if (!ww) return 1;
+    *gran = 4096;
+    ULONG_PTR cap = *count, k = 0;
+    struct ww_page_region vec[256];
+    while (s < e && k < cap) {
+        struct ww_pm_scan_arg a = { sizeof a, WW_PM_SCAN_CHECK_WPASYNC | ((flags & WRITE_WATCH_FLAG_RESET) ? WW_PM_SCAN_WP_MATCHING : 0), s, e, 0,
+                                    (uintptr_t)vec, 256, cap - k, 0, WW_PAGE_IS_WRITTEN, 0, WW_PAGE_IS_WRITTEN };
+        long got = ioctl(g_pagemap, WW_PAGEMAP_SCAN, &a);
+        if (got < 0) return 1;                                /* cannot ask: as if not watched (the callers hash) */
+        for (long i = 0; i < got; i++)
+            for (uint64_t pg = vec[i].start; pg < vec[i].end && k < cap; pg += 4096) addrs[k++] = (void *)(uintptr_t)pg;
+        if (a.walk_end <= s) break;
+        s = a.walk_end;                                       /* the scan stopped early (vec full or max_pages): go on from there */
+    }
+    *count = k;
+    return 0;
+}
+UINT ResetWriteWatch(void *base, SIZE_T n) {
+    uintptr_t s = (uintptr_t)base & ~(uintptr_t)4095, e = ((uintptr_t)base + n + 4095) & ~(uintptr_t)4095;
+    pthread_mutex_lock(&g_res_m);
+    Res *r = n ? res_find(s) : NULL;
+    int ww = r && r->ww && e <= r->base + r->size;
+    pthread_mutex_unlock(&g_res_m);
+    return !ww || !ww_protect(s, e - s);
 }
 /* /proc/self/maps: the mapping holding a (or the gap before the next one) */
 static int maps_find(uintptr_t a, uintptr_t *lo, uintptr_t *hi, int *prot, uintptr_t *next) {
