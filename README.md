@@ -178,10 +178,14 @@ the game. They are ignored by git: never commit, upload or share them.
 - The lifter (`lifter/`) and the runtime (`runtime/`) started as copies of
   [ssbu-recomp](https://github.com/Denkishi/ssbu-recomp) by Denkishi (commit `3a96916`), licensed GPL-3.0-or-later;
   every change is marked `[Recomps#1]` and listed in `runtime/UPSTREAM.md` and `lifter/README.md`.
+- Contributions, with thanks: **Zexyen**, write watch on Linux: the kernel tracks which pages the game wrote, so the
+  textures are no longer checksummed every frame (`runtime/linux/win32_compat.c`, userfaultfd + PAGEMAP_SCAN;
+  [#48](https://github.com/K0NL/B2recomp/pull/48)).
 - Other open-source components and references: see [NOTICE.md](NOTICE.md).
-- Copyright (C) 2026 K0NL, and the ssbu-recomp authors for the parts taken from it. This project as a whole is licensed
-  under the **GNU General Public License, version 3 or (at your option) any later version**; see [LICENSE](LICENSE).
-  The need for your own game dump is a technical requirement, not a licence term.
+- Copyright (C) 2026 K0NL, the contributors named above for their contributions, and the ssbu-recomp authors for the
+  parts taken from it. This project as a whole is licensed under the **GNU General Public License, version 3 or (at your
+  option) any later version**; see [LICENSE](LICENSE). The need for your own game dump is a technical requirement, not a
+  licence term.
 
 ## Legal
 
