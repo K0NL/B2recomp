@@ -122,6 +122,47 @@ static void test_memory(void) {
 }
 
 /* files, folders, text */
+/* write watch: only the pages written since the last reset, also when the kernel writes them (read() into the page);
+ * on a kernel without userfaultfd async write-protect (before 6.7) the reservation is not watched and GetWriteWatch says so */
+static void test_write_watch(void) {
+    uint8_t *w = VirtualAlloc(NULL, 16 * 4096, MEM_RESERVE | MEM_WRITE_WATCH, PAGE_NOACCESS);
+    void *pg[16];
+    ULONG_PTR n = 16;
+    ULONG gran = 0;
+    CHECK(w && VirtualAlloc(w, 16 * 4096, MEM_COMMIT, PAGE_READWRITE) == w, "write-watched reservation committed");
+    if (GetWriteWatch(0, w, 16 * 4096, pg, &n, &gran)) {
+        printf("compat_test: write watch not available on this kernel (the callers hash): its checks skipped\n");
+        uint8_t *plain = VirtualAlloc(NULL, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        n = 16;
+        CHECK(GetWriteWatch(0, plain, 4096, pg, &n, &gran) != 0, "unwatched memory is refused");
+        VirtualFree(plain, 0, MEM_RELEASE); VirtualFree(w, 0, MEM_RELEASE);
+        return;
+    }
+    CHECK(n == 0 && gran == 4096, "nothing written after the commit (%d pages)", (int)n);
+    w[2 * 4096 + 7] = 1;
+    int fds[2];
+    CHECK(pipe(fds) == 0 && write(fds[1], "abc", 3) == 3 && read(fds[0], w + 5 * 4096, 3) == 3, "the kernel writes into a watched page");
+    close(fds[0]); close(fds[1]);
+    volatile uint8_t r = w[9 * 4096]; (void)r;                    /* a read is not a write */
+    n = 16;
+    CHECK(GetWriteWatch(WRITE_WATCH_FLAG_RESET, w, 16 * 4096, pg, &n, &gran) == 0 && n == 2 && pg[0] == w + 2 * 4096 && pg[1] == w + 5 * 4096,
+          "exactly the two pages written (%d)", (int)n);
+    n = 16;
+    CHECK(GetWriteWatch(0, w, 16 * 4096, pg, &n, &gran) == 0 && n == 0, "the reset forgot them (%d)", (int)n);
+    w[3 * 4096] = 1; w[4 * 4096] = 1;
+    n = 1;
+    CHECK(GetWriteWatch(0, w, 16 * 4096, pg, &n, &gran) == 0 && n == 1 && pg[0] == w + 3 * 4096, "a short list holds the first page");
+    CHECK(ResetWriteWatch(w, 16 * 4096) == 0, "ResetWriteWatch");
+    n = 16;
+    CHECK(GetWriteWatch(0, w, 16 * 4096, pg, &n, &gran) == 0 && n == 0, "nothing after ResetWriteWatch (%d)", (int)n);
+    CHECK(VirtualFree(w + 4096, 4096, MEM_DECOMMIT) && VirtualAlloc(w + 4096, 4096, MEM_COMMIT, PAGE_READWRITE) && w[4096] == 0, "decommit and commit again");
+    n = 16;
+    CHECK(GetWriteWatch(0, w, 16 * 4096, pg, &n, &gran) == 0 && n == 0, "committed again: not written (%d)", (int)n);
+    uint8_t *plain = VirtualAlloc(NULL, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    n = 16;
+    CHECK(GetWriteWatch(0, plain, 4096, pg, &n, &gran) != 0, "unwatched memory is refused");
+    CHECK(VirtualFree(w, 0, MEM_RELEASE) && VirtualFree(plain, 0, MEM_RELEASE), "released");
+}
 static void test_files(void) {
     char dir[MAX_PATH], path[MAX_PATH];
     GetTempPathA(sizeof dir, dir);
@@ -235,6 +276,7 @@ int main(void) {
     test_events();
     test_fibers();
     test_memory();
+    test_write_watch();
     test_files();
     test_handles();
     test_crypt();
