@@ -3047,6 +3047,14 @@ static void blit_tex(Tex *s, const View *sv, const int *sr, Tex *d, const View *
     if (vs->samples > 1 || vd->samples > 1) { nvn_vk_missing("a scaled or depth copy of a multisample texture"); return; }
     /* glBlitFramebuffer with FRAMEBUFFER_SRGB off copies the stored values; vkCmdBlitImage converts between an sRGB and a
      * linear format. Same class on both sides = the same values. */
+    if ((vs->aspect & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) == (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) {
+        /* one blit per aspect: a combined depth+stencil blit wrote nothing on Mesa RADV (the copied shadow map stayed zero = a dark box) */
+        for (VkImageAspectFlags as = VK_IMAGE_ASPECT_DEPTH_BIT; as <= VK_IMAGE_ASPECT_STENCIL_BIT; as <<= 1) {
+            b.srcSubresource.aspectMask = b.dstSubresource.aspectMask = as;
+            vkCmdBlitImage(R.cmd, vs->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, vd->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_NEAREST);
+        }
+        return;
+    }
     vkCmdBlitImage(R.cmd, vs->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, vd->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, linear && vs->aspect == VK_IMAGE_ASPECT_COLOR_BIT ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
 }
 
