@@ -199,7 +199,7 @@ O_VSYNC = [('auto', 'Auto (by refresh rate)'), ('display', 'Display refresh (60/
            ('off', 'Off (tearing, lowest latency)'), ('on', 'Swapchain FIFO (not recommended)'), ('mailbox', 'Mailbox')]
 O_LATENCY = [('normal', 'Normal'), ('low', 'Low'), ('lowest', 'Lowest (frames may judder)')]
 O_ANISO = [('game', 'Game default'), ('2', '2x'), ('4', '4x'), ('8', '8x'), ('16', '16x')]
-O_ASPECT = [('keep', 'Keep 16:9 (black bars)'), ('stretch', 'Stretch to the window')]
+O_ASPECT = [('keep', 'Keep 16:9 (black bars)'), ('stretch', 'Stretch to the window'), ('wide', 'Wide screen (21:9, 32:9)')]
 O_LAYOUT = [('auto', 'Auto'), ('positional', 'By position (Switch)'), ('labels', 'By printed letter')]
 O_PROMPTS = [('auto', 'Auto (by controller)'), ('switch', 'Switch'), ('playstation', 'PlayStation'), ('xbox', 'Xbox')]
 O_INPUT = [('both', 'Controller and keyboard'), ('keyboard', 'Keyboard and mouse only'), ('controller', 'Controller only')]
@@ -232,7 +232,9 @@ S_ = dict(
                   tip='Sharper textures at flat angles; costs little on any GPU.'),
     aspect=Setting(F_GFX, 'aspect', K_COMBO, O_ASPECT, 0, d='keep', label='Aspect ratio',
                    tip="The game's picture is 16:9. Keep: in a wider or taller window (an ultrawide monitor in borderless or "
-                       'fullscreen mode) it keeps its shape, with black bars. Stretch: it fills the window.'),
+                       'fullscreen mode) it keeps its shape, with black bars. Stretch: it fills the window. Wide screen: on a 21:9 '
+                       "or 32:9 monitor the game draws at the monitor's shape (more of the world at the sides, menus in the middle, "
+                       'movies at 16:9); on a 16:9 monitor it is the same as Keep. Use Borderless or Fullscreen.'),
     overlay=Setting(F_GFX, 'frame_time_overlay', K_CHECK, d='off', label='Show frame time in the window title'),
     fps=Setting(F_GFX, 'frame_rate', K_SLIDER, lo=60, hi=120, step=1, d='60', label='Frame rate (beta)',
                 tip='60: the game as made. Above 60 (experimental): the game runs up to this many frames per second at its normal speed. '

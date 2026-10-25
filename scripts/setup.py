@@ -28,7 +28,7 @@ ignored by git; never upload them). Steps, resumable (a finished step is skipped
     tables   runtime/gen/* from YOUR sdk and main (layout, imports, lifted SDK functions, SDK constants, test vectors)
     lift     lifter/recomp_eh.py: your main.elf -> build/gen_eh (C); then scripts/fps_patch.py --inplace (the frame-rate
              patch: off at graphics.ini frame_rate = 60, the default), scripts/event_fix.py (cutscenes keep no
-             deleted character, finding 146) and scripts/prompt_fix.py (the action prompt's ring turns with its
+             deleted character, finding 146), scripts/uw_patch.py (wide screens: aspect = wide) and scripts/prompt_fix.py (the action prompt's ring turns with its
              button's place, finding 148)
     compile  scripts/compile_main.py: build/gen_eh -> build/obj (clang -O2; the longest step, ~5 min with 16 threads)
     icon     optional: build/bayonetta2.ico from <folder>/control/icon_AmericanEnglish.dat
@@ -522,6 +522,9 @@ def step_lift(cx):
     # the action prompt's ring turns toward its button's place in the table the runtime rewrites when the face buttons go
     # by printed letter (finding 148: runtime/nnfs.c prompt_places_by_letter; nothing changes with the game's own table)
     cx.run('lift', [sys.executable, os.path.join(REPO, 'scripts', 'prompt_fix.py'), '--gen=' + os.path.join(cx.build, 'gen_eh')])
+    # wide screens: the screen width, the post-effect buffers and the 2D layout's place follow graphics.ini aspect = wide
+    # at run time (RECOMPS_UW_WIDTH; nothing changes with keep / stretch) (scripts/uw_patch.py)
+    cx.run('lift', [sys.executable, os.path.join(REPO, 'scripts', 'uw_patch.py'), '--gen=' + os.path.join(cx.build, 'gen_eh')])
 
 
 def step_compile(cx):

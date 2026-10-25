@@ -190,7 +190,7 @@ static const Opt o_vsync[] = { {"auto", L"Auto (by refresh rate)"}, {"display", 
                                {"on", L"Swapchain FIFO (not recommended)"}, {"mailbox", L"Mailbox"} };
 static const Opt o_latency[] = { {"normal", L"Normal"}, {"low", L"Low"}, {"lowest", L"Lowest (frames may judder)"} };
 static const Opt o_aniso[] = { {"game", L"Game default"}, {"2", L"2x"}, {"4", L"4x"}, {"8", L"8x"}, {"16", L"16x"} };
-static const Opt o_aspect[] = { {"keep", L"Keep 16:9 (black bars)"}, {"stretch", L"Stretch to the window"} };
+static const Opt o_aspect[] = { {"keep", L"Keep 16:9 (black bars)"}, {"stretch", L"Stretch to the window"}, {"wide", L"Wide screen (21:9, 32:9)"} };
 static const Opt o_hdr[] = { {"auto", L"Auto (when Windows HDR is on)"}, {"on", L"On (always)"}, {"off", L"Off"} };
 static const Opt o_layout[] = { {"auto", L"Auto"}, {"positional", L"By position (Switch)"}, {"labels", L"By printed letter"} };
 static const Opt o_prompts[] = { {"auto", L"Auto (by controller)"}, {"switch", L"Switch"}, {"playstation", L"PlayStation"}, {"xbox", L"Xbox"} };
@@ -218,7 +218,9 @@ static Setting g_s[S_COUNT] = {
                      .tip = L"Sharper textures at flat angles; costs little on any GPU." },
     [S_ASPECT]   = { F_GFX, "aspect", K_COMBO, OPTS(o_aspect), 0, .def = "keep", .label = L"Aspect ratio",      /* [Recomps#1] */
                      .tip = L"The game's picture is 16:9. Keep: in a wider or taller window (an ultrawide monitor in borderless or "
-                            L"fullscreen mode) it keeps its shape, with black bars. Stretch: it fills the window." },
+                            L"fullscreen mode) it keeps its shape, with black bars. Stretch: it fills the window. Wide screen: on a 21:9 "
+                            L"or 32:9 monitor the game draws at the monitor's shape (more of the world at the sides, menus in the middle, "
+                            L"movies at 16:9); on a 16:9 monitor it is the same as Keep. Use Borderless or Fullscreen." },
     [S_OVERLAY]  = { F_GFX, "frame_time_overlay", K_CHECK, .def = "off", .label = L"Show frame time in the window title" },
     [S_FPS]      = { F_GFX, "frame_rate", K_SLIDER, .lo = 60, .hi = 120, .step = 1, .def = "60", .label = L"Frame rate (beta)",   /* [Recomps#1] gfx_options.c */
                      .tip = L"60: the game as made. Above 60 (experimental): the game runs up to this many frames per second at its normal speed. "

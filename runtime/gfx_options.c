@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <SDL3/SDL.h>
 #include "gfx_options.h"
 #ifndef L1_LATENCY_DEFAULT
 #define L1_LATENCY_DEFAULT 0      /* track L1: normal (coordinator 2026-10-14); low is an option */
@@ -112,10 +113,12 @@ static const char *const k_default_ini =
 ";   vsync = clock; those three keys of the file are then not used. The log says which profile is active.\r\n"
 "profile = custom\r\n"
 "\r\n"
-"; aspect = keep | stretch      (Vulkan)\r\n"
+"; aspect = keep | stretch | wide      (Vulkan)\r\n"
 ";   [Recomps#1] keep: the game's 16:9 picture keeps its shape; a wider or taller window (an ultrawide monitor in\r\n"
 ";   borderless or fullscreen mode) gets black bars at the sides or at the top and bottom. stretch: the picture fills\r\n"
-";   the window whatever its shape.\r\n"
+";   the window whatever its shape. wide: on a wider monitor (21:9, 32:9) the game draws at the monitor's shape: more\r\n"
+";   of the world at the sides, menus and the HUD in the middle, movies at 16:9 between black bars. On a 16:9 monitor\r\n"
+";   it is the same as keep. Use it with window = borderless or fullscreen.\r\n"
 "aspect = keep\r\n"
 "\r\n"
 "; frame_time_overlay = off | on\r\n"
@@ -216,7 +219,7 @@ static BOOL CALLBACK opt_load(PINIT_ONCE once, PVOID arg, PVOID *ctx) {
         else if (!_stricmp(key, "shader_wait")) o->shader_skip = !_stricmp(val, "skip");
         else if (!_stricmp(key, "runahead")) g_gfx_runahead = !_stricmp(val, "on") || !_stricmp(val, "1");      /* track R1 round 5 (r1_state.c) */
         else if (!_stricmp(key, "latency")) g_gfx_latency = !_stricmp(val, "lowest") ? 2 : !_stricmp(val, "low") ? 1 : 0;      /* track L1 (display.c latency_mode) */
-        else if (!_stricmp(key, "aspect")) o->aspect_stretch = !_stricmp(val, "stretch");      /* [Recomps#1] */
+        else if (!_stricmp(key, "aspect")) { o->aspect_stretch = !_stricmp(val, "stretch"); o->wide_width = !_stricmp(val, "wide") ? -1 : 0; }      /* [Recomps#1] */
         else if (!_stricmp(key, "shader_prepare")) o->shader_prepare = !_stricmp(val, "background") ? 1 : !_stricmp(val, "off") ? 2 : 0;
         else if (!_stricmp(key, "frame_rate")) { int v = atoi(val); o->frame_rate = v < 60 ? 60 : v > 120 ? 120 : v; }      /* [Recomps#1] */
         else if (!_stricmp(key, "hdr")) o->hdr = !_stricmp(val, "off") ? 1 : !_stricmp(val, "on") ? 2 : 0;      /* [Recomps#1] finding 147 */
@@ -227,6 +230,18 @@ static BOOL CALLBACK opt_load(PINIT_ONCE once, PVOID arg, PVOID *ctx) {
     }
     if (f) fclose(f);
     if (!o->frame_rate) o->frame_rate = 60;
+    /* [Recomps#1] aspect = wide: the game draws at the primary monitor's shape, 720 high (scripts/uw_patch.py reads
+     * RECOMPS_UW_WIDTH at the game's graphics init, after this). A set variable (test runs) wins. */
+    if (o->wide_width < 0) {
+        o->wide_width = 0;
+        if (SDL_InitSubSystem(SDL_INIT_VIDEO)) {
+            SDL_Rect b;
+            if (SDL_GetDisplayBounds(SDL_GetPrimaryDisplay(), &b) && b.h > 0) { int w = (int)(720.0 * b.w / b.h + 0.5) & ~1; o->wide_width = w > 1280 ? (w > 8192 ? 8192 : w) : 0; }
+            SDL_QuitSubSystem(SDL_INIT_VIDEO);
+        }
+        if (o->wide_width && !getenv("RECOMPS_UW_WIDTH")) { char n[16]; snprintf(n, sizeof n, "%d", o->wide_width); _putenv_s("RECOMPS_UW_WIDTH", n); }
+        printf("graphics options: aspect=wide: %s\n", o->wide_width ? "the game draws wider than 16:9 (RECOMPS_UW_WIDTH)" : "the monitor is 16:9 or narrower, so the picture stays 16:9");
+    }
     /* [Recomps#1] frame_rate above 60: switch on the lifted code's frame-rate patch (scripts/fps_patch.py), which reads
      * RECOMPS_UNCAP / RECOMPS_UNCAP_FPS with getenv the first time the game's clock runs (after this, at the first frame).
      * The UCRT environment is one per process, so game.dll sees what is set here. Set variables (test runs) win. */
@@ -247,7 +262,7 @@ static BOOL CALLBACK opt_load(PINIT_ONCE once, PVOID arg, PVOID *ctx) {
     static const char *const k_win[3] = {"windowed", "borderless", "fullscreen"}, *const k_vs[6] = {"clock", "on", "off", "mailbox", "display", "auto"};
     printf("graphics options: %s (%s): renderer=%s window=%s %dx%d vsync=%s gpu=%s console_mode=%s resolution_scale=%.2f anisotropic_filtering=%d frame_time_overlay=%s aspect=%s%s\n", o->path,
            written ? "written with the defaults" : f ? "read" : "NOT readable, defaults used", o->renderer ? "opengl" : "vulkan", k_win[o->window_mode], o->width, o->height, k_vs[o->present],
-           o->gpu[0] ? o->gpu : "auto", o->handheld ? "handheld" : "docked", o->scale, o->aniso, o->overlay ? "on" : "off", o->aspect_stretch ? "stretch" : "keep", unknown ? " (lines with an unknown key were ignored)" : "");
+           o->gpu[0] ? o->gpu : "auto", o->handheld ? "handheld" : "docked", o->scale, o->aniso, o->overlay ? "on" : "off", o->aspect_stretch ? "stretch" : o->wide_width ? "wide" : "keep", unknown ? " (lines with an unknown key were ignored)" : "");
     {   char pw[16]; static const char *const k_hdr[3] = {"auto", "off", "on"};      /* [Recomps#1] finding 147 */
         if (o->hdr_paper_white > 0) snprintf(pw, sizeof pw, "%.0f", o->hdr_paper_white); else snprintf(pw, sizeof pw, "auto");
         printf("graphics options: hdr=%s hdr_format=%s hdr_paper_white=%s hdr_gamma=%s\n", k_hdr[o->hdr], o->hdr_scrgb ? "scrgb" : "hdr10", pw, o->hdr_srgb ? "srgb" : "2.2"); }

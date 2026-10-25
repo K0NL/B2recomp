@@ -517,6 +517,7 @@ static DWORD WINAPI window_thread(LPVOID arg) {
                 break;
             case SDL_EVENT_KEY_DOWN:
                 if (e.key.key == SDLK_ESCAPE && g_mouse_grab && !fills_monitor(w)) { g_mouse_grab = 0; mouse_update(w); }
+                if (e.key.key == SDLK_F10 && getenv("SSBU_UW_LOG") && atoi(getenv("SSBU_UW_LOG"))) { FILE *f = fopen("/tmp/uw_capture", "w"); if (f) fclose(f); }   /* developer aid: capture this frame's draws (nvn_vk_draw.c uw_cap_now) */
                 break;
             case SDL_EVENT_WINDOW_FOCUS_GAINED: case SDL_EVENT_WINDOW_FOCUS_LOST: case SDL_EVENT_WINDOW_MINIMIZED:
             case SDL_EVENT_WINDOW_RESTORED: case SDL_EVENT_WINDOW_RESIZED: case SDL_EVENT_WINDOW_MOVED:

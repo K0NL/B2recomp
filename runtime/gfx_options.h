@@ -17,6 +17,8 @@ typedef struct {
     int shader_prepare;     /* track V session 14 (appended: older objects keep their offsets): 0 first_run (the game is held at its first frame until every shader of the game's data is prepared, once per GPU + driver), 1 background (as before), 2 off;  env SSBU_VK_PREPARE wins */
     int aspect_stretch;     /* [Recomps#1] aspect = keep (0, default: the picture keeps its shape, black bars on a wider or taller
                                window, e.g. an ultrawide monitor) | stretch (1: it fills the window); nvn_vk_draw.c present (Vulkan) */
+    int wide_width;         /* [Recomps#1] aspect = wide: the game's screen width for the monitor's shape (e.g. 1720 at 3440 x 1440), 0 = 16:9
+                               (keep / stretch, or a 16:9 or narrower monitor); handed to the lifted code as RECOMPS_UW_WIDTH (scripts/uw_patch.py) */
     int frame_rate;         /* [Recomps#1] frame_rate = 60 (the game as made) .. 120: above 60 the lifted frame-rate patch is on, capped there */
     int hdr;                /* [Recomps#1] hdr = auto (0: HDR output while Windows HDR is on for the window's monitor) | off (1) | on (2: always);
                                nvn_vk_draw.c hdr_* (Vulkan on Windows; finding 147) */

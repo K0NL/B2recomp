@@ -2602,7 +2602,52 @@ static uint64_t c2_ref(int s) {
     g_c2k[s].off = off; g_c2k[s].gen = R.gen; g_c2k[s].ver = g_c2_ver[s]; g_c2k[s].ok = 1; g_c2k_n[0]++;
     return off;
 }
+static void uw_log_target(void) {               /* SSBU_UW_LOG=1: each new render-area size (viewport, scissor, target), once */
+    static char seen[512][96]; static int ns; char k[96];
+    snprintf(k, sizeof k, "vp %g,%g,%g,%g sc %d,%d,%d,%d(%d) pass %dx%d", R.viewport[0], R.viewport[1], R.viewport[2], R.viewport[3], R.scissor[0], R.scissor[1], R.scissor[2], R.scissor[3], R.have_scissor, R.pass_w, R.pass_h);
+    for (int i = 0; i < ns; i++) if (!strcmp(seen[i], k)) return;
+    if (ns < 512) { strcpy(seen[ns++], k); printf("UWVP f%lld vs#%d fs#%d %s\n", nvn_front_frame_next(), R.prog[0] ? R.prog[0]->serial : -1, R.prog[1] ? R.prog[1]->serial : -1, k); }
+}
+static int uw_log_on(void);
+/* SSBU_UW_LOG=1 developer aid: touch /tmp/uw_capture while the effect is on screen; the next frame's draws are written
+ * out one line each (UWCAP), then the file is removed. */
+volatile int g_uw_cap_shot;
+static int uw_cap_now(void) {
+    static long long lf = -1; static int on;
+    long long f = nvn_front_frame_next();
+    if (f != lf) { lf = f; if (on) { on = 0; remove("/tmp/uw_capture"); printf("UWCAP end\n"); } else if (!access("/tmp/uw_capture", 0)) { on = 1; g_uw_cap_shot = 1; printf("UWCAP begin frame %lld\n", f); } }
+    return on;
+}
+static void uw_cap_draw(void) {
+    printf("UWCAP vs#%d fs#%d na%d attrs", R.prog[0] ? R.prog[0]->serial : -1, R.prog[1] ? R.prog[1]->serial : -1, R.nattr);
+    for (int i = 0; i < R.nattr && i < 16; i++) if (R.vattr[i] & 0xff) printf(" %d:%x+%u", i, R.vattr[i] & 0xff, R.vattr[i] >> 14 & 0xffff);
+    printf(" stride %u vp %g,%g,%g,%g sc %d,%d,%d,%d(%d) tgt %d", R.vstream[0].stride, R.viewport[0], R.viewport[1], R.viewport[2], R.viewport[3], R.scissor[0], R.scissor[1], R.scissor[2], R.scissor[3], R.have_scissor, R.ncol && R.col[0].tex ? (int)R.col[0].tex->b.width : 0);
+    if (R.vbuf[0].addr && R.vbuf[0].size >= 16) { const float *v = P(R.vbuf[0].addr); printf(" v0 %g,%g,%g,%g", v[0], v[1], v[2], v[3]); }
+    for (int n = 0; n < 16; n++) if (R.ubo[0][n].addr && R.ubo[0][n].size >= 32) { const float *q = P(R.ubo[0][n].addr); printf(" | u%d %g %g %g %g %g %g %g %g", n, q[0], q[1], q[2], q[3], q[4], q[5], q[6], q[7]); if (n == 4 && R.ubo[0][n].size >= 128) printf(" [16] %g %g %g %g %g %g %g %g", q[16], q[17], q[18], q[19], q[20], q[21], q[22], q[23]); }
+    for (int n = 0; n < 16; n++) if (R.prog[1] && R.ubo[1][n].addr && R.ubo[1][n].size >= 32) { const float *q = P(R.ubo[1][n].addr); printf(" | f%d", n); for (int i = 0; i < 16 && i * 4 < (int)R.ubo[1][n].size; i++) printf(" %g", q[i]); }
+    printf("\n");
+}
+/* SSBU_UW_LOG=1 live controls, read every 30 frames: /tmp/uw_skip holds vertex-shader serials whose draws are left out;
+ * /tmp/uw_dump holds one serial whose draws print all their blocks in full (UWDUMP): the first 5, then in F10-captured frames. */
+static int g_uw_skip[16], g_uw_nskip, g_uw_dumpvs = -1;
+static void uw_live(void) {
+    static long long lf = -100; long long f = nvn_front_frame_next();
+    if (f - lf < 30 && f >= lf) return;
+    lf = f; g_uw_nskip = 0; g_uw_dumpvs = -1;
+    FILE *fp = fopen("/tmp/uw_skip", "r"); if (fp) { while (g_uw_nskip < 16 && fscanf(fp, "%d", &g_uw_skip[g_uw_nskip]) == 1) g_uw_nskip++; fclose(fp); }
+    fp = fopen("/tmp/uw_dump", "r"); if (fp) { if (fscanf(fp, "%d", &g_uw_dumpvs) != 1) g_uw_dumpvs = -1; fclose(fp); }
+}
 static int draw_prepare(unsigned prim) {
+    if (uw_log_on()) {
+        uw_log_target(); if (uw_cap_now()) uw_cap_draw();
+        uw_live();
+        if (R.prog[0]) for (int i = 0; i < g_uw_nskip; i++) if (R.prog[0]->serial == g_uw_skip[i] || (R.prog[1] && -R.prog[1]->serial == g_uw_skip[i])) return 0;   /* negative: a fragment-shader serial */
+        if (R.prog[0] && R.prog[0]->serial == g_uw_dumpvs) { static int n; if (n++ < 5 || uw_cap_now()) {
+            printf("UWDUMP f%lld vs#%d fs#%d", nvn_front_frame_next(), R.prog[0]->serial, R.prog[1] ? R.prog[1]->serial : -1);
+            for (int b = 0; b < 16; b++) if (R.ubo[0][b].addr && R.ubo[0][b].size) { const float *q = P(R.ubo[0][b].addr); int nf = (int)(R.ubo[0][b].size / 4); if (nf > 32) nf = 32; printf(" | u%d", b); for (int i = 0; i < nf; i++) printf(" %g", q[i]); }
+            for (int b = 0; b < 16; b++) if (R.prog[1] && R.ubo[1][b].addr && R.ubo[1][b].size) { const float *q = P(R.ubo[1][b].addr); int nf = (int)(R.ubo[1][b].size / 4); if (nf > 32) nf = 32; printf(" | f%d", b); for (int i = 0; i < nf; i++) printf(" %g", q[i]); }
+            printf("\n"); } }
+    }
     if (g_ptm_on < 0) g_ptm_on = getenv("SSBU_VK_PREPTIME") && atoi(getenv("SSBU_VK_PREPTIME"));
     if (g_ptm_on > 0) { g_ptm_t = tk(); g_ptm_n++; }
     static const int8_t topo[7] = {VK_PRIMITIVE_TOPOLOGY_POINT_LIST, VK_PRIMITIVE_TOPOLOGY_LINE_LIST, -1, VK_PRIMITIVE_TOPOLOGY_LINE_STRIP, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN};
@@ -3061,6 +3106,196 @@ static uint64_t g_dt_voff[16];
 static VkBuffer g_dt_vb[16];
 static void *dt_host(uint64_t a) { return P(a); }
 static const uint8_t *dt_map(VkBuffer b) { if (b == R.ring) return R.ring_mem.map; for (int i = 0; i < 256; i++) if (g_cb[i].state && g_cb[i].buf == b) return g_cb[i].mem.map; return NULL; }
+/* 21:9: the game lays its 2D out 1280 wide; its 2D projection (vertex uniform block 12, patched in the game) centres that
+ * layout on a wider screen. Per 2D draw (float4 position, uv and colour at +0, +16, +32 of stream 0; the element's 2x4
+ * matrix in block 13), the element's extent in layout pixels picks the projection: a piece spanning (nearly) the
+ * layout's width around its centre (backgrounds, fades, overlays, also while they zoom in) is stretched to the screen's
+ * width, and a piece the game sized to the whole screen in screen pixels (pause blur, screen copies) gets the plain
+ * screen projection. Either is a copy of block 12 with another first row, bound for that draw only (uw2d_end puts the
+ * game's back). A projection rather than a viewport: the viewport also moves the clip window. */
+static float g_uw_proj[6][64];                    /* 0 the screen, 1 the layout stretched, 2 a right-edge panel reaching the screen's edge, 3 hung from the right edge; host memory: buf_ref streams it */
+static Range g_uw_keep;
+static int g_uw_sc, g_uw_sc_had, g_uw_sc_keep[4];
+static int uw_log_on(void) { static int on = -1; if (on < 0) on = getenv("SSBU_UW_LOG") && atoi(getenv("SSBU_UW_LOG")); return on; }   /* developer aid: hunting 21:9 pieces */
+static float g_uw_vtx[64 * 12];                   /* a stretched screen copy's vertices with its u widened too (at most 64) */
+static Range g_uw_vkeep;
+static int g_uw_von;                               /* 1: R.vbuf[0] is g_uw_vtx, holding the draw's vertices from g_uw_vlo on */
+static int64_t g_uw_vlo;  /* a scissor of ours for this draw, and the game's to put back */
+static int g_uw_on;                               /* 0 nothing swapped, else 1 + the uniform block index swapped */
+static uint8_t g_uw_fx[4096][256];                /* effect blocks: a fresh address per draw (ring_put caches by address within a batch) */
+static unsigned g_uw_fxn;
+static int g_uw_fx_vs;                            /* 0: any vertex stage with the effect layout */
+static float g_uw_bars;                           /* the screen width of a movie draw just prepared: its sides are cleared black */
+/* The effect shader's full-screen quads (underwater tint, screen fades): a unit quad through the 4x4 in block 4 (floats
+ * 16..31), which for these is the game's centred 2D projection of the 1280 layout: x scale 2 * 1280 / W, x offset
+ * 1280 / W, y as for the full height, w row 0 0 0 1 (float4 position and uv, stride 32). Made the plain full screen;
+ * a movie (block 4's colour exactly white) instead keeps 16:9 and gets black sides, as on a 16:9 screen with bars. */
+static int uw_centred_x(const float *m) {        /* a 4x4 whose x row is the game's centred 1280 layout over W (2560 / W, 0, 0, 1280 / W); W or 0 */
+    float W = m[0] > 1.0f ? 2560.0f / m[0] : 0;
+    if (W < 1281.0f || W > 8192.0f || fabsf(m[3] * W - 1280.0f) > 1.0f || m[1] != 0 || fabsf(m[5] - 2.0f) > 1e-4f || fabsf(m[7] - 1.0f) > 1e-4f ||
+        m[12] != 0 || m[13] != 0 || m[14] != 0 || m[15] != 1.0f) return 0;
+    return (int)W;
+}
+static int uw_vrange(const Cmd *m, int indexed, uint64_t *lo, uint64_t *hi) {   /* the vertices a draw reads */
+    const uint64_t *a = m->a;
+    if (!indexed) { *lo = a[1]; *hi = a[1] + a[2]; return *hi > *lo; }
+    unsigned t = (unsigned)a[1] < 3 ? (unsigned)a[1] : 1; const uint8_t *ip = P(a[3]); uint32_t mn = ~0u, mx = 0;
+    if (!ip) return 0;
+    for (int i = 0; i < (int)a[2]; i++) { uint32_t v = t == 0 ? ip[i] : t == 1 ? ((const uint16_t *)ip)[i] : ((const uint32_t *)ip)[i]; if (v < mn) mn = v; if (v > mx) mx = v; }
+    if (mn > mx) return 0;
+    *lo = (uint64_t)((int64_t)mn + (int32_t)a[4]); *hi = (uint64_t)((int64_t)mx + (int32_t)a[4]) + 1;
+    return 1;
+}
+static int uw_fx_begin(const Cmd *m, int indexed) {
+    {   /* the screen-copy pass (Panther Within's zoom blur): unit quad, float3 at stride 12, its 4x4 in block 8 */
+        const Range *b = &R.ubo[0][8];
+        if (b->size >= 64 && b->size <= sizeof g_uw_fx[0] && R.vstream[0].stride == 12 && (R.vattr[0] & 0xff) == 0x22 && uw_centred_x(P(b->addr))) {
+            uint8_t *p = g_uw_fx[g_uw_fxn++ & 4095];
+            memcpy(p, P(b->addr), (size_t)b->size);
+            ((float *)p)[0] = 2.0f; ((float *)p)[3] = 1.0f;
+            g_uw_keep = *b; g_uw_on = 1 + 8;
+            R.ubo[0][8].addr = (uint64_t)(uintptr_t)p;
+            if (uw_log_on()) { static int n; if (n++ < 20) printf("UWFX8 f%lld vs#%d fs#%d made full screen\n", nvn_front_frame_next(), R.prog[0]->serial, R.prog[1] ? R.prog[1]->serial : -1); }
+            return 1;
+        }
+    }
+    const Range *u = &R.ubo[0][4];
+    if (u->size < 128 || u->size > sizeof g_uw_fx[0]) return 0;
+    const float *q = P(u->addr);
+    if (uw_log_on() && R.vstream[0].stride == 32 && (R.vattr[0] & 0xff) == 0x2e && R.vbuf[0].addr) {   /* SSBU_UW_LOG=1: each new effect-quad matrix, once */
+        static char seen[4096][160]; static int ns; char kk[160]; const float *v = P(R.vbuf[0].addr);
+        snprintf(kk, sizeof kk, "vs#%d fs#%d v0 %.2f,%.2f M %.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f | w %.2f %.2f %.2f %.2f col %.2f %.2f %.2f vp %g,%g", R.prog[0]->serial, R.prog[1] ? R.prog[1]->serial : -1, v[0], v[1], q[16], q[17], q[18], q[19], q[20], q[21], q[22], q[23], q[28], q[29], q[30], q[31], q[0], q[1], q[2], R.viewport[0], R.viewport[2]);
+        int f = 0; for (int i = 0; i < ns; i++) if (!strcmp(seen[i], kk)) { f = 1; break; }
+        if (!f && ns < 4096 && q[28] == 0 && q[29] == 0 && q[31] == 1.0f) { strcpy(seen[ns++], kk); printf("UWFX f%lld %s\n", nvn_front_frame_next(), kk); } }
+    /* a screen-space overlay (no rotation, w = 1) that reaches the full height and spans about the 16:9 area's width around
+     * the centre: the game sized it for 16:9 (underwater tint, also mirrored; fades; Panther Within's ghost; glows) */
+    float W = (float)g_rs_bw;
+    if (q[16] == 0 || q[21] == 0 || W < 1281.0f || fabsf(q[17]) > 1e-4f || fabsf(q[20]) > 1e-4f || q[28] != 0 || q[29] != 0 || q[30] != 0 || q[31] != 1.0f) return 0;
+    if (R.vstream[0].stride != 32 || (R.vattr[0] & 0xff) != 0x2e || (R.vattr[5] & 0xff) != 0x2e || !R.vbuf[0].addr) return 0;
+    uint64_t lo, hi;
+    if (!uw_vrange(m, indexed, &lo, &hi) || hi - lo > 64 || hi * 32 > R.vbuf[0].size) return 0;
+    float x0 = 1e30f, x1 = -1e30f, y0 = 1e30f, y1 = -1e30f;
+    for (uint64_t i = lo; i < hi; i++) {
+        const float *v = (const float *)((const uint8_t *)P(R.vbuf[0].addr) + i * 32);
+        float x = q[16] * v[0] + q[19], y = q[21] * v[1] + q[23];
+        if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
+    }
+    float span = (x1 - x0) * W / 2560.0f;           /* the width in 16:9 areas: 1 = the game's 1280 */
+    if (uw_log_on() && y0 <= -0.98f && y1 >= 0.98f) { static int n; if (n++ < 40) printf("UWFXQ f%lld vs#%d fs#%d x %.3f..%.3f y %.3f..%.3f span %.3f\n", nvn_front_frame_next(), R.prog[0]->serial, R.prog[1] ? R.prog[1]->serial : -1, x0, x1, y0, y1, span); }
+    if (y0 > -0.98f || y1 < 0.98f || fabsf(x0 + x1) > 0.06f || span < 0.85f || span > 1.3f) return 0;     /* up to 1.3: the underwater tint is drawn 1.2 wide */
+    if (R.prog[0]->serial != g_uw_fx_vs && g_uw_fx_vs) return 0;
+    if (q[0] == 1.0f && q[1] == 1.0f && q[2] == 1.0f && fabsf(q[21] - 2.0f) < 1e-4f && fabsf(q[19] * W - 1280.0f) < 1.0f) { g_uw_bars = W; return 0; }      /* the colour untouched, unzoomed: a movie; it stays 16:9 between black bars */
+    uint8_t *p = g_uw_fx[g_uw_fxn++ & 4095];
+    memcpy(p, q, (size_t)u->size);
+    ((float *)p)[16] *= W / 1280.0f; ((float *)p)[19] *= W / 1280.0f;
+    g_uw_keep = *u; g_uw_on = 1 + 4;
+    R.ubo[0][4].addr = (uint64_t)(uintptr_t)p;
+    return 1;
+}
+static void uw2d_begin(const Cmd *m, int indexed) {
+    const uint64_t *a = m->a;
+    if (!R.prog[0]) return;
+    if (uw_fx_begin(m, indexed)) return;
+    if (R.nattr < 9) return;
+#define UW_F4(i, off) ((R.vattr[i] & 0xff) == 0x2e && (R.vattr[i] >> 8 & 31) == 0 && (R.vattr[i] >> 14 & 0xffff) == (off))
+    if (!UW_F4(0, 0) || !UW_F4(5, 16) || !UW_F4(8, 32) || R.vstream[0].stride != 48) return;
+#undef UW_F4
+    const Range *u = R.ubo[0];
+    if (u[12].size < 32 || u[12].size > sizeof g_uw_proj[0] || u[13].size < 32 || !R.vbuf[0].addr) return;
+    const float *o = P(u[12].addr), *w = P(u[13].addr);
+    float W = o[0] > 0 ? 2.0f / o[0] : 0;
+    if (W < 1281.0f || fabsf(o[3] * W + 1280.0f) > 0.5f) return;      /* not the centred projection */
+    uint64_t lo, hi;                               /* the vertices the draw reads */
+    if (!indexed) { lo = a[1]; hi = a[1] + a[2]; }
+    else {
+        unsigned t = (unsigned)a[1] < 3 ? (unsigned)a[1] : 1; const uint8_t *ip = P(a[3]); uint32_t mn = ~0u, mx = 0;
+        if (!ip) return;
+        for (int i = 0; i < (int)a[2]; i++) { uint32_t v = t == 0 ? ip[i] : t == 1 ? ((const uint16_t *)ip)[i] : ((const uint32_t *)ip)[i]; if (v < mn) mn = v; if (v > mx) mx = v; }
+        if (mn > mx) return;
+        lo = (uint64_t)((int64_t)mn + (int32_t)a[4]); hi = (uint64_t)((int64_t)mx + (int32_t)a[4]) + 1;
+    }
+    if (hi <= lo || hi * 48 > R.vbuf[0].size || hi - lo > 65536) return;
+    float x0 = 1e30f, x1 = -1e30f, y0 = 1e30f, y1 = -1e30f;
+    for (uint64_t i = lo; i < hi; i++) {
+        const float *v = (const float *)((const uint8_t *)P(R.vbuf[0].addr) + i * 48);
+        float x = w[0] * v[0] + w[1] * v[1] + w[2] * v[2] + w[3], y = w[4] * v[0] + w[5] * v[1] + w[6] * v[2] + w[7];
+        if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
+    }
+    if (uw_log_on()) {   /* SSBU_UW_LOG=1: each new kind of wide or off-layout 2D piece, once */
+        static char seen[4096][128]; static int ns; char kk[128]; float u0 = 1e30f, u1 = -1e30f, v0 = 1e30f, v1 = -1e30f;
+        for (uint64_t i = lo; i < hi; i++) { const float *t = (const float *)((const uint8_t *)P(R.vbuf[0].addr) + i * 48 + 16); if (t[0] < u0) u0 = t[0]; if (t[0] > u1) u1 = t[0]; if (t[1] < v0) v0 = t[1]; if (t[1] > v1) v1 = t[1]; }
+        snprintf(kk, sizeof kk, "vs#%d fs#%d x %.0f..%.0f y %.0f..%.0f uv %.3f..%.3f %.3f..%.3f vp %g,%g pass %dx%d", R.prog[0]->serial, R.prog[1] ? R.prog[1]->serial : -1, x0, x1, y0, y1, u0, u1, v0, v1, R.viewport[0], R.viewport[2], R.pass_w, R.pass_h);
+        int f = 0; for (int i = 0; i < ns; i++) if (!strcmp(seen[i], kk)) { f = 1; break; }
+        if (!f && ns < 4096 && (x1 - x0 > 900 || x0 > 1279.0f || x1 < 1.0f || fabsf(R.viewport[2] - W) > 0.5f)) { strcpy(seen[ns++], kk); printf("UW2D f%lld %s\n", nvn_front_frame_next(), kk); } }
+    int k;
+    int onscreen = fabsf(R.viewport[2] - W) <= 0.5f && !(R.ncol && R.col[0].tex && fabsf((float)R.col[0].tex->b.width - W) > 0.5f);
+    if (!onscreen) k = 1;                          /* an off-screen picture (shop preview, 256 x 256): the layout projection the Switch used, no clip */
+    else if (x1 - x0 > 1150.0f && x1 - x0 < 1400.0f && fabsf(x0 + x1 - 1280.0f) < 40.0f) k = 1;      /* centred within 20: zooming copies (Panther Within) */      /* up to 1400: blur copies drawn with a margin (-16..1296) */
+    else if (x0 < 1.0f && x1 > W - 1.0f && y0 < 1.0f && y1 > 719.0f) k = 0;
+    else if ((fabsf(w[3] - 1280.0f) < 0.5f && x1 > 1279.0f && x1 < 1281.0f && x0 > 320.0f) || (x1 > 1300.0f && x0 > 320.0f && x0 < 1260.0f)) k = 2;   /* reaching past the right edge too (the results / chapter screens' side shades) */
+    else if (x0 < -20.0f && x1 > 20.0f && x1 < 960.0f) k = 5;   /* reaching past the left edge: its left end goes to the real edge */   /* a panel the game hangs from the screen's right edge (results screen): its right end goes to the real edge, the text inside stays */
+    else if (w[3] > 1280.5f && w[3] < 1280.0f + (W - 1280.0f) * 0.25f) k = 3;   /* anchored just right of the layout's edge (the results screen's light rays): moves with the screen's right edge, not clipped */
+    else {                                         /* centred: clipped to the 16:9 area, as on the Switch (menus park panels just outside it) */
+        /* placed from the screen's width (x = W - d: the halo counter, the chapter results' score page, panels parked to
+         * slide in): the game meant 1280 - d, so it moves left by the extra width and is clipped like the rest */
+        int wbased = w[3] > 1280.0f + (W - 1280.0f) * 0.25f && w[3] <= W + 0.5f && y1 < 140.0f;      /* the top counters only: the chapter results' score page is parked off-screen until its turn; not a panel parked past the screen (the shop popup at 2580) */
+        int l = (int)((W - 1280.0f) * 0.5f), sx = R.have_scissor ? R.scissor[0] : 0, sw = R.have_scissor ? R.scissor[2] : (int)W;
+        if (R.have_scissor && !(sx <= 0 && sx + sw >= (int)W)) sx += l;      /* the game's own scissor (scrolling lists) is in uncentred layout pixels */
+        else if (x0 >= 0 && x1 <= 1280.0f && !wbased) return;
+        if (wbased) {
+            float *p = g_uw_proj[3 + 1];
+            memcpy(p, o, (size_t)u[12].size);
+            p[0] = 2.0f / W; p[1] = p[2] = 0; p[3] = -1.0f - (W - 1280.0f) / W;      /* layout x -> screen x - off */
+            g_uw_keep = R.ubo[0][12]; g_uw_on = 1 + 12;
+            R.ubo[0][12].addr = (uint64_t)(uintptr_t)p;
+        }
+        int a0 = sx > l ? sx : l, a1 = sx + sw < l + 1280 ? sx + sw : l + 1280;
+        memcpy(g_uw_sc_keep, R.scissor, sizeof g_uw_sc_keep); g_uw_sc_had = R.have_scissor; g_uw_sc = 1;
+        if (!R.have_scissor) { R.scissor[1] = 0; R.scissor[3] = 720; }
+        R.scissor[0] = a0; R.scissor[2] = a1 > a0 ? a1 - a0 : 0; R.have_scissor = 1; R.dyn_dirty = 1;
+        return;
+    }
+    if (k == 1 && hi - lo <= 64 && onscreen) {         /* a copy of the screen drawn on the layout: the game took u = layout x / W, so only 1280 / W of it showed */
+        float u0 = 1e30f, u1 = -1e30f;
+        for (uint64_t i = lo; i < hi; i++) { float t = ((const float *)((const uint8_t *)P(R.vbuf[0].addr) + i * 48))[4]; if (t < u0) u0 = t; if (t > u1) u1 = t; }
+        if (fabsf((u1 - u0) - (x1 - x0) / W) < 0.01f) {
+            memcpy(g_uw_vtx, (const uint8_t *)P(R.vbuf[0].addr) + lo * 48, (size_t)(hi - lo) * 48);
+            for (uint64_t i = 0; i < hi - lo; i++) g_uw_vtx[i * 12 + 4] *= W / 1280.0f;
+            g_uw_vkeep = R.vbuf[0]; g_uw_von = 1; g_uw_vlo = (int64_t)lo;
+            R.vbuf[0].addr = (uint64_t)(uintptr_t)g_uw_vtx; R.vbuf[0].size = (hi - lo) * 48;
+        }
+    }
+    float *p = g_uw_proj[k];
+    memcpy(p, o, (size_t)u[12].size);              /* the same bytes each time (W fixed): ring_put's range cache stays right */
+    p[0] = 2.0f / (k == 1 ? 1280.0f : W); p[1] = p[2] = 0; p[3] = -1.0f;
+    if (k == 3) p[3] = -1.0f + 2.0f * (W - 1280.0f) / W;      /* layout x -> screen x + 2 off */
+    if (k == 5) {                                  /* layout 0 .. x1 -> screen 0 .. off + x1 (the part past the left edge goes past it too), as k == 2 on the right */
+        float off = (W - 1280.0f) * 0.5f, a = (off + x1) / x1;
+        p[0] = 2.0f * a / W; p[3] = -1.0f + 2.0f * (off + x1 - a * x1) / W;
+    }
+    if (k == 2) {                                  /* layout x0 .. 1280 -> screen off + x0 .. W */
+        float off = (W - 1280.0f) * 0.5f, a = (1280.0f + off - x0) / (1280.0f - x0);
+        p[0] = 2.0f * a / W; p[3] = -1.0f + 2.0f * (off + x0 - a * x0) / W;
+    }
+    g_uw_keep = R.ubo[0][12]; g_uw_on = 1 + 12;
+    R.ubo[0][12].addr = (uint64_t)(uintptr_t)p;
+}
+static void uw2d_end(void) {
+    if (g_uw_on) { R.ubo[0][g_uw_on - 1] = g_uw_keep; g_uw_on = 0; }
+    if (g_uw_von) { R.vbuf[0] = g_uw_vkeep; g_uw_von = 0; }
+    if (g_uw_sc) { memcpy(R.scissor, g_uw_sc_keep, sizeof g_uw_sc_keep); R.have_scissor = g_uw_sc_had; R.dyn_dirty = 1; g_uw_sc = 0; }
+    if (g_uw_bars > 0) {
+        float W = g_uw_bars, sx = R.pass_rs ? R.pass_sx : 1.0f; g_uw_bars = 0;
+        int side = (int)((W - 1280.0f) * 0.5f * sx + 0.5f), w = (int)(W * sx + 0.5f);
+        if (!R.in_pass || R.ncol < 1 || side <= 0 || w > R.pass_w) return;
+        VkClearAttachment ca; VkClearRect cr[2];
+        memset(&ca, 0, sizeof ca); memset(cr, 0, sizeof cr);
+        ca.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; ca.colorAttachment = 0; ca.clearValue.color.float32[3] = 1.0f;
+        cr[0].rect.extent.width = (uint32_t)side; cr[0].rect.extent.height = (uint32_t)R.pass_h; cr[0].layerCount = 1;
+        cr[1] = cr[0]; cr[1].rect.offset.x = w - side;
+        vkCmdClearAttachments(R.cmd, 1, &ca, 2, cr);
+    }
+}
 static void dt_vk(int fight, int idx, int ok, const Cmd *m, int indexed, const BufRef *ib) {
     const uint64_t *a = m->a;
     unsigned t = (unsigned)a[1] < 3 ? (unsigned)a[1] : 1;
@@ -3391,8 +3626,10 @@ static void exec(const Cmd *m, int depth) {
         break;
     }
     case OP_DRAW_ARRAYS:
-        { LONG64 t0 = tk(); int ok = draw_prepare((unsigned)a[0]); g_tm[8] += tk() - t0; { int dtag = nvn_front_draw_tag(); if (dtag) dt_vk(dtag, nvn_front_draw_tag_next(), ok, m, 0, NULL); } shlog_draw(ok, m, 0); if (!ok) { R.frame_skipped++; nvn_front_count(1, 1); break; } }
-        vkCmdDraw(R.cmd, (uint32_t)a[2], (uint32_t)a[4], (uint32_t)a[1], (uint32_t)a[3]);
+        uw2d_begin(m, 0);
+        int uw_first0 = g_uw_von;      /* the copied vertices start at 0 */
+        { LONG64 t0 = tk(); int ok = draw_prepare((unsigned)a[0]); g_tm[8] += tk() - t0; uw2d_end(); { int dtag = nvn_front_draw_tag(); if (dtag) dt_vk(dtag, nvn_front_draw_tag_next(), ok, m, 0, NULL); } shlog_draw(ok, m, 0); if (!ok) { R.frame_skipped++; nvn_front_count(1, 1); break; } }
+        vkCmdDraw(R.cmd, (uint32_t)a[2], (uint32_t)a[4], uw_first0 ? 0 : (uint32_t)a[1], (uint32_t)a[3]);
         R.frame_draws++; g_cmd_draws++; nvn_front_count(0, 1);
         break;
     case OP_DRAW_ELEMENTS: {
@@ -3402,9 +3639,11 @@ static void exec(const Cmd *m, int depth) {
         if (t == 0 && !D.has_iu8) { nvn_vk_missing("8-bit indices on a GPU without VK_EXT_index_type_uint8"); break; }
         BufRef ib;
         buf_ref(a[3], (uint64_t)count << t, (uint64_t)1 << t, &ib);    /* before the draw is prepared: a ring wrap submits */
-        { LONG64 t0 = tk(); int ok = draw_prepare((unsigned)a[0]); g_tm[8] += tk() - t0; { int dtag = nvn_front_draw_tag(); if (dtag) dt_vk(dtag, nvn_front_draw_tag_next(), ok, m, 1, &ib); } shlog_draw(ok, m, 1); if (!ok) { R.frame_skipped++; nvn_front_count(1, 1); break; } }
+        uw2d_begin(m, 1);
+        int64_t uw_vadj = g_uw_von ? g_uw_vlo : 0;
+        { LONG64 t0 = tk(); int ok = draw_prepare((unsigned)a[0]); g_tm[8] += tk() - t0; uw2d_end(); { int dtag = nvn_front_draw_tag(); if (dtag) dt_vk(dtag, nvn_front_draw_tag_next(), ok, m, 1, &ib); } shlog_draw(ok, m, 1); if (!ok) { R.frame_skipped++; nvn_front_count(1, 1); break; } }
         vkCmdBindIndexBuffer(R.cmd, ib.buf, ib.off, t == 0 ? VK_INDEX_TYPE_UINT8_EXT : t == 1 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
-        vkCmdDrawIndexed(R.cmd, (uint32_t)count, (uint32_t)a[6], 0, (int32_t)a[4], (uint32_t)a[5]);
+        vkCmdDrawIndexed(R.cmd, (uint32_t)count, (uint32_t)a[6], 0, (int32_t)((int64_t)(int32_t)a[4] - uw_vadj), (uint32_t)a[5]);
         R.frame_draws++; g_cmd_draws++; nvn_front_count(0, 1);
         break;
     }
@@ -3429,6 +3668,7 @@ static void exec(const Cmd *m, int depth) {
         memcpy(&sv, blob, sizeof sv); memcpy(sr, blob + 24, 24); memcpy(&dv, blob + 48, sizeof dv); memcpy(dr, blob + 72, 24);
         if (a[6] & 4) { dr[0] += dr[3]; dr[3] = -dr[3]; }
         if (a[6] & 8) { dr[1] += dr[4]; dr[4] = -dr[4]; }
+        if (uw_log_on() && uw_cap_now()) printf("UWCAP copy %dx%d [%d,%d %dx%d] -> %dx%d [%d,%d %dx%d]\n", s->b.width, s->b.height, sr[0], sr[1], sr[3], sr[4], d->b.width, d->b.height, dr[0], dr[1], dr[3], dr[4]);
         blit_tex(s, &sv, sr, d, &dv, dr, (int)(a[6] & 1));
         lr_record(d);                                  /* [Recomps#1] finding 118: texels the game reads on the CPU */
         if (g_dump_on) dump_tex_op(s, d, "copy");
@@ -4195,6 +4435,7 @@ static void vk_present2(void *arg, int progress) {
     { int step = nvn_front_take_step_shot(); if (step && vt) { char path[300]; const char *dir = getenv("SSBU_SHOT_DIR"); snprintf(path, sizeof path, "%s%sstep_%03d.bmp", dir ? dir : "", dir ? "/" : "", step - 1); save_bmp_vk(path, vt); } }
     nvn_front_draw_tag_clear();
     if (j->shot_fight && vt) { char path[300]; const char *dir = getenv("SSBU_SHOT_DIR"); snprintf(path, sizeof path, "%s%sfight_%05d.bmp", dir ? dir : "", dir ? "/" : "", j->shot_fight); save_bmp_vk(path, vt); printf("shot: fight frame %d saved at presented frame %lld (Vulkan)\n", j->shot_fight, (long long)frame); }      /* session 13, SSBU_SHOT_FIGHT */
+    { extern volatile int g_uw_cap_shot; if (vt && g_uw_cap_shot) { char path[300]; snprintf(path, sizeof path, "/tmp/uwcap_%lld.bmp", (long long)frame); save_bmp_vk(path, vt); g_uw_cap_shot = 0; } }   /* SSBU_UW_LOG: the captured frame's picture */
     if (vt && (frame == shot || (every > 0 && frame >= shot_from && frame % every == 0))) {
         char path[300];
         const char *dir = getenv("SSBU_SHOT_DIR");
