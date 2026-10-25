@@ -6,7 +6,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
+#ifdef _WIN32
 #include <malloc.h>
+#endif
 #include <windows.h>
 #include "runtime.h"
 #include "hostrt.h"
@@ -55,7 +57,14 @@ static SRWLOCK g_table_lock = SRWLOCK_INIT;
  * took ONE process-wide lock exclusively. Records are never removed and a record's key and next pointer never change
  * once it is in the table, so a look-up can walk the bucket without the lock; only a miss takes the lock (and looks
  * again under it). SSBU_OBJ_LOCKFREE=0: the lock at every look-up, as before. */
+#ifdef __APPLE__
+#define OBJ_LOCKFREE_DEFAULT 1      /* [Recomps#1] macOS: on by default - the game's ~20 threads take this table's lock
+                                       * for every guest lock, unlock, event and semaphore operation, and the whole-process
+                                       * burn at 4-10 fps showed that single lock as the wall (plan step 6: the port's own
+                                       * measurements; the records here are never removed, so the walk is safe) */
+#else
 #define OBJ_LOCKFREE_DEFAULT 0
+#endif
 static int g_obj_lf = -1;
 static Obj *obj(uint64_t key) {
     unsigned h = (unsigned)((key >> 3) * 2654435761u) & (BUCKETS - 1);

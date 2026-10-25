@@ -29,15 +29,18 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#include <windows.h>
-#include <wincrypt.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/ioctl.h>
+#include <poll.h>
+#include "windows.h"
 #include "sdklift.h"
 
-#ifdef _WIN32                     /* [Recomps#1] Linux: no .lib notes (zig's lld would look for them) */
-#pragma comment(lib, "ws2_32.lib")
-#endif
+/* Darwin: uses system sockets, no .lib notes (zig's lld would look for them) */
 
 #define A0 (c->x[0])
 #define A1 (c->x[1])

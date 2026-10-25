@@ -89,6 +89,7 @@ ROMFS_FILES = {   # small enough to hash on every verify
 ROMFS_MANIFEST = (1643, 13480389777, '4d5e288d43f669353e483f279e325984544906c253d932863b649f8f681c340d')
 ENCRYPTED = ('.nsp', '.xci', '.nca', '.nsz', '.xcz')
 LINUX_HOST = sys.platform.startswith('linux')                # [Recomps#1] the Linux version (TOOLCHAIN=linux, build-linux/)
+DARWIN_HOST = sys.platform == 'darwin'                       # [Recomps#1] macOS (TOOLCHAIN=darwin, build-darwin/)
 
 
 class Fail(Exception):
@@ -157,7 +158,7 @@ def link_folder(link, target):
         else:
             return 'a real folder, kept (not replaced by the dump\'s)'
     os.makedirs(os.path.dirname(link), exist_ok=True)
-    if LINUX_HOST:
+    if LINUX_HOST or DARWIN_HOST:
         os.symlink(target, link, target_is_directory=True)
         return 'symlink to ' + target
     # quoted here: cmd splits an unquoted path at commas too, and Python quotes only paths with spaces (finding 149)
@@ -229,6 +230,8 @@ def step_deps(cx):
     saved = cx.state.get('tools', {})                    # what an earlier run found (its options need not be given again)
     if LINUX_HOST:
         return deps_linux(cx, saved)
+    if DARWIN_HOST:
+        return deps_darwin(cx, saved)
     name = a.toolchain or os.environ.get('TOOLCHAIN') or saved.get('TOOLCHAIN') or 'mingw'
     if name not in ('mingw', 'msvc'):
         raise Fail('--toolchain must be mingw or msvc, not %r' % name)
@@ -357,6 +360,38 @@ def deps_linux(cx, saved):
     else:
         raise Fail('the shader compiler shim is missing: deps/libssbu_glslang.so (the Linux builder package has it), or '
                    'install glslang')
+    cx.state['tools'] = dict(cx.tools)
+
+
+def deps_darwin(cx, saved):
+    """[Recomps#1] macOS: apple clang (system or xcrun), SDL3/Vulkan via Homebrew, no glslang (optional)."""
+    a = cx.a
+    cx.tools['TOOLCHAIN'] = 'darwin'
+    clang = shutil.which('clang') or os.path.join('/usr', 'bin', 'clang')
+    if not clang or not os.path.isfile(clang):
+        raise Fail('clang not found (macOS needs Apple clang: xcode-select --install or install Xcode)')
+    ver = subprocess.run([clang, '--version'], capture_output=True, text=True).stdout.splitlines()[0]
+    say('  compiler (darwin): %s   [%s]' % ('clang', ver))
+    cx.tools['CLANG'] = clang
+    sdl = find_first([a.sdl3, os.environ.get('SDL3_ROOT'), os.path.join(DEPS, 'SDL3'), saved.get('SDL3_ROOT')],
+                    os.path.join('lib', 'libSDL3.so'))  # macOS Homebrew uses .dylib; look for include/SDL3/SDL.h
+    if not sdl:
+        sdl = find_first([a.sdl3, os.environ.get('SDL3_ROOT'), os.path.join(DEPS, 'SDL3'), saved.get('SDL3_ROOT')],
+                        os.path.join('include', 'SDL3', 'SDL.h'))
+    if sdl:
+        cx.tools['SDL3_ROOT'] = sdl
+        say('  SDL3            %s' % sdl)
+    elif not (os.path.exists('/opt/homebrew/include/SDL3/SDL.h') or os.path.exists('/usr/local/include/SDL3/SDL.h')):
+        say('  SDL3            not found (Homebrew sdl3 or --sdl3); the build reports but exits 0 without --strict')
+    vk = find_first([a.vulkan_headers, os.environ.get('VULKAN_HEADERS'), os.path.join(DEPS, 'Vulkan-Headers'), saved.get('VULKAN_HEADERS')],
+                    os.path.join('include', 'vulkan', 'vulkan.h'))
+    if vk:
+        cx.tools['VULKAN_HEADERS'] = vk
+        say('  Vulkan-Headers  %s' % vk)
+    elif os.path.exists('/opt/homebrew/include/vulkan/vulkan.h') or os.path.exists('/usr/local/include/vulkan/vulkan.h'):
+        say('  Vulkan-Headers  the Homebrew / system header')
+    else:
+        say('  Vulkan-Headers  not found; build reports (exit 0 without --strict)')
     cx.state['tools'] = dict(cx.tools)
 
 
@@ -549,6 +584,11 @@ def step_link(cx):
         say('  build-linux/game_native %.1f MB, game.so %.0f MB' % (os.path.getsize(os.path.join(out, 'game_native')) / 2 ** 20,
                                                                   os.path.getsize(os.path.join(out, 'game.so')) / 2 ** 20))
         return
+    if DARWIN_HOST:                                         # [Recomps#1] macOS: build-darwin/
+        cx.run('link', [sys.executable, os.path.join(REPO, 'scripts', 'build_runtime_darwin.py'), '--strict'])
+        out = os.path.join(REPO, 'build-darwin')
+        say('  build-darwin/ link completed (reports not-yet-ported files, exit 0 without --strict)')
+        return
     cx.run('link', [sys.executable, os.path.join(REPO, 'scripts', 'build_runtime.py')])
     cx.run('link', [sys.executable, os.path.join(REPO, 'scripts', 'build_launcher.py')])
     for f in ('game.dll', 'game_native.exe', 'SDL3.dll', 'ssbu_glslang.dll', 'launcher.exe'):
@@ -608,7 +648,7 @@ def main():
     ap.add_argument('--status', action='store_true')
     ap.add_argument('--accept-modified', action='store_true')
     ap.add_argument('--mods', help='folder of emulator-style code mods (.pchtxt / .ips); default <repo>\\mods (remembered)')
-    ap.add_argument('--toolchain', choices=('mingw', 'msvc', 'linux'))
+    ap.add_argument('--toolchain', choices=('mingw', 'msvc', 'linux', 'darwin'))
     ap.add_argument('--zig', help='zig 0.17.0 folder (Linux: the compiler; deps/zig in the Linux builder package)')
     ap.add_argument('--glslang-so', help='Linux: a built libssbu_glslang.so (deps/libssbu_glslang.so in the package)')
     ap.add_argument('--llvm-mingw', help='llvm-mingw folder (bin\\x86_64-w64-mingw32-clang.exe)')

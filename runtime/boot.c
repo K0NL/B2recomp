@@ -3,12 +3,18 @@
  * other modules it asks for, in order. Unimplemented imports return 0. */
 #include <stdio.h>
 #include <stdlib.h>
-#include <malloc.h>
 #include <math.h>
+#ifdef _WIN32
+#include <malloc.h>
+#endif
 #include <windows.h>
 #include "runtime.h"
 #include "hostrt.h"
-#include "gfx_options.h"           /* [Recomps#1] graphics.ini read before the game starts (frame_rate) */
+#include "gfx_options.h"
+#ifdef __APPLE__
+extern void display_pump_events(int wait_ms);    /* display.c: the window's SDL events, pumped on this (main) thread (plan step 4) */
+#endif
+extern volatile LONG g_display_close;           /* [Recomps#1] graphics.ini read before the game starts (frame_rate) */
 
 #include "image_layout.h"          /* [Recomps#1] entry points of our main, by exported name */
 #define NNINIT_STARTUP (GUEST_BASE + NNINIT_STARTUP_OFF)
@@ -330,10 +336,28 @@ int main(int argc, char **argv) {
     HANDLE t = CreateThread(NULL, (SIZE_T)1 << 30, guest_main, NULL, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
     if (getenv("SSBU_PROF")) { g_prof_target = t; CloseHandle(CreateThread(NULL, 0, profiler, NULL, 0, NULL)); }
     { void prof15_start(void); prof15_start(); }         /* prof15.c: SSBU_PROF15, every busy thread (test only; nothing without the variable) */
-    DWORD wr = WaitForSingleObject(t, seconds > 0 ? (DWORD)seconds * 1000 : INFINITE);
+    DWORD wr;
+#ifdef __APPLE__
+    /* [Recomps#1] macOS (notes/macos-port-plan.md step 4): SDL's Cocoa driver pumps the window's events on the thread
+     * that started video - this main thread. The guest runs on its own thread; this loop serves the window while it
+     * does, and ends as WaitForSingleObject below would: WAIT_OBJECT_0 when the guest ended, WAIT_TIMEOUT when the
+     * seconds limit passed (the shared code after this handles both the same way). */
+    signal(SIGPIPE, SIG_IGN);                            /* a socket of ours may close while somebody writes to it */
+    wr = WAIT_TIMEOUT;
+    time_t started = time(NULL);
+    for (;;) {
+        display_pump_events(10);                         /* the window's events: close button, mouse camera, focus, ... */
+        if (WaitForSingleObject(t, 0) == WAIT_OBJECT_0) { wr = WAIT_OBJECT_0; break; }
+        if (seconds > 0 && difftime(time(NULL), started) >= (double)seconds) break;
+    }
+#else
+    wr = WaitForSingleObject(t, seconds > 0 ? (DWORD)seconds * 1000 : INFINITE);
+#endif
+#ifndef __APPLE__
     {   unsigned nvn_gl_held_ms(void);                   /* nvn_gl.c: time the presents were held for shader preparation is not run time */
         for (unsigned done = 0, h; wr == WAIT_TIMEOUT && (h = nvn_gl_held_ms()) > done + 50; done = h) wr = WaitForSingleObject(t, h - done);
     }
+#endif      /* [Recomps#1] macOS: the main thread pumps the window's events after this; it must not block in this test-only extension */
     if (wr == WAIT_TIMEOUT) {
         printf("\nstill running after %d s with %d guest thread(s) started: stopping here.\n", seconds, guest_thread_count());
         trace_printf("=== stopped by the time limit after %d s\n", seconds);

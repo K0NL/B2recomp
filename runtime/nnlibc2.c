@@ -10,7 +10,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
 #include <malloc.h>
+#endif
 #include <windows.h>
 #include "runtime.h"
 #include "hostrt.h"

@@ -21,7 +21,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
 #include <malloc.h>
+#endif
 #include <windows.h>
 #include "image_layout.h"          /* [Recomps#1] GAME_FREE_OFF */
 #include "runtime.h"

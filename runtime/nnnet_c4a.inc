@@ -197,6 +197,64 @@ static void nifm_HandleNetworkRequestResult(Ctx *c) {
 /* ================================================================== nn::socket on Winsock */
 #define SO_MAX_FD 128
 #define SO_O_NONBLOCK 0x800
+#ifndef _WIN32
+typedef int SOCKET;
+#define INVALID_SOCKET (-1)
+#define WSAEINTR EINTR
+#define WSAEBADF EBADF
+#define WSAENOTSOCK ENOTSOCK
+#define WSAEACCES EACCES
+#define WSAEFAULT EFAULT
+#define WSAEINVAL EINVAL
+#define WSAEMFILE EMFILE
+#define WSAEWOULDBLOCK EWOULDBLOCK
+#define WSAEINPROGRESS EINPROGRESS
+#define WSAEALREADY EALREADY
+#define WSAEDESTADDRREQ EDESTADDRREQ
+#define WSAEMSGSIZE EMSGSIZE
+#define WSAEPROTOTYPE EPROTOTYPE
+#define WSAENOPROTOOPT ENOPROTOOPT
+#define WSAEPROTONOSUPPORT EPROTONOSUPPORT
+#define WSAESOCKTNOSUPPORT ESOCKTNOSUPPORT
+#ifndef _WIN32
+#define InetPtonA(af, src, dst) inet_pton(af, src, dst)
+#endif
+#define WSAEOPNOTSUPP EOPNOTSUPP
+#define WSAEPFNOSUPPORT EPFNOSUPPORT
+#define WSAEAFNOSUPPORT EAFNOSUPPORT
+#define WSAEADDRINUSE EADDRINUSE
+#define WSAEADDRNOTAVAIL EADDRNOTAVAIL
+#define WSAENETDOWN ENETDOWN
+#define WSAENETUNREACH ENETUNREACH
+#define WSAENETRESET ENETRESET
+#define WSAECONNABORTED ECONNABORTED
+#define WSAECONNRESET ECONNRESET
+#define WSAENOBUFS ENOBUFS
+#define WSAEISCONN EISCONN
+#define WSAENOTCONN ENOTCONN
+#define WSAESHUTDOWN ESHUTDOWN
+#define WSAETIMEDOUT ETIMEDOUT
+#define WSAECONNREFUSED ECONNREFUSED
+#define WSAEHOSTDOWN EHOSTDOWN
+#define WSAEHOSTUNREACH EHOSTUNREACH
+#define WSATRY_AGAIN EAGAIN
+#define WSANO_RECOVERY EIO
+#define WSA_NOT_ENOUGH_MEMORY ENOMEM
+#define WSAHOST_NOT_FOUND HOST_NOT_FOUND
+#define WSATYPE_NOT_FOUND NO_DATA
+#define WSAESOCKTNOSUPPORT ESOCKTNOSUPPORT
+#ifndef _WIN32
+#define InetPtonA(af, src, dst) inet_pton(af, src, dst)
+#endif
+#define LINGER struct linger
+#define WSAGetLastError() errno
+#define closesocket(x) close(x)
+#define ioctlsocket(s, cmd, argp) ioctl(s, cmd, argp)
+#define WSAPOLLFD struct pollfd
+#define DWORD uint32_t
+#define WSAPoll poll
+#define Sleep(ms) usleep((ms) * 1000)
+#endif
 typedef struct { SOCKET s; LONG refs; int type; int bound_any; } SoObj;
 static struct { SoObj *o; int flags; } g_so_fd[SO_MAX_FD];
 static SRWLOCK g_so_lock = SRWLOCK_INIT;
@@ -269,7 +327,7 @@ static void so_put(SoObj *o) {
     AcquireSRWLockExclusive(&g_so_lock);
     last = --o->refs == 0;
     ReleaseSRWLockExclusive(&g_so_lock);
-    if (last) { closesocket(o->s); free(o); }
+    if (last) { close(o->s); free(o); }
 }
 static int so_install(SoObj *o, int flags) {             /* lowest free descriptor, or -1 */
     int fd = -1;
@@ -296,7 +354,7 @@ static int so_dup(int fd) {                               /* bsd DuplicateSocket
     so_put(o);
     return nfd;
 }
-static void so_nonblock(SoObj *o, int on) { u_long v = on ? 1 : 0; ioctlsocket(o->s, FIONBIO, &v); }
+static void so_nonblock(SoObj *o, int on) { u_long v = on ? 1 : 0; ioctl(o->s, FIONBIO, &v); }
 static int so_is_loopback(uint32_t be_addr) { return (be_addr & 0xff) == 127; }      /* first byte in memory */
 static int so_addr_in(uint64_t p, struct sockaddr_in *out) {                          /* guest BSD sockaddr_in -> host; 0 when not AF_INET */
     memset(out, 0, sizeof *out);
@@ -321,13 +379,21 @@ static void socket_Initialize(Ctx *c) {                   /* (void *pool, size_t
     if (g_so_init || !pool || (unsigned)(conc - 1) >= 14 || size <= alloc || (pool & 0xfff) || (size & 0xfff) || (alloc & 0xfff) || alloc <= 0xfff)
         guest_trap("nn::socket::Initialize: [sdk 0x36f89c] abort (already initialised or bad arguments)", c->x[30] - 4);
     if (size < 0xa0000) { RET(0x21bu); return; }
-    if (!g_so_wsa) { WSADATA d; if (WSAStartup(MAKEWORD(2, 2), &d) == 0) g_so_wsa = 1; }
+    #ifndef _WIN32
+    g_so_wsa = 1;                                   /* POSIX: sockets ready immediately */
+#else
+    { WSADATA d; if (WSAStartup(MAKEWORD(2, 2), &d) == 0) g_so_wsa = 1; }
+#endif
     g_so_init = 1;
     RET(0);
 }
 static void socket_InitializeConfig(Ctx *c) {             /* [Recomps#1] finding 133: Initialize(const Config &), the overload B2's online library uses */
     if (g_so_init) guest_trap("nn::socket::Initialize(Config): [sdk] abort (already initialised)", c->x[30] - 4);
-    if (!g_so_wsa) { WSADATA d; if (WSAStartup(MAKEWORD(2, 2), &d) == 0) g_so_wsa = 1; }
+    #ifndef _WIN32
+    g_so_wsa = 1;                                   /* POSIX: sockets ready immediately */
+#else
+    { WSADATA d; if (WSAStartup(MAKEWORD(2, 2), &d) == 0) g_so_wsa = 1; }
+#endif
     g_so_init = 1;
     RET(0);
 }
@@ -735,8 +801,12 @@ static void so_ResolverGetOption(Ctx *c) {                /* (ResolverOption *ou
     }
     if (key == 0x2711) {                                  /* [sdk 0x382d50] CreateRandomId */
         uint32_t id = 0;
+#ifndef _WIN32
+        arc4random_buf(&id, 4);
+#else
         HCRYPTPROV prov = 0;
         if (CryptAcquireContextA(&prov, NULL, NULL, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT)) { CryptGenRandom(prov, 4, (BYTE *)&id); CryptReleaseContext(prov, 0); }
+#endif
         M32(opt + 0x10) = id; M64(opt + 8) = 4;
         RETI(0); return;
     }

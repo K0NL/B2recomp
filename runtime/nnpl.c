@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <windows.h>
+#include <limits.h>
 #include "runtime.h"
 #include "hostrt.h"
 
@@ -78,6 +79,19 @@ static int linux_font(char *out, size_t n) {              /* once: every font ty
     return found[0] != 0;
 }
 #endif
+#ifdef __APPLE__
+/* [Recomps#1] macOS (notes/macos-port-plan.md step 7): the stand-in is Arial Unicode - glyf outlines, which
+ * nnfontll.c draws (the system fonts of /System/Library/Fonts are CFF: no outlines), with the CJK glyphs the
+ * game's system text needs - else Arial, from the system's Supplemental folder. */
+static int darwin_font(char *out, size_t n) {
+    static const char *const k_mac_fonts[] = { "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+        "/System/Library/Fonts/Supplemental/Arial.ttf", "/Library/Fonts/Arial Unicode.ttf" };
+    struct stat st;
+    for (size_t i = 0; i < sizeof k_mac_fonts / sizeof k_mac_fonts[0]; i++)
+        if (!stat(k_mac_fonts[i], &st) && S_ISREG(st.st_mode)) { snprintf(out, n, "%s", k_mac_fonts[i]); return 1; }
+    return 0;
+}
+#endif
 static CRITICAL_SECTION g_lock;
 
 static uint32_t be32(const uint8_t *p) { return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3]; }
@@ -140,6 +154,14 @@ static void load_font(unsigned type) {
             }
 #ifndef _WIN32
             if (!data && linux_font(path, MAX_PATH)) {        /* [Recomps#1] Linux: a TrueType font of the system */
+                for (unsigned t = 0; t < FONT_TYPES && !data; t++)
+                    if (t != type && g_fonts[t].data && !strcmp(g_fonts[t].path, path)) data = g_fonts[t].data, size = g_fonts[t].size;
+                if (!data) data = read_file(path, &size);
+                if (data && !is_sfnt(data)) { _aligned_free(data); data = NULL; }
+            }
+#endif
+#ifdef __APPLE__
+            if (!data && darwin_font(path, MAX_PATH)) {       /* [Recomps#1] macOS plan step 7: a glyf font of the system */
                 for (unsigned t = 0; t < FONT_TYPES && !data; t++)
                     if (t != type && g_fonts[t].data && !strcmp(g_fonts[t].path, path)) data = g_fonts[t].data, size = g_fonts[t].size;
                 if (!data) data = read_file(path, &size);

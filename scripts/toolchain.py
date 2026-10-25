@@ -23,7 +23,7 @@ import sys
 ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 BUILD = os.path.join(ROOT, 'build')
 DEPS = os.path.join(ROOT, 'deps')
-NAMES = ('mingw', 'msvc', 'linux')
+NAMES = ('mingw', 'msvc', 'linux', 'darwin')
 DEFAULT = 'mingw'
 
 
@@ -56,6 +56,7 @@ if NAME not in NAMES:
     sys.exit('TOOLCHAIN must be one of %s, not %r' % ('/'.join(NAMES), NAME))
 MINGW = NAME == 'mingw'
 LINUX = NAME == 'linux'
+DARWIN = NAME == 'darwin'
 # the default toolchain builds into the standard places; the other one beside them, in folders named after it
 OBJ = os.path.join(BUILD, 'obj' if NAME == DEFAULT else 'obj_' + NAME)        # lifted objects (compile_main.py)
 OUT = BUILD if NAME == DEFAULT else os.path.join(BUILD, 'out_' + NAME)       # game.dll, obj_host/, game_native.exe
@@ -69,6 +70,13 @@ if LINUX:                                                # [Recomps#1] the Linux
     OBJEXT, SHLIB, EXEEXT = '.o', '.so', ''
     EXTRA = ['-fdeclspec', '-fPIC']                      # __declspec(dllexport) of the shared headers; game.so is shared
     LIFTED_EXTRA = ['-g0']                               # the lifted code without debug info, as on Windows (zig cc adds -g)
+elif DARWIN:                                             # [Recomps#1] macOS: build-darwin/, .dylib shared libraries
+    DARWIN_BUILD = os.path.join(ROOT, 'build-darwin')
+    OBJ = os.path.join(DARWIN_BUILD, 'obj')
+    OUT = DARWIN_BUILD
+    OBJEXT, SHLIB, EXEEXT = '.o', '.dylib', ''
+    EXTRA = ['-D_XOPEN_SOURCE=700', '-D_DARWIN_C_SOURCE', '-fdeclspec', '-fPIC']
+    LIFTED_EXTRA = ['-g0']
 
 if MINGW:
     LLVM_MINGW = need('LLVM_MINGW', 'llvm-mingw', 'bin/x86_64-w64-mingw32-clang.exe', 'llvm-mingw (TOOLCHAIN=mingw)')
@@ -96,9 +104,27 @@ elif LINUX:
     BIN = os.path.dirname(CLANG)
     OPTNONE = 5000                                       # clang 22 / 23 behave alike on the huge functions (toolchain-mingw.md 2.1)
     RUNTIME_LICENCE = None                               # glibc is the system's
-else:
-    BIN = os.path.join(need('LLVM_ROOT', 'llvm', 'bin/clang.exe', 'LLVM/clang 9.0.0 (TOOLCHAIN=msvc)'), 'bin')
+elif DARWIN:                             # macOS Apple Silicon / Intel (clang system)
+    import shutil as _sh
+    _clang = os.environ.get('CLANG') or _sh.which('clang')
+    if not _clang:
+        sys.exit('TOOLCHAIN=darwin: no compiler: install clang (xcode-select --install, Xcode, or set CLANG=<path>)')
+    CLANG = _clang
+    BIN = os.path.dirname(CLANG)
+    CC = [CLANG]
+    OPTNONE = 20000
+    RUNTIME_LICENCE = None
+    DARWIN_BUILD = os.path.join(ROOT, 'build-darwin')
+    OBJ = os.path.join(DARWIN_BUILD, 'obj')
+    OUT = DARWIN_BUILD
+    EXTRA = ['-D_XOPEN_SOURCE=700', '-D_DARWIN_C_SOURCE', '-fdeclspec', '-fPIC']
+    LIFTED_EXTRA = ['-g0']
+    # macOS uses .dylib for shared libraries; binary outputs: obj_darwin/ build-darwin/
+else:                                                 # msvc / default
+    LLVM_ROOT = need('LLVM_ROOT', 'llvm', 'bin/clang.exe', 'LLVM/clang 9.0.0 (TOOLCHAIN=msvc)')
+    BIN = os.path.join(LLVM_ROOT, 'bin')
     CLANG = os.path.join(BIN, 'clang.exe')
+    CC = [CLANG]
     OPTNONE = 20000
     RUNTIME_LICENCE = None                               # MSVC's CRT is the system's / the redistributable's
 if not LINUX:

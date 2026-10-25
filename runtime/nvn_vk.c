@@ -18,14 +18,21 @@
  *   SSBU_VK_MISSING=warn      development only: an operation that is not implemented is reported once, counted and
  *                             skipped instead of stopping the game (the picture is then NOT the game's)
  *
- * Vulkan declarations: vk_min.h (see there why it is not the Khronos header). The loader is vulkan-1.dll. */
+ * Vulkan declarations: vk_min.h (see there why it is not the Khronos header). The loader is vulkan-1.dll on Windows,
+ * libvulkan.dylib on macOS. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <windows.h>
+#ifndef _WIN32
+#include <dlfcn.h>
+#endif
 /* Session 2: the Khronos headers (reference\upstream\Vulkan-Headers\include, -I in build.py) replace our own vk_min.h subset. */
 #ifdef _WIN32
 #define VK_USE_PLATFORM_WIN32_KHR
+#endif
+#ifdef __APPLE__
+#define VK_USE_PLATFORM_METAL_KHR
 #endif
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
@@ -211,7 +218,11 @@ static int swapchain_create(void) {
     VkResult r = vkGetPhysicalDeviceSurfaceCapabilitiesKHR(V.gpu, V.surface, &caps);
     if (r != VK_SUCCESS) vk_fatal("vkGetPhysicalDeviceSurfaceCapabilitiesKHR", r);
     VkExtent2D ext = caps.currentExtent;
+#ifdef _WIN32
     if (ext.width == 0xffffffffu) { RECT rc; GetClientRect(V.hwnd, &rc); ext.width = (uint32_t)rc.right; ext.height = (uint32_t)rc.bottom; }
+#else
+    if (ext.width == 0xffffffffu) { int w, h; SDL_GetWindowSize((SDL_Window *)V.hwnd, &w, &h); ext.width = (uint32_t)w; ext.height = (uint32_t)h; }   /* [Recomps#1] Darwin: SDL3 window */
+#endif
     if (ext.width < caps.minImageExtent.width) ext.width = caps.minImageExtent.width;
     if (ext.height < caps.minImageExtent.height) ext.height = caps.minImageExtent.height;
     if (caps.maxImageExtent.width && ext.width > caps.maxImageExtent.width) ext.width = caps.maxImageExtent.width;
@@ -248,23 +259,36 @@ static int swapchain_create(void) {
 
 /* ---------------------------------------------------------------- start */
 static void *vk_sym(const char *name) {
-    void *p = (void *)GetProcAddress(V.loader, name);
+    void *p;
 #ifndef _WIN32
+    p = dlsym(V.loader, name);
     if (!p && !strcmp(name, "vkCreateWin32SurfaceKHR")) return NULL;
+#else
+    p = (void *)GetProcAddress(V.loader, name);
 #endif
     if (!p) { printf("nvn_vk: vulkan-1.dll does not export %s\n", name); fflush(stdout); ExitProcess(5); }
     return p;
 }
 
-/* Render thread, once. Returns 1; any failure prints its cause and ends the process with code 5 (as the OpenGL path does). */
+/* Render thread, once. Returns 1; any failure prints its cause and ends the process with code 5 (as the OpenGL path does).
+ * [Recomps#1] macOS: the first call runs on the MAIN thread (nvn_gl_start calls this before the render thread exists):
+ * SDL_Vulkan_CreateSurface attaches the Metal layer to the window's view, an AppKit change that must be made on the
+ * thread that created the window - made from the render thread the layer stays detached, every present succeeds and
+ * the window shows nothing (measured: a probe with the same surface call from a second thread stays black). */
 int nvn_vk_init(void *hwnd) {
-    static const char *const k_wanted[] = {"VK_KHR_swapchain", "VK_EXT_extended_dynamic_state3", "VK_EXT_vertex_input_dynamic_state", "VK_KHR_push_descriptor", "VK_EXT_custom_border_color",
+    if (V.alive) return 1;                     /* idempotent: the render thread's own call returns at once */
+    static const char *const k_wanted[] = {"VK_KHR_surface", "VK_KHR_swapchain", "VK_EXT_metal_surface", "VK_EXT_extended_dynamic_state3", "VK_EXT_vertex_input_dynamic_state", "VK_KHR_push_descriptor", "VK_EXT_custom_border_color",
                                            "VK_EXT_conservative_rasterization", "VK_EXT_external_memory_host", "VK_EXT_depth_clip_control", "VK_EXT_provoking_vertex", "VK_EXT_4444_formats",
-                                           "VK_EXT_index_type_uint8", "VK_EXT_full_screen_exclusive", "VK_EXT_blend_operation_advanced", "VK_KHR_pipeline_library"};
+                                           "VK_EXT_index_type_uint8", "VK_EXT_blend_operation_advanced", "VK_KHR_pipeline_library"};
     VkResult r;
     V.hwnd = hwnd;
+#ifndef _WIN32
+    V.loader = dlopen("libvulkan.dylib", RTLD_NOW | RTLD_GLOBAL);
+    if (!V.loader) { printf("nvn_vk: libvulkan.dylib cannot be loaded: no Vulkan driver on this PC (install vulkan-loader, molten-vk)\n"); fflush(stdout); ExitProcess(5); }
+#else
     V.loader = LoadLibraryA("vulkan-1.dll");
     if (!V.loader) { printf("nvn_vk: vulkan-1.dll cannot be loaded (error %lu): no Vulkan driver on this PC\n", GetLastError()); fflush(stdout); ExitProcess(5); }
+#endif
 #define X(ret, name, args) name = vk_sym(#name);
     VKF(X)
 #undef X
@@ -277,21 +301,38 @@ int nvn_vk_init(void *hwnd) {
     uint32_t niext = 128;
     r = vkEnumerateInstanceExtensionProperties(NULL, &niext, iext);
     if (r != VK_SUCCESS && r != VK_INCOMPLETE) vk_fatal("vkEnumerateInstanceExtensionProperties", r);
-    const char *exts[6], *layers[1];
+    const char *exts[8], *layers[1];
     uint32_t next = 0, nlayers = 0;
+    int portability = 0;                           /* [Recomps#1] macOS: VK_KHR_portability_enumeration was enabled (MoltenVK is a portability driver) */
 #ifdef _WIN32
     exts[next++] = "VK_KHR_surface"; exts[next++] = "VK_KHR_win32_surface";
     if (!has_name(iext, niext, "VK_KHR_surface") || !has_name(iext, niext, "VK_KHR_win32_surface")) { printf("nvn_vk: the Vulkan loader has no VK_KHR_surface / VK_KHR_win32_surface\n"); fflush(stdout); ExitProcess(5); }
     if (has_name(iext, niext, "VK_EXT_swapchain_colorspace")) exts[next++] = "VK_EXT_swapchain_colorspace";      /* [Recomps#1] finding 147: the HDR colour spaces */
 #else
-    {   /* [Recomps#1] Linux: the surface extensions SDL needs for its window (VK_KHR_surface + xlib / xcb / wayland) */
+    {   /* [Recomps#1] Darwin/Linux: the surface extensions SDL needs for its window */
         Uint32 n = 0;
         const char *const *se = SDL_Vulkan_GetInstanceExtensions(&n);
         if (!se || !n) { printf("nvn_vk: SDL names no Vulkan surface extensions (%s)\n", SDL_GetError()); fflush(stdout); ExitProcess(5); }
-        for (Uint32 i = 0; i < n && next < 3; i++) {
+#ifdef __APPLE__
+        int have_surface = 0, have_metal = 0;
+        for (Uint32 i = 0; i < n; i++) {
+            if (!strcmp(se[i], "VK_KHR_surface")) have_surface = 1;
+            if (!strcmp(se[i], "VK_EXT_metal_surface")) have_metal = 1;
+        }
+        if (!have_surface || !have_metal) { printf("nvn_vk: SDL does not name VK_KHR_surface and VK_EXT_metal_surface (video driver %s)\n", SDL_GetCurrentVideoDriver()); fflush(stdout); ExitProcess(5); }
+        exts[next++] = "VK_KHR_surface";
+        exts[next++] = "VK_EXT_metal_surface";
+        if (has_name(iext, niext, "VK_KHR_portability_enumeration")) {
+            exts[next++] = "VK_KHR_portability_enumeration";
+            portability = 1;
+        }
+#else
+        for (Uint32 i = 0; i < n && next < 3; i++) {      /* Linux: VK_KHR_surface + xlib / xcb / wayland, as SDL names them */
             if (!has_name(iext, niext, se[i])) { printf("nvn_vk: the Vulkan loader has no %s (SDL video driver %s)\n", se[i], SDL_GetCurrentVideoDriver()); fflush(stdout); ExitProcess(5); }
             exts[next++] = se[i];
         }
+#endif
+        if (has_name(iext, niext, "VK_EXT_swapchain_colorspace")) exts[next++] = "VK_EXT_swapchain_colorspace";
     }
 #endif
     { const char *e = getenv("SSBU_VK_VALIDATE"); V.validate = e && atoi(e) != 0; }
@@ -311,6 +352,9 @@ int nvn_vk_init(void *hwnd) {
     memset(&ici, 0, sizeof ici);
     ici.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO; ici.pApplicationInfo = &app;
     ici.enabledLayerCount = nlayers; ici.ppEnabledLayerNames = layers; ici.enabledExtensionCount = next; ici.ppEnabledExtensionNames = exts;
+#ifndef _WIN32
+    if (portability) ici.flags = VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;      /* [Recomps#1] macOS: only with the extension enabled (a Linux loader may not know it) */
+#endif
     r = vkCreateInstance(&ici, NULL, &V.instance);
     if (r != VK_SUCCESS) vk_fatal("vkCreateInstance", r);
     if (V.validate) {

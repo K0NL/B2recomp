@@ -13,7 +13,9 @@
  * exception (nn::err::ErrorResultVariant, see below). */
 #include <stdio.h>
 #include <stdlib.h>
+#ifdef _WIN32
 #include <malloc.h>
+#endif
 #include <setjmp.h>
 #include <windows.h>
 #include <wincrypt.h>

@@ -4051,6 +4051,9 @@ void nvn_gl_start(void *hwnd) {
     g_job_event = CreateEventA(NULL, FALSE, FALSE, NULL);
     g_ready_event = CreateEventA(NULL, TRUE, FALSE, NULL);
     { const char *e = getenv("SSBU_STACKS_AT"); void nvn_vk_stacks_at(int seconds); if (e && atoi(e) > 0) nvn_vk_stacks_at(atoi(e)); }      /* session 13, TEST: every thread's call stack once, that many seconds from here, with either renderer (nvn_vk_wd.c) */
+#ifdef __APPLE__
+    if (g_vk) nvn_vk_init(g_hwnd);    /* [Recomps#1] macOS: the Vulkan start-up on the main thread, before the render thread starts - see nvn_vk.c */
+#endif
     CreateThread(NULL, 16 << 20, render_thread, NULL, 0, NULL);
     WaitForSingleObject(g_ready_event, INFINITE);
 }

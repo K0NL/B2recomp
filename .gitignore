@@ -48,6 +48,14 @@
 !/runtime/linux/*.c
 !/runtime/linux/GL/gl.h
 
+# ---- 4c. the macOS version (notes/macos-port-plan.md): the Win32-on-Darwin layer of the runtime (our code)
+!/runtime/darwin/*.h
+!/runtime/darwin/*.c
+!/runtime/darwin/GL/gl.h
+!/scripts/build_runtime_darwin.py
+!/scripts/play_darwin.sh
+!/launcher/launcher_darwin.py
+
 # ---- 5. launcher (source only; art and icon come from the user's own files at build time)
 !/launcher/launcher.c
 !/launcher/launcher.manifest

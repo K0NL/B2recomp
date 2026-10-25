@@ -49,7 +49,7 @@ EXT = toolchain.OBJEXT                                   # .obj; .o for linux
 # clang 9 runs only the always-inliner at -O1: without this every rd64 / wr64 / cond / adds32 of runtime.h, neon.h and
 # rt_ext.h stays a call there (finding 91). Harmless at -O2, which inlines them anyway.
 FORCE_INLINE = '-Dinline=inline __attribute__((always_inline))'
-FLAGS = ['-ffp-contract=off', '-w', '-fno-strict-aliasing', '-mcx16', FORCE_INLINE, '-I', INC, '-I', GEN]
+FLAGS = ['-ffp-contract=off', '-w', '-fno-strict-aliasing', FORCE_INLINE, '-I', INC, '-I', GEN]
 OPT = '-O2'
 OPTNONE = toolchain.OPTNONE
 TIME_LIMIT = 900                                         # -O2: the largest file takes ~300 s with 16 jobs
