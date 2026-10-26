@@ -194,3 +194,11 @@ Both are marked `[Recomps#1]` in the code; the values the game sees are unchange
   only when chosen (`button_prompts`). `mod_family` guesses a prompt mod's kind from a word that starts with ds4, ds5,
   dualshock, dualsense, playstation, ps4, ps5 / xbox (or the word ps), so the DS4Prompts / XBOXPrompts folders of the
   GameBanana prompt mod 360121 need no [prompts] line.
+
+## Movie playback (2026-10-26, issue #63)
+- `nnaudio.c`: AudioOut is per guest object (up to 4, `AoDev`): each has its own buffer queue, released list, event,
+  waveOut stream, clock and statistics (log lines tagged `[n]`); every AudioOut import looks it up by its `AudioOut *`.
+  Upstream had one global AudioOut. The game opens two during a movie (Wwise's at boot, CRI's own at 7101108f8c): the
+  second open reset the shared queue and the two then took each other's released buffers, so CRI's output, the movie's
+  clock, ran at about 1/6 of real time and every movie was a slideshow. `SSBU_WAV` / `SSBU_AUDIO_HASH` follow the first
+  AudioOut, as before.
