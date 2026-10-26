@@ -22,7 +22,8 @@
  * AudioOutBuffer is only touched through these functions, so the field order inside its 0x28 bytes is ours
  * (the same as in the public SDK headers): +0 next, +8 data, +0x10 capacity, +0x18 data size, +0x20 data offset.
  *
- * Host side: every appended buffer is copied (6 channels are mixed down to stereo) and handed to waveOut at once.
+ * Host side: each AudioOut the game opens is its own output (the game has two open during a movie: Wwise's and
+ * CRI's). Every appended buffer is copied (6 channels are mixed down to stereo) and handed to that output's waveOut at once.
  * A buffer is "released" when the device has finished playing its copy, in the order it was appended; the
  * guest's event is signalled then. Without an output device the buffers are released by the clock instead.
  *
@@ -70,6 +71,12 @@ void os_signal_event(uint64_t key);
 #define SAMPLE_FORMAT_PCM16 2                         /* nn::audio::SampleFormat_PcmInt16 */
 #define SLOTS 64                                      /* more than the game's maximum of 16 buffers */
 #define WAV_SECONDS 30
+/* [Recomps#1] The game opens more than one AudioOut at a time: Wwise's (guest 710107fb74) for the whole session, and CRI's
+ * (guest 7101108f8c, CRI Atom's own output) while a movie plays. Each one is its own output with its own queue,
+ * released list, event and waveOut stream (Windows mixes the streams), as on the console. Until 2026-10-26 this file
+ * had one global queue: the second open reset it, and the two then took each other's released buffers. CRI got back
+ * Wwise's buffers, which it does not own, so its own output stalled and every movie ran at about 1/6 speed (issue #63). */
+#define AO_MAX 4
 
 typedef struct {
     WAVEHDR hdr;
@@ -81,42 +88,70 @@ typedef struct {
     int prepared;
 } Slot;
 
+typedef struct {
+    uint64_t handle;                                  /* the guest's AudioOut object (0 = unused entry) */
+    uint64_t event;
+    int rate, channels, open, started;
+    HWAVEOUT wave;
+    Slot slots[SLOTS];
+    unsigned head, tail;                              /* playing queue: slots head..tail-1 (mod SLOTS) */
+    uint64_t released[SLOTS];
+    unsigned rel_head, rel_tail;
+    LONGLONG clock_due;
+    int tone_left, heard;
+    unsigned long long tone_phase;
+    /* statistics, protected by g_lock */
+    unsigned long long total_appended, total_released, total_dropped, nonsilent_seconds;
+    unsigned sec_appended, sec_released, sec_peak, sec_polls, sec_empty;
+    unsigned long long sec_frames;
+    /* Underruns (bounded round 2026-10-09): the device played every buffer it had while the output was started, i.e.
+     * the game did not append the next one in time; the listener hears a gap until the next AppendAudioOutBuffer.
+     * Counted from the first buffer with sound on (before it the game's mixer may legitimately idle). */
+    unsigned long long underruns, underrun_ticks, underrun_longest;
+    LONGLONG empty_since;
+    unsigned queue_max;
+    /* A second, stricter measure: at an append, the DEVICE's own play position (waveOutGetPosition, samples) had
+     * already reached the end of everything handed to it: the output really ran out of samples. */
+    unsigned long long frames_submitted, starved;
+    /* the 10 s report window */
+    unsigned acc_appended, acc_released, acc_peak, acc_polls, acc_empty;
+    unsigned long long acc_frames;
+    unsigned char who_seen[2];
+} AoDev;
+
 static CRITICAL_SECTION g_lock;
-static uint64_t g_audio_out, g_event, g_device_event;
-static int g_rate = 48000, g_channels = 2, g_open, g_started;
-static HWAVEOUT g_wave;
-static HANDLE g_wake;
-static Slot g_slots[SLOTS];
-static unsigned g_head, g_tail;                       /* playing queue: slots head..tail-1 (mod SLOTS) */
-static uint64_t g_released[SLOTS];
-static unsigned g_rel_head, g_rel_tail;
+static uint64_t g_device_event;
+static AoDev g_ao[AO_MAX];
+static HANDLE g_wake;                                 /* every waveOut stream signals this one event */
 static LARGE_INTEGER g_freq;
-static LONGLONG g_clock_due;
 static float g_volume = 1.0f;                         /* output volume of the active device */
 static const char g_device_name[] = "AudioTvOutput";
-/* statistics, protected by g_lock */
-static unsigned long long g_total_appended, g_total_released, g_total_dropped, g_nonsilent_seconds;
-static unsigned g_sec_appended, g_sec_released, g_sec_peak, g_sec_polls, g_sec_empty;
-/* Underruns (bounded round 2026-10-09): the device played every buffer it had while the output was started, i.e. the
- * game did not append the next one in time; the listener hears a gap until the next AppendAudioOutBuffer. Counted from
- * the first buffer with sound on (before it the game's mixer may legitimately idle). audio_report prints them. */
-static unsigned long long g_underruns, g_underrun_ticks, g_underrun_longest;
-static LONGLONG g_empty_since;
-static unsigned g_queue_max;
-/* A second, stricter measure: at an append, the DEVICE's own play position (waveOutGetPosition, samples) had already
- * reached the end of everything handed to it: the output really ran out of samples (waveOut marks a buffer "done" when
- * its own pipeline has taken it, which can be earlier than the moment it is heard). */
-static unsigned long long g_frames_submitted, g_starved;
-static FILE *g_wav;
-static int g_tone_left, g_heard;
-static unsigned long long g_tone_phase;
+static FILE *g_wav;                                   /* SSBU_WAV: what the FIRST AudioOut opened plays */
+static AoDev *g_wav_dev;
+static int g_wav_rate = 48000;
 static unsigned long long g_wav_bytes;
+
+const char *guest_thread_name_of(unsigned long tid);   /* os_threads.c */
+static void audio_who(AoDev *d, int slot, const char *what, Ctx *c) {   /* once per AudioOut and call */
+    if (d->who_seen[slot]) return;
+    d->who_seen[slot] = 1;
+    const char *n = guest_thread_name_of(GetCurrentThreadId());
+    printf("nn::audio: %s on AudioOut %d is called from guest %llx on thread \"%s\"\n", what, (int)(d - g_ao),
+           (unsigned long long)c->import_from, n ? n : "?");
+    fflush(stdout);
+}
+
+/* The AudioOut the guest object belongs to; null if it was never opened. Caller holds g_lock. */
+static AoDev *ao_find(uint64_t handle) {
+    for (int i = 0; i < AO_MAX; i++) if (g_ao[i].handle == handle && handle) return &g_ao[i];
+    return NULL;
+}
 
 static LONGLONG now_ticks(void) { LARGE_INTEGER t; QueryPerformanceCounter(&t); return t.QuadPart; }
 
 static void wav_header(void) {
     unsigned char h[44];
-    uint32_t data = (uint32_t)g_wav_bytes, riff = data + 36, rate = (uint32_t)g_rate, bytes_per_sec = rate * 4;
+    uint32_t data = (uint32_t)g_wav_bytes, riff = data + 36, rate = (uint32_t)g_wav_rate, bytes_per_sec = rate * 4;
     uint16_t fmt = 1, ch = 2, align = 4, bits = 16;
     uint32_t fmt_size = 16;
     memcpy(h, "RIFF", 4); memcpy(h + 4, &riff, 4); memcpy(h + 8, "WAVEfmt ", 8); memcpy(h + 16, &fmt_size, 4);
@@ -131,8 +166,8 @@ static void wav_header(void) {
 static int16_t sat16(int v) { return (int16_t)(v > 32767 ? 32767 : v < -32768 ? -32768 : v); }
 
 /* Copies a guest buffer to host stereo samples; returns the number of frames and the peak amplitude. */
-static unsigned convert(Slot *s, const int16_t *in, size_t bytes, unsigned *peak_out) {
-    unsigned frames = (unsigned)(bytes / (2u * (unsigned)g_channels)), peak = 0;
+static unsigned convert(const AoDev *d, Slot *s, const int16_t *in, size_t bytes, unsigned *peak_out) {
+    unsigned frames = (unsigned)(bytes / (2u * (unsigned)d->channels)), peak = 0;
     size_t need = (size_t)frames * 4;
     if (need > s->capacity || !s->pcm) {
         free(s->pcm);
@@ -142,14 +177,14 @@ static unsigned convert(Slot *s, const int16_t *in, size_t bytes, unsigned *peak
     int16_t *out = s->pcm;
     for (unsigned i = 0; i < frames; i++) {
         float l, r;
-        if (g_channels == 6) {                        /* FL FR FC LFE RL RR */
+        if (d->channels == 6) {                       /* FL FR FC LFE RL RR */
             const int16_t *p = in + (size_t)i * 6;
             l = p[0] + 0.707f * p[2] + 0.251f * p[3] + 0.707f * p[4];
             r = p[1] + 0.707f * p[2] + 0.251f * p[3] + 0.707f * p[5];
-        } else if (g_channels == 1) {
+        } else if (d->channels == 1) {
             l = r = in[i];
         } else {
-            const int16_t *p = in + (size_t)i * (unsigned)g_channels;
+            const int16_t *p = in + (size_t)i * (unsigned)d->channels;
             l = p[0];
             r = p[1];
         }
@@ -165,9 +200,9 @@ static unsigned convert(Slot *s, const int16_t *in, size_t bytes, unsigned *peak
 }
 
 /* SSBU_AUDIO_TONE: a quiet 440 Hz tone over the first second, to check the host output path by ear. */
-static unsigned add_tone(int16_t *pcm, unsigned frames, unsigned peak) {
-    for (unsigned i = 0; i < frames; i++, g_tone_phase++) {
-        int v = (int)(3000.0 * sin(6.283185307179586 * 440.0 * (double)g_tone_phase / g_rate));
+static unsigned add_tone(AoDev *d, int16_t *pcm, unsigned frames, unsigned peak) {
+    for (unsigned i = 0; i < frames; i++, d->tone_phase++) {
+        int v = (int)(3000.0 * sin(6.283185307179586 * 440.0 * (double)d->tone_phase / d->rate));
         for (int k = 0; k < 2; k++) {
             pcm[i * 2 + k] = sat16(pcm[i * 2 + k] + v);
             unsigned a = (unsigned)abs(pcm[i * 2 + k]);
@@ -178,23 +213,23 @@ static unsigned add_tone(int16_t *pcm, unsigned frames, unsigned peak) {
 }
 
 /* Moves the buffers that have finished playing to the released list. Returns how many. Caller holds g_lock. */
-static int collect_finished(int everything) {
+static int collect_finished(AoDev *d, int everything) {
     int n = 0;
     LONGLONG now = now_ticks();
-    while (g_head != g_tail) {
-        Slot *s = &g_slots[g_head % SLOTS];
+    while (d->head != d->tail) {
+        Slot *s = &d->slots[d->head % SLOTS];
         if (!everything) {
             if (s->prepared) { if (!(s->hdr.dwFlags & WHDR_DONE)) break; }
-            else if (!g_started || now < s->due) break;
+            else if (!d->started || now < s->due) break;
         }
-        if (s->prepared) { waveOutUnprepareHeader(g_wave, &s->hdr, sizeof s->hdr); s->prepared = 0; }
-        g_released[g_rel_tail++ % SLOTS] = s->guest;
-        g_head++;
-        g_total_released++;
-        g_sec_released++;
+        if (s->prepared) { waveOutUnprepareHeader(d->wave, &s->hdr, sizeof s->hdr); s->prepared = 0; }
+        d->released[d->rel_tail++ % SLOTS] = s->guest;
+        d->head++;
+        d->total_released++;
+        d->sec_released++;
         n++;
     }
-    if (n && !everything && g_head == g_tail && g_started && g_heard && !g_empty_since) { g_underruns++; g_empty_since = now; }
+    if (n && !everything && d->head == d->tail && d->started && d->heard && !d->empty_since) { d->underruns++; d->empty_since = now; }
     return n;
 }
 
@@ -203,33 +238,45 @@ static DWORD WINAPI audio_thread(LPVOID arg) {
     LONGLONG next_report = now_ticks() + g_freq.QuadPart;
     unsigned seconds = 0;
     int every_second = getenv("SSBU_AUDIO_LOG") != NULL;
-    unsigned acc_appended = 0, acc_released = 0, acc_peak = 0, acc_polls = 0, acc_empty = 0;
     for (;;) {
         WaitForSingleObject(g_wake, 2);
+        uint64_t ev[AO_MAX];
+        char lines[AO_MAX][320];
+        int report[AO_MAX];
         EnterCriticalSection(&g_lock);
-        int n = g_open ? collect_finished(0) : 0;
-        uint64_t ev = g_event;
         LONGLONG now = now_ticks();
-        int report = 0;
-        unsigned queued = g_tail - g_head;
-        if (now >= next_report) {
-            next_report += g_freq.QuadPart;
-            seconds++;
-            if (g_sec_peak) g_nonsilent_seconds++;
-            acc_appended += g_sec_appended; acc_released += g_sec_released; acc_polls += g_sec_polls; acc_empty += g_sec_empty;
-            if (g_sec_peak > acc_peak) acc_peak = g_sec_peak;
-            g_sec_appended = g_sec_released = g_sec_peak = g_sec_polls = g_sec_empty = 0;
-            if (g_wav) wav_header();
-            report = g_open && (every_second || seconds % 10 == 0);
+        int tick = now >= next_report;
+        if (tick) { next_report += g_freq.QuadPart; seconds++; }
+        if (tick && g_wav) wav_header();
+        for (int i = 0; i < AO_MAX; i++) {
+            AoDev *d = &g_ao[i];
+            int n = d->open ? collect_finished(d, 0) : 0;
+            ev[i] = n ? d->event : 0;
+            report[i] = 0;
+            if (!tick || !d->handle) continue;
+            if (d->sec_peak) d->nonsilent_seconds++;
+            d->acc_appended += d->sec_appended; d->acc_released += d->sec_released; d->acc_polls += d->sec_polls;
+            d->acc_empty += d->sec_empty; d->acc_frames += d->sec_frames;
+            if (d->sec_peak > d->acc_peak) d->acc_peak = d->sec_peak;
+            d->sec_appended = d->sec_released = d->sec_peak = d->sec_polls = d->sec_empty = 0;
+            d->sec_frames = 0;
+            if (d->open && (every_second || seconds % 10 == 0)) {
+                unsigned window = every_second ? 1 : 10;
+                snprintf(lines[i], sizeof lines[i],
+                         "nn::audio: [%d] t=%us appended %u released %u polls %u (empty %u) queued %u peak %u, total %llu buffers, %llu s with sound\n"
+                         "nn::audio: [%d]   %llu frames in that window = %.0f Hz of output (the device runs at %d Hz)\n",
+                         i, seconds, d->acc_appended, d->acc_released, d->acc_polls, d->acc_empty, d->tail - d->head, d->acc_peak,
+                         d->total_appended, d->nonsilent_seconds, i, d->acc_frames, (double)d->acc_frames / window, d->rate);
+                report[i] = 1;
+            }
+            if (!d->open || every_second || seconds % 10 == 0) {
+                d->acc_appended = d->acc_released = d->acc_peak = d->acc_polls = d->acc_empty = 0;
+                d->acc_frames = 0;
+            }
         }
         LeaveCriticalSection(&g_lock);
-        if (n && ev) os_signal_event(ev);
-        if (report) {
-            printf("nn::audio: t=%us appended %u released %u polls %u (empty %u) queued %u peak %u, total %llu buffers, %llu s with sound\n",
-                   seconds, acc_appended, acc_released, acc_polls, acc_empty, queued, acc_peak, g_total_appended, g_nonsilent_seconds);
-            fflush(stdout);
-            acc_appended = acc_released = acc_peak = acc_polls = acc_empty = 0;
-        }
+        for (int i = 0; i < AO_MAX; i++) if (ev[i]) os_signal_event(ev[i]);
+        for (int i = 0; i < AO_MAX; i++) if (report[i]) { fputs(lines[i], stdout); fflush(stdout); }
     }
 }
 
@@ -242,30 +289,51 @@ static void audio_InitializeAudioOutParameter(Ctx *c) {   /* (AudioOutParameter 
 static void audio_OpenDefaultAudioOut(Ctx *c) {       /* (AudioOut *, nn::os::SystemEvent *, const AudioOutParameter &) -> Result */
     unsigned want_rate = rd32(A2), want_channels = rd16(A2 + 4);
     EnterCriticalSection(&g_lock);
-    g_audio_out = A0;
-    g_event = A1;
-    g_rate = want_rate ? (int)want_rate : 48000;
+    AoDev *d = ao_find(A0);
+    if (d && d->open) {                               /* the same object opened twice: start it over */
+        LeaveCriticalSection(&g_lock);
+        printf("nn::audio: OpenDefaultAudioOut on an AudioOut that is already open; it is reopened\n");
+        EnterCriticalSection(&g_lock);
+    }
+    if (!d) for (int i = 0; i < AO_MAX && !d; i++) if (!g_ao[i].handle || !g_ao[i].open) d = &g_ao[i];
+    if (!d) {
+        LeaveCriticalSection(&g_lock);
+        printf("nn::audio: OpenDefaultAudioOut: more than %d AudioOuts open at once; refused\n", AO_MAX);
+        RET(0x1c99);                                  /* any failure: the game logs it and does without */
+        return;
+    }
+    HWAVEOUT old = d->open ? d->wave : NULL;
+    if (old) { waveOutReset(old); collect_finished(d, 1); }
+    for (unsigned i = 0; i < SLOTS; i++) d->slots[i].prepared = 0;
+    unsigned long long keep_appended = d->handle == A0 ? d->total_appended : 0;   /* statistics stay per object */
+    unsigned long long keep_released = d->handle == A0 ? d->total_released : 0;
+    {   /* everything but the host copies of the samples (Slot.pcm) starts over */
+        Slot keep[SLOTS];
+        memcpy(keep, d->slots, sizeof keep);
+        memset(d, 0, sizeof *d);
+        for (unsigned i = 0; i < SLOTS; i++) { d->slots[i].pcm = keep[i].pcm; d->slots[i].capacity = keep[i].capacity; }
+    }
+    d->total_appended = keep_appended;
+    d->total_released = keep_released;
+    d->handle = A0;
+    d->event = A1;
+    d->rate = want_rate ? (int)want_rate : 48000;
     const char *env = getenv("SSBU_AUDIO_CHANNELS");
-    g_channels = want_channels == 6 && env && atoi(env) == 6 ? 6 : 2;
-    g_head = g_tail = g_rel_head = g_rel_tail = 0;
-    g_frames_submitted = 0;
-    g_started = 0;
-    g_clock_due = 0;
-    os_init_event(g_event, 1);
-    g_wave = NULL;
+    d->channels = want_channels == 6 && env && atoi(env) == 6 ? 6 : 2;
+    os_init_event(d->event, 1);
     if (!getenv("SSBU_AUDIO_MUTE")) {
         WAVEFORMATEX f;
         memset(&f, 0, sizeof f);
         f.wFormatTag = WAVE_FORMAT_PCM;
         f.nChannels = 2;
-        f.nSamplesPerSec = (DWORD)g_rate;
+        f.nSamplesPerSec = (DWORD)d->rate;
         f.wBitsPerSample = 16;
         f.nBlockAlign = 4;
-        f.nAvgBytesPerSec = (DWORD)g_rate * 4;
-        MMRESULT r = waveOutOpen(&g_wave, WAVE_MAPPER, &f, (DWORD_PTR)g_wake, 0, CALLBACK_EVENT);
-        if (r != MMSYSERR_NOERROR) { g_wave = NULL; printf("nn::audio: waveOutOpen failed (%u): no sound, buffers are released by the clock\n", (unsigned)r); }
+        f.nAvgBytesPerSec = (DWORD)d->rate * 4;
+        MMRESULT r = waveOutOpen(&d->wave, WAVE_MAPPER, &f, (DWORD_PTR)g_wake, 0, CALLBACK_EVENT);
+        if (r != MMSYSERR_NOERROR) { d->wave = NULL; printf("nn::audio: waveOutOpen failed (%u): no sound, buffers are released by the clock\n", (unsigned)r); }
         else {
-            waveOutPause(g_wave);                     /* nothing plays before StartAudioOut */
+            waveOutPause(d->wave);                    /* nothing plays before StartAudioOut */
             /* Test copies are silent: only the copies a person plays (ssbu_native.exe, ssbu_user.exe) are audible,
              * like the window rule in display.c. The device stays open, so timing is the same as with sound.
              * SSBU_VOLUME=<0..100> overrides either way. */
@@ -276,7 +344,7 @@ static void audio_OpenDefaultAudioOut(Ctx *c) {       /* (AudioOut *, nn::os::Sy
             if (percent < 0) percent = 0;
             if (percent > 100) percent = 100;
             DWORD level = (DWORD)(0xffff * percent / 100);
-            waveOutSetVolume(g_wave, level | level << 16);
+            waveOutSetVolume(d->wave, level | level << 16);
             printf("nn::audio: host volume %d%%%s\n", percent, percent ? "" : " (test copy: silent; SSBU_VOLUME=<0..100> to change)");
         }
     }
@@ -284,18 +352,30 @@ static void audio_OpenDefaultAudioOut(Ctx *c) {       /* (AudioOut *, nn::os::Sy
     if (wav && !g_wav) {
         g_wav = fopen(wav, "wb");
         g_wav_bytes = 0;
+        g_wav_dev = d;
+        g_wav_rate = d->rate;
         if (g_wav) wav_header();
     }
-    g_tone_left = getenv("SSBU_AUDIO_TONE") ? g_rate / 512 : 0;
-    g_open = 1;
+    d->tone_left = getenv("SSBU_AUDIO_TONE") ? d->rate / 512 : 0;
+    d->open = 1;
+    int index = (int)(d - g_ao);
     LeaveCriticalSection(&g_lock);
-    printf("nn::audio: OpenDefaultAudioOut: game asks %u Hz, %u channels -> %d Hz, %d channels, 16-bit, %s\n",
-           want_rate, want_channels, g_rate, g_channels, g_wave ? "waveOut device open" : "no host device");
+    if (old) waveOutClose(old);
+    const char *n = guest_thread_name_of(GetCurrentThreadId());
+    printf("nn::audio: OpenDefaultAudioOut [%d] (from guest %llx, thread \"%s\"): game asks %u Hz, %u channels -> %d Hz, %d channels, 16-bit, %s\n",
+           index, (unsigned long long)c->import_from, n ? n : "?", want_rate, want_channels, d->rate, d->channels,
+           d->wave ? "waveOut device open" : "no host device");
     RET(0);
 }
 
-static void audio_GetAudioOutChannelCount(Ctx *c) { RET(g_channels); }
-static void audio_GetAudioOutSampleRate(Ctx *c) { RET(g_rate); }
+static void audio_GetAudioOutChannelCount(Ctx *c) {
+    EnterCriticalSection(&g_lock); AoDev *d = ao_find(A0); int v = d ? d->channels : 2; LeaveCriticalSection(&g_lock);
+    RET(v);
+}
+static void audio_GetAudioOutSampleRate(Ctx *c) {
+    EnterCriticalSection(&g_lock); AoDev *d = ao_find(A0); int v = d ? d->rate : 48000; LeaveCriticalSection(&g_lock);
+    RET(v);
+}
 static void audio_GetAudioOutSampleFormat(Ctx *c) { RET(SAMPLE_FORMAT_PCM16); }
 
 static void audio_SetAudioOutBufferInfo(Ctx *c) {     /* (AudioOutBuffer *, void *data, size_t capacity, size_t dataSize) */
@@ -312,141 +392,164 @@ static void audio_AppendAudioOutBuffer(Ctx *c) {      /* (AudioOut *, AudioOutBu
     uint64_t buf = A1, data = rd64(buf + BUF_DATA), size = rd64(buf + BUF_SIZE);
     int ok = 0;
     EnterCriticalSection(&g_lock);
-    if (g_open && g_tail - g_head < SLOTS && data && size) {
-        Slot *s = &g_slots[g_tail % SLOTS];
+    AoDev *d = ao_find(A0);
+    if (d) audio_who(d, 0, "AppendAudioOutBuffer", c);
+    if (d && d->open && d->tail - d->head < SLOTS && data && size) {
+        Slot *s = &d->slots[d->tail % SLOTS];
         unsigned peak = 0;
-        unsigned frames = convert(s, (const int16_t *)(uintptr_t)data, (size_t)size, &peak);
+        unsigned frames = convert(d, s, (const int16_t *)(uintptr_t)data, (size_t)size, &peak);
         s->guest = buf;
         s->frames = frames;
         s->prepared = 0;
-        if (g_tone_left > 0) { g_tone_left--; peak = add_tone(s->pcm, frames, peak); }
-        if (peak && !g_heard) { g_heard = 1; printf("nn::audio: first buffer with sound (buffer %llu, peak %u)\n", g_total_appended, peak); }
+        if (d->tone_left > 0) { d->tone_left--; peak = add_tone(d, s->pcm, frames, peak); }
+        if (peak && !d->heard) { d->heard = 1; printf("nn::audio: [%d] first buffer with sound (buffer %llu, peak %u)\n", (int)(d - g_ao), d->total_appended, peak); }
         {   /* TEST ONLY, SSBU_AUDIO_HASH=<file> (round "four players"): one line per buffer the game hands to the device:
              * index, frames, peak, FNV-1a 64 of the game's own samples (before our stereo copy). Compares the mixer's output
-             * of two builds (tests\p15_pcm_compare.py). One getenv at the first buffer; nothing without the variable. */
+             * of two builds (tests\p15_pcm_compare.py). One getenv at the first buffer; nothing without the variable.
+             * Only the first AudioOut opened (the game's own mixer) is hashed. */
             static FILE *hf; static int tried;
             if (!tried) { const char *hp = getenv("SSBU_AUDIO_HASH"); tried = 1; if (hp && *hp) hf = fopen(hp, "w"); }
-            if (hf) {
+            if (hf && d == &g_ao[0]) {
                 uint64_t h = 0xcbf29ce484222325ULL;
                 const uint8_t *pb = (const uint8_t *)(uintptr_t)data;
                 for (uint64_t i = 0; i < size; i++) { h ^= pb[i]; h *= 0x100000001b3ULL; }
-                fprintf(hf, "%llu %u %u %016llx\n", g_total_appended, frames, peak, (unsigned long long)h);
-                if ((g_total_appended & 63) == 0) fflush(hf);
+                fprintf(hf, "%llu %u %u %016llx\n", d->total_appended, frames, peak, (unsigned long long)h);
+                if ((d->total_appended & 63) == 0) fflush(hf);
             }
         }
-        if (g_wav && g_wav_bytes < (unsigned long long)WAV_SECONDS * (unsigned)g_rate * 4) {
+        if (g_wav && d == g_wav_dev && g_wav_bytes < (unsigned long long)WAV_SECONDS * (unsigned)g_wav_rate * 4) {
             fwrite(s->pcm, 4, frames, g_wav);
             g_wav_bytes += (unsigned long long)frames * 4;
         }
-        if (g_wave) {
-            if (g_started && g_heard && g_frames_submitted) {
+        if (d->wave) {
+            if (d->started && d->heard && d->frames_submitted) {
                 MMTIME mt;
                 memset(&mt, 0, sizeof mt);
                 mt.wType = TIME_SAMPLES;
-                if (waveOutGetPosition(g_wave, &mt, sizeof mt) == MMSYSERR_NOERROR && mt.wType == TIME_SAMPLES && (unsigned long long)mt.u.sample >= g_frames_submitted) g_starved++;
+                if (waveOutGetPosition(d->wave, &mt, sizeof mt) == MMSYSERR_NOERROR && mt.wType == TIME_SAMPLES && (unsigned long long)mt.u.sample >= d->frames_submitted) d->starved++;
             }
-            g_frames_submitted += frames;
+            d->frames_submitted += frames;
             memset(&s->hdr, 0, sizeof s->hdr);
             s->hdr.lpData = (LPSTR)s->pcm;
             s->hdr.dwBufferLength = frames * 4;
-            if (waveOutPrepareHeader(g_wave, &s->hdr, sizeof s->hdr) == MMSYSERR_NOERROR) {
-                if (waveOutWrite(g_wave, &s->hdr, sizeof s->hdr) == MMSYSERR_NOERROR) s->prepared = 1;
-                else waveOutUnprepareHeader(g_wave, &s->hdr, sizeof s->hdr);
+            if (waveOutPrepareHeader(d->wave, &s->hdr, sizeof s->hdr) == MMSYSERR_NOERROR) {
+                if (waveOutWrite(d->wave, &s->hdr, sizeof s->hdr) == MMSYSERR_NOERROR) s->prepared = 1;
+                else waveOutUnprepareHeader(d->wave, &s->hdr, sizeof s->hdr);
             }
         }
         if (!s->prepared) {                           /* clock-driven: one buffer after the other in real time */
             LONGLONG now = now_ticks();
-            if (g_clock_due < now) g_clock_due = now;
-            g_clock_due += (LONGLONG)frames * g_freq.QuadPart / g_rate;
-            s->due = g_clock_due;
+            if (d->clock_due < now) d->clock_due = now;
+            d->clock_due += (LONGLONG)frames * g_freq.QuadPart / d->rate;
+            s->due = d->clock_due;
         }
-        g_tail++;
-        if (g_empty_since) {
-            unsigned long long gap = (unsigned long long)(now_ticks() - g_empty_since);
-            g_underrun_ticks += gap; if (gap > g_underrun_longest) g_underrun_longest = gap;
-            g_empty_since = 0;
+        d->tail++;
+        if (d->empty_since) {
+            unsigned long long gap = (unsigned long long)(now_ticks() - d->empty_since);
+            d->underrun_ticks += gap; if (gap > d->underrun_longest) d->underrun_longest = gap;
+            d->empty_since = 0;
         }
-        if (g_tail - g_head > g_queue_max) g_queue_max = g_tail - g_head;
-        g_total_appended++;
-        g_sec_appended++;
-        if (peak > g_sec_peak) g_sec_peak = peak;
+        if (d->tail - d->head > d->queue_max) d->queue_max = d->tail - d->head;
+        d->total_appended++;
+        d->sec_appended++;
+        d->sec_frames += frames;
+        if (peak > d->sec_peak) d->sec_peak = peak;
         ok = 1;
-    } else {
-        g_total_dropped++;
+    } else if (d) {
+        d->total_dropped++;
     }
     LeaveCriticalSection(&g_lock);
     RET(ok);
 }
 
-/* End-of-run line (hostrt.c report_and_exit): what the output path did in this run. */
+/* End-of-run line (hostrt.c report_and_exit): what the output path did in this run, per AudioOut. */
 void audio_report(FILE *out) {
-    if (!g_total_appended) return;
     double f = g_freq.QuadPart ? (double)g_freq.QuadPart : 1.0;
-    fprintf(out, "nn::audio: %d Hz, %d channels granted, 16-bit; %llu buffers appended, %llu released, %llu refused; deepest queue %u buffers; "
-                 "underruns (device ran dry while started, after the first sound): %llu, %.1f ms in all, longest %.1f ms; %llu s with sound\n",
-            g_rate, g_channels, g_total_appended, g_total_released, g_total_dropped, g_queue_max,
-            g_underruns, (double)g_underrun_ticks * 1000.0 / f, (double)g_underrun_longest * 1000.0 / f, g_nonsilent_seconds);
-    fprintf(out, "nn::audio: appends that found the device's own play position at the end of everything submitted (the output had no samples left): %llu of %llu\n", g_starved, g_total_appended);
+    for (int i = 0; i < AO_MAX; i++) {
+        const AoDev *d = &g_ao[i];
+        if (!d->total_appended) continue;
+        fprintf(out, "nn::audio: [%d] %d Hz, %d channels granted, 16-bit; %llu buffers appended, %llu released, %llu refused; deepest queue %u buffers; "
+                     "underruns (device ran dry while started, after the first sound): %llu, %.1f ms in all, longest %.1f ms; %llu s with sound\n",
+                i, d->rate, d->channels, d->total_appended, d->total_released, d->total_dropped, d->queue_max,
+                d->underruns, (double)d->underrun_ticks * 1000.0 / f, (double)d->underrun_longest * 1000.0 / f, d->nonsilent_seconds);
+        fprintf(out, "nn::audio: [%d] appends that found the device's own play position at the end of everything submitted (the output had no samples left): %llu of %llu\n",
+                i, d->starved, d->total_appended);
+    }
 }
 
 static void audio_StartAudioOut(Ctx *c) {             /* (AudioOut *) -> Result */
+    unsigned long long queued = 0;
+    int index = -1;
     EnterCriticalSection(&g_lock);
-    if (g_open && !g_started) {
-        g_started = 1;
-        g_clock_due = now_ticks();                    /* clock-driven buffers queued before the start begin now */
-        for (unsigned i = g_head; i != g_tail; i++) {
-            Slot *s = &g_slots[i % SLOTS];
-            g_clock_due += (LONGLONG)s->frames * g_freq.QuadPart / g_rate;
-            s->due = g_clock_due;
+    AoDev *d = ao_find(A0);
+    if (d && d->open && !d->started) {
+        d->started = 1;
+        d->clock_due = now_ticks();                   /* clock-driven buffers queued before the start begin now */
+        for (unsigned i = d->head; i != d->tail; i++) {
+            Slot *s = &d->slots[i % SLOTS];
+            d->clock_due += (LONGLONG)s->frames * g_freq.QuadPart / d->rate;
+            s->due = d->clock_due;
         }
-        if (g_wave) waveOutRestart(g_wave);
+        if (d->wave) waveOutRestart(d->wave);
     }
+    if (d) { queued = d->tail - d->head; index = (int)(d - g_ao); }
     LeaveCriticalSection(&g_lock);
-    printf("nn::audio: StartAudioOut (%llu buffers queued)\n", g_total_appended - g_total_released);
+    printf("nn::audio: StartAudioOut [%d] (%llu buffers queued)\n", index, queued);
     RET(0);
 }
 
 static void audio_GetReleasedAudioOutBuffer(Ctx *c) { /* (AudioOut *) -> AudioOutBuffer * or null */
     uint64_t r = 0;
     EnterCriticalSection(&g_lock);
-    if (g_open) collect_finished(0);
-    if (g_rel_head != g_rel_tail) r = g_released[g_rel_head++ % SLOTS];
-    g_sec_polls++;
-    if (!r) g_sec_empty++;
+    AoDev *d = ao_find(A0);
+    if (d) {
+        audio_who(d, 1, "GetReleasedAudioOutBuffer", c);
+        if (d->open) collect_finished(d, 0);
+        if (d->rel_head != d->rel_tail) r = d->released[d->rel_head++ % SLOTS];
+        d->sec_polls++;
+        if (!r) d->sec_empty++;
+    }
     LeaveCriticalSection(&g_lock);
     RET(r);
 }
 
 static void audio_StopAudioOut(Ctx *c) {              /* (AudioOut *): everything queued becomes released */
     EnterCriticalSection(&g_lock);
-    HWAVEOUT w = g_wave;
+    AoDev *d = ao_find(A0);
+    HWAVEOUT w = d ? d->wave : NULL;
     LeaveCriticalSection(&g_lock);
+    if (!d) { printf("nn::audio: StopAudioOut on an AudioOut that was never opened\n"); return; }
     if (w) waveOutReset(w);                           /* marks every queued header as done */
-    g_frames_submitted = 0;                           /* waveOutReset also sets the device position back to 0 */
     EnterCriticalSection(&g_lock);
-    if (g_open) collect_finished(1);
-    g_started = 0;
-    if (g_wave) waveOutPause(g_wave);
-    uint64_t ev = g_event;
+    d->frames_submitted = 0;                          /* waveOutReset also sets the device position back to 0 */
+    if (d->open) collect_finished(d, 1);
+    d->started = 0;
+    if (d->wave) waveOutPause(d->wave);
+    uint64_t ev = d->event;
+    int index = (int)(d - g_ao);
     LeaveCriticalSection(&g_lock);
     if (ev) os_signal_event(ev);
-    printf("nn::audio: StopAudioOut\n");
+    printf("nn::audio: StopAudioOut [%d]\n", index);
 }
 
 static void audio_CloseAudioOut(Ctx *c) {             /* (AudioOut *) */
     EnterCriticalSection(&g_lock);
-    HWAVEOUT w = g_wave;
+    AoDev *d = ao_find(A0);
+    HWAVEOUT w = d ? d->wave : NULL;
     LeaveCriticalSection(&g_lock);
+    if (!d) { printf("nn::audio: CloseAudioOut on an AudioOut that was never opened\n"); return; }
     if (w) waveOutReset(w);
     EnterCriticalSection(&g_lock);
-    if (g_open) collect_finished(1);
-    g_open = g_started = 0;
-    g_wave = NULL;
-    g_event = 0;
-    if (g_wav) wav_header();
+    if (d->open) collect_finished(d, 1);
+    d->open = d->started = 0;
+    d->wave = NULL;
+    d->event = 0;
+    if (g_wav && d == g_wav_dev) wav_header();
+    unsigned long long app = d->total_appended, rel = d->total_released;
+    int index = (int)(d - g_ao);
     LeaveCriticalSection(&g_lock);
     if (w) waveOutClose(w);
-    printf("nn::audio: CloseAudioOut (%llu buffers appended, %llu released)\n", g_total_appended, g_total_released);
+    printf("nn::audio: CloseAudioOut [%d] (%llu buffers appended, %llu released)\n", index, app, rel);
 }
 
 /* ---------------------------------------------------------------- audio device */

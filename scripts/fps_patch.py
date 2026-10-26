@@ -33,6 +33,8 @@ frame_rate (runtime/gfx_options.c sets the variables below for 61..120) or from 
     any step (the game's scale assumed a step of 2.0; at 0.5 the timeline stopped one float ulp short of the even frame:
     the world freeze, finding 144), and its timer loses its amount x step / k, so it lasts as long as at 30 / 60 fps;
     RECOMPS_SLOWMO_FIX=0 = the game's own, =1 = the alignment only.
+  - a movie's timeout (0x7100b75dc0, issue #63): it loses step / k an update instead of 1.0, so a movie is not cut off
+    after a quarter of its length at 120 fps; RECOMPS_MOVIE_FIX=0 = the game's own.
 The patched files include their helpers after '#include "funcs.h"'; funcs.h gains the declarations of PROTOS.
 """
 import os, re, shutil, sys
@@ -375,6 +377,23 @@ SLOWMO_HOOKS = [                            # (label, code put before it), in 0x
     ('L_7100b55978: {', 'if (slowmo_fix() >= 2) slowmo_timer(c);'),
     ('L_7100b55b3c: {', 'if (slowmo_fix()) { if (slowmo_align(c)) goto L_7100b55ba8; goto L_7100b55b40; }'),
 ]
+MOVIE = r'''
+/* [fps_patch.py] a movie's timeout above 60 fps (issue #63). The game's movie player 0x7100b75dc0
+ * sets, when a movie starts, a float timeout of (the movie's length in seconds + 1.5) x 30 ([0x710186d000 + 2248] + 4) and
+ * takes 1.0 off it each update (0x7100b76284); at 0 it ends the movie. During a movie the game asks for 30 fps, so that
+ * is real time; above 60 fps the request is ignored and every movie was cut off after a quarter of its length at 120 fps
+ * (the 93 s attract movie after 24 s). Here the timeout loses step / k (k = 2 while the game asks for 30 fps, else 1: the
+ * step the game would have), which is 1.0 whenever the game runs at the rate it asked for. RECOMPS_MOVIE_FIX=0: the game's own. */
+static int movie_fix_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("RECOMPS_MOVIE_FIX"); v = uncap_on() && (!e || atoi(e)); } return v; }
+static void movie_timeout_step(Ctx *c) {    /* 0x7100b76288: v1 = what the timeout loses this update (-1.0) */
+    float k = (rd32(rd64(0x71018668e0ULL) + 4) >> 5 & 1) ? 2.0f : 1.0f;     /* bit 37 of the flag word: 30 fps wanted */
+    float s = uncap_f(rd64(0x7101867708ULL) + 200);
+    if (s > 0.0f) c->v[1].f[0] = c->v[1].f[0] * s / k;
+}
+'''
+MOVIE_HOOKS = [                             # (label, code put before it), in 0x7100b75dc0
+    ('L_7100b76288: {', 'if (movie_fix_on()) movie_timeout_step(c);'),
+]
 
 
 def find_file(gen, fn):
@@ -684,6 +703,11 @@ def main():
     for lab, hook in SLOWMO_HOOKS:
         replace_once(ls, lab, hook + '\n' + lab)
     slowmo_file = name
+    # a movie's timeout (issue #63): it runs in game time, as at 30 fps
+    name, ls = lines_of('7100b75dc0')
+    for lab, hook in MOVIE_HOOKS:
+        replace_once(ls, lab, hook + '\n' + lab)
+    movie_file = name
     # the counters (finding 134): each moves by the frames due to it; the key of its record is its store's address
     done, slots = 0, 0
     for fn, lab, kind in sites:
@@ -737,7 +761,7 @@ def main():
         if fname in files:
             text = '\n'.join(files[fname])
             extra = HELP + (LIMIT if fname == present_file else '') + (TICK + SITES if fname == clock_file else '') + (CINE if fname == cine_file else '') + \
-                    (SLOWMO if fname == slowmo_file else '')
+                    (SLOWMO if fname == slowmo_file else '') + (MOVIE if fname == movie_file else '')
             assert text.count('#include "funcs.h"\n') == 1, fname
             write(os.path.join(out, fname), text.replace('#include "funcs.h"\n', '#include "funcs.h"\n' + extra, 1))
         elif fname == 'funcs.h':                          # the sites' helpers (defined in the clock's file); older lists replaced
