@@ -293,6 +293,15 @@ void display_mouse_want(int on) {
     InterlockedExchange(&g_mouse_want, on);
     if (g_hwnd) PostMessageA(g_hwnd, WM_APP + 7, 0, 0);       /* the window thread applies it */
 }
+/* [Recomps#1] The mouse cursor over the picture, in the touch screen's 1280 x 720 (nnhid.c: the keyboard's touch key). 0 when the
+ * cursor is outside the client area (or there is no window). The cursor moves even while it is hidden for the camera. */
+int display_cursor_touch_pos(int *x, int *y) {
+    POINT p; RECT r;
+    if (!g_hwnd || !GetCursorPos(&p) || !ScreenToClient(g_hwnd, &p) || !GetClientRect(g_hwnd, &r)) return 0;
+    if (r.right <= 0 || r.bottom <= 0 || p.x < 0 || p.y < 0 || p.x >= r.right || p.y >= r.bottom) return 0;
+    *x = (int)((long long)p.x * 1280 / r.right); *y = (int)((long long)p.y * 720 / r.bottom);
+    return 1;
+}
 void display_mouse_take(int *dx, int *dy) { *dx = InterlockedExchange(&g_mdx, 0); *dy = InterlockedExchange(&g_mdy, 0); }
 int display_mouse_hold(void) {                              /* 1 while the buttons of the capturing click are still down */
     if (!g_mouse_hold) return 0;
