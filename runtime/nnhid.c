@@ -694,10 +694,35 @@ static void hid_ControllerColor1(Ctx *c) {                  /* (NpadControllerCo
     RET(0);
 }
 static void hid_ControllerColor2(Ctx *c) { RET(HID_COLOR_NO_CONTROLLER); }   /* (left, right, id): Joy-Con colours; no Joy-Con is ever attached */
+/* [Recomps#1] The keyboard's touch key (controllers.ini [keyboard] touch, default G): while it is held, one finger touches the
+ * screen at the mouse cursor's position over the game window (display.c, 1280 x 720). nn::hid::TouchState (0x28 bytes): +0 delta
+ * time, +8 attributes (bit0 start, bit1 end), +0xc finger id, +0x10 x, +0x14 y, +0x18 / +0x1c diameter x / y, +0x20 angle.
+ * Returns 1 and fills the state while touching (the press gives "start", the release one last "end" state at the last
+ * position), 0 when nothing touches. */
+int nnpad_touch_vk(void);                                    /* nnpad_sdl.c */
+int display_cursor_touch_pos(int *x, int *y);                /* display.c */
+static int touch_sample(uint64_t st) {
+    static int was, lx, ly;
+    int x = 0, y = 0, down = 0;
+    int real = sdl_on() ? nnpad_touch_vk() : 'G';
+    if (g_keyboard_player >= 0 && real && keyboard_ours() && (kb_down(real & 0xff) || kb_down(real >> 8 & 0xff)))
+        down = display_cursor_touch_pos(&x, &y);
+    uint32_t attr;
+    if (down) { attr = was ? 0 : 1; lx = x; ly = y; }
+    else if (was) { attr = 2; x = lx; y = ly; }
+    else return 0;
+    was = down;
+    memset((void *)(uintptr_t)st, 0, 0x28);
+    *(uint32_t *)(uintptr_t)(st + 8) = attr;
+    *(int32_t *)(uintptr_t)(st + 0x10) = x; *(int32_t *)(uintptr_t)(st + 0x14) = y;
+    *(int32_t *)(uintptr_t)(st + 0x18) = 15; *(int32_t *)(uintptr_t)(st + 0x1c) = 15;
+    return 1;
+}
 static void hid_InitializeTouchScreen(Ctx *c) { (void)c; g_touch_ready = 1; }
-static void hid_GetTouchScreenState(Ctx *c) {               /* docked console: the screen is in the dock, no touch can arrive */
+static void hid_GetTouchScreenState(Ctx *c) {               /* TouchScreenState<16>: +0 sampling number, +8 count, +0x10 states */
     memset((void *)(uintptr_t)A0, 0, 0x290);
     wr64(A0, (uint64_t)InterlockedIncrement64(&g_sampling));
+    if (touch_sample(A0 + 0x10)) *(int32_t *)(uintptr_t)(A0 + 8) = 1;
 }
 /* [Recomps#1] SDK 3.6.0 forms our game uses.
  * GetTouchScreenStates<1>(TouchScreenState<1> *states, int count) -> int written. [sdk 0x20b4dc]: 0x38-byte states
@@ -707,6 +732,7 @@ static void hid_GetTouchScreenStates1(Ctx *c) {
     if ((int)A1 <= 0) { RET(0); return; }
     memset((void *)(uintptr_t)A0, 0, 0x38);
     wr64(A0, (uint64_t)InterlockedIncrement64(&g_sampling));
+    if (touch_sample(A0 + 0x10)) *(int32_t *)(uintptr_t)(A0 + 8) = 1;      /* [Recomps#1] the keyboard's touch key */
     RET(1);
 }
 /* InitializeKeyboard() / GetKeyboardState(KeyboardState *). [sdk 0x202060]: the state is 0x30 bytes copied from the shared

@@ -194,3 +194,10 @@ Both are marked `[Recomps#1]` in the code; the values the game sees are unchange
   only when chosen (`button_prompts`). `mod_family` guesses a prompt mod's kind from a word that starts with ds4, ds5,
   dualshock, dualsense, playstation, ps4, ps5 / xbox (or the word ps), so the DS4Prompts / XBOXPrompts folders of the
   GameBanana prompt mod 360121 need no [prompts] line.
+- 2026-11-03, touch screen from the keyboard (`nnhid.c`, `nnpad_sdl.c`, `display.c`): the Switch's touch screen was always
+  empty (docked). `[keyboard] touch = <key>` (default G, two keys allowed, none = off; `nnpad_touch_vk()`) now holds one
+  finger on the screen while it is down, at the mouse cursor's position over the picture (`display_cursor_touch_pos()`:
+  client area scaled to 1280 x 720; nothing when the cursor is outside the window). `touch_sample()` in `nnhid.c` fills
+  the TouchState (+8 attributes: 1 start on the press, 2 end on the release at the last position) for both
+  `GetTouchScreenStates<1>` and `GetTouchScreenState<16>`. The cursor moves while hidden for the mouse camera, so
+  `mouse_camera = off` shows where the touch lands. Tested by hand in game.

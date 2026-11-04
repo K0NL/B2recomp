@@ -114,9 +114,12 @@ Hover over any setting for a short explanation. Press **Save** (Play also saves)
   | Umbran Climax | Q |
   | Pause | Esc |
   | Menus: confirm / back | Enter / Backspace |
+  | Touch screen (a tap at the mouse cursor) | G (hold) |
 
   **Keyboard and mouse...** changes any key: click a slot, then press the key or mouse button you want (Delete clears
-  it). The same window sets the mouse sensitivity and can turn the mouse camera off. In game the cursor is hidden and
+  it). The same window sets the mouse sensitivity and can turn the mouse camera off. The touch key (`touch` in
+  `config\controllers.ini`) acts as a finger on the Switch's touch screen at the mouse cursor; turn the mouse camera
+  off to see the cursor. In game the cursor is hidden and
   kept in the window; Alt+Tab lets it go. **Input** (top of the controller panel) can lock the game to the keyboard
   and mouse only, or to the controller only.
 

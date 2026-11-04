@@ -39,6 +39,7 @@ typedef struct {
     float mouse_sens;                   /* [Recomps#1] [keyboard] mouse_sensitivity (default 1.0) */
     int prompts;                        /* [Recomps#1] [general] button_prompts: 0 auto, 1 switch, 2 playstation, 3 xbox */
     int input;                          /* [Recomps#1] [general] input: 0 both, 1 keyboard (pads unused), 2 controller (keyboard and mouse unused) */
+    int touch_vk;                       /* [Recomps#1] [keyboard] touch: key(s) that touch the screen at the mouse cursor (default G) */
 } Cfg;
 typedef struct {
     int used, ignored;
@@ -188,6 +189,9 @@ static const char *const g_default_ini =
 "; The mouse moves the camera (the right stick) once you click into the game (borderless / fullscreen: at once): the cursor\r\n"
 "; is hidden and kept in the window; Esc (pause) or Alt+Tab lets it go. mouse_sensitivity: 1.0 = full stick at a brisk move.\r\n"
 "mouse_camera = on\r\nmouse_sensitivity = 1.0\r\nmouse_invert_y = off\r\n"
+"; The Switch's touch screen: while this key is held, the game sees a finger on the screen at the mouse cursor's position\r\n"
+"; (inside the game window). With mouse_camera = on the cursor is hidden: set it to off to see where you touch. none = no touch.\r\n"
+"touch = G\r\n"
 "\r\n"
 "; Per device (GUID from --pad-test). Every key is optional; what is missing falls back to [general] and the built-in default:\r\n"
 "; [device 03000000de280000ff11000000007801]\r\n"
@@ -215,6 +219,7 @@ static void cfg_defaults(Cfg *c) {
     c->kb_player = -2;
     memcpy(c->kb_vk, g_kb_default, sizeof c->kb_vk);
     c->mouse_cam = 1; c->mouse_sens = 1.0f;
+    c->touch_vk = 'G';
 }
 static int parse_vk1(const char *t) {
     char b[24];
@@ -321,6 +326,7 @@ static void cfg_parse(Cfg *c, char *text) {
             else if (!_stricmp(key, "mouse_camera")) c->mouse_cam = parse_bool(val);            /* [Recomps#1] */
             else if (!_stricmp(key, "mouse_sensitivity")) { float v = (float)atof(val); if (v > 0.01f && v <= 20.0f) c->mouse_sens = v; }
             else if (!_stricmp(key, "mouse_invert_y")) c->mouse_inv = parse_bool(val);
+            else if (!_stricmp(key, "touch")) c->touch_vk = parse_vk(val);                     /* [Recomps#1] */
             else for (int i = 0; i < 24; i++) if (!_stricmp(key, g_kbn[i])) c->kb_vk[i] = parse_vk(val);
         }
     }
@@ -774,6 +780,10 @@ int nnpad_prompts_by_letter(void) {
     }
     unlock();
     return r;
+}
+int nnpad_touch_vk(void) {                          /* [Recomps#1] the touch key(s): vk | vk2 << 8 */
+    if (!g_inited) { lock(); if (!g_cfg.path[0]) { cfg_load(1); } unlock(); }
+    return g_cfg.touch_vk;
 }
 int nnpad_kb_vk(int idx) {
     if (!g_inited) { lock(); if (!g_cfg.path[0]) { cfg_load(1); } unlock(); }
